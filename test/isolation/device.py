@@ -114,17 +114,17 @@ try:
     for suffix, loader in lib.loaders():
         name = loader.name
         # Filter program: the device option adds the openat rules only.
-        base = run([str(loader), '--guest-filter-dump']).stdout.splitlines()
-        with_device = run([str(loader), '--isolate-device', DEVICE, '--guest-filter-dump'])
+        base = run([str(loader), '--dump-filter']).stdout.splitlines()
+        with_device = run([str(loader), '--allow-device', DEVICE, '--dump-filter'])
         longer = with_device.returncode == 0 and len(base) > 100 and \
             len(base) < len(with_device.stdout.splitlines()) < len(base) + 60
-        print('PASS:' if longer else 'FAIL:', f'{name}: filter with --isolate-device adds the device rules')
+        print('PASS:' if longer else 'FAIL:', f'{name}: filter with --allow-device adds the device rules')
         longer or failures.append(f'{name}: device filter {with_device.returncode} {with_device.stderr[-200:]!r}')
 
         # Refused starts.
-        for args, why in (([f'--isolate-device', DEVICE], 'requires --isolate'),
-                          (['--isolate', '--isolate-device', '/dev/null'], 'unsupported isolated device'),
-                          (['--isolate', '--isolate-device', '/dev/hvgr0x'], 'unsupported isolated device')):
+        for args, why in (([f'--allow-device', DEVICE], 'requires --isolate'),
+                          (['--isolate', '--allow-device', '/dev/null'], 'unsupported isolated device'),
+                          (['--isolate', '--allow-device', '/dev/hvgr0x'], 'unsupported isolated device')):
             p = run([str(loader), *args, '--', str(probe), 'exec'])
             ok = p.returncode != 0 and why in p.stdout + p.stderr and 'execveat' not in p.stdout
             print('PASS:' if ok else 'FAIL:', f'{name}: start refused: {" ".join(args)}')
@@ -132,12 +132,12 @@ try:
         for missing in ('/dev/mali0', '/dev/kgsl-3d0', '/dev/dri/renderD128'):
             if os.path.exists(missing):
                 continue
-            p = run([str(loader), '--isolate', '--isolate-device', missing, '--', str(probe), 'exec'])
+            p = run([str(loader), '--isolate', '--allow-device', missing, '--', str(probe), 'exec'])
             ok = p.returncode != 0 and 'cannot stat' in p.stdout + p.stderr
             print('PASS:' if ok else 'FAIL:', f'{name}: start refused for missing {missing}')
             ok or failures.append(f'{name}: missing {missing} started: {p.returncode} {p.stderr[-200:]!r}')
 
-        isolated = [str(loader), '--isolate', '--isolate-device', DEVICE]
+        isolated = [str(loader), '--isolate', '--allow-device', DEVICE]
         # Positive: the driver opens the device itself in every kind of process.
         if not sdk:
             print('SKIP: OpenHarmony SDK headers missing, no Vulkan probe')
@@ -150,7 +150,7 @@ try:
                 # Control: without the option the broker opens it and the driver refuses it.
                 p = run([str(loader), '--isolate', '--', str(gpu), mode])
                 ok = f'RESULT {mode} fail' in p.stdout
-                print('PASS:' if ok else 'FAIL:', f'{name}: control: without --isolate-device createDevice fails')
+                print('PASS:' if ok else 'FAIL:', f'{name}: control: without --allow-device createDevice fails')
                 ok or failures.append(f'{name}: control without the option: {p.stdout[-300:]!r}')
 
         for variant, flags in (('', isolated), (' (no device)', [str(loader), '--isolate'])):
@@ -171,9 +171,9 @@ try:
         except OSError as error:
             linked = False
             print(f'SKIP: {name}: hard link of the loader ({error.strerror}: the host refuses hard links)')
-        for variant, device in (('', ['--isolate-device', DEVICE]), (' (no device)', [])):
+        for variant, device in (('', ['--allow-device', DEVICE]), (' (no device)', [])):
             before = digest(copy), copy.stat().st_mode
-            policy = ['--guard-file-access', 'rww', '--allow-stdio-output'] if suffix else []
+            policy = ['--root-mode', 'ro', '--guard', 'access', '--allow-stdio'] if suffix else []
             p = run([str(copy), '--isolate', *device, '-v', f'{folded}:{folded}',
                      '-v', f'{links}:{links}', *policy, '--', str(probe), 'broker',
                      str(link) if linked else '/nonexistent', str(alias)])
@@ -193,7 +193,7 @@ try:
             after == before or failures.append(f'{name}{variant}: loader file changed')
         # /proc/<pid>/mem with /proc bound; the device path keeps its names.
         for variant, flags in (('', isolated), (' (no device)', [str(loader), '--isolate'])):
-            p = run([*flags, '-v', '/proc:/proc', *(['--guard-file-access', 'ww', '--allow-stdio-output']
+            p = run([*flags, '-v', '/proc:/proc', *(['--guard', 'access', '--allow-stdio']
                                                     if suffix else []),
                      '--', str(probe), 'broker', '/nonexistent', '/nonexistent'])
             check(f'{name}{variant}: /proc/<pid>/mem and the device path', parse(p.stdout),

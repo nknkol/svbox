@@ -19,7 +19,7 @@ for directory, shell, prefix in (
     with tempfile.TemporaryDirectory(prefix='file-workflow-', dir=build) as temp:
         def run(command):
             return subprocess.run(
-                [str(loader), '--fd-track', '--mode', 'container', '--root', str(root),
+                [str(loader), '--guard', 'track', '--mode', 'container', '--root', str(root),
                  '-v', f'{temp}:/work', '-v', '/dev/null:/dev/null', '--',
                  shell, *prefix, '-c', 'export PATH=/bin:/usr/bin; set -e; ' + command],
                 cwd=root, capture_output=True, text=True, timeout=20)

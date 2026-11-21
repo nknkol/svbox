@@ -23,7 +23,7 @@
 /* Script levels the kernel follows (exec_binprm allows five rewrites
  * before ELOOP): the script plus four script interpreters. */
 #define SCRIPT_DEPTH 5
-#define CHAIN_EXTRA (80 + SCRIPT_DEPTH * 2 + CONFIG_MAX_BINDS * 2 + CONFIG_MAX_LOWERS * 4)
+#define CHAIN_EXTRA (16 + SCRIPT_DEPTH * 2)
 #define CHAIN_ARGS (EXEC_ARGS + CHAIN_EXTRA)
 #define S_IFMT 0170000
 #define S_IFREG 0100000
@@ -37,27 +37,15 @@ typedef struct {
     char guest[CONFIG_MAX_PATH], host[CONFIG_MAX_PATH];
     char interpreter_guest[CONFIG_MAX_PATH], interpreter_host[CONFIG_MAX_PATH];
     char header[SCRIPT_DEPTH + 1][256];
-    char volumes[CONFIG_MAX_BINDS][CONFIG_MAX_PATH * 2 + 2];
     char **argv;
     char *inline_argv[CHAIN_ARGS];
-    char fake_ids[8 * 11];
-    char fake_groups[32 * 11 + 2];
-    char exec_fd[16];
-    char isolate_fd[16];
-    char device_mask[16];
-    char interp_fd[16], loader_fd[16];
-    char case_folds[CONFIG_MAX_BINDS * 11];
-    char owners[CONFIG_OWNERS * 24];
-    char mount_table_fd[16], owner_db_fd[16];
-    char net_addr[16];
-    char fd_state[24];
-    char fd_capacity[24];
-    char passed_fds[CONFIG_MAX_PASSED_FDS * 64];
+    char handoff_fd[16];
     /* PT_INTERP as stored in the target, then its resolution in guest terms
      * (file access guard, isolation mode). */
     char elf_interp[CONFIG_MAX_PATH];
     char elf_interp_guest[CONFIG_MAX_PATH], elf_interp_host[CONFIG_MAX_PATH];
     Elf64_Phdr phdrs[64];
+    svbox_handoff_t handoff;
 } ExecScratch;
 
 size_t proot_exec_scratch_size(void) { return sizeof(ExecScratch); }
@@ -74,15 +62,13 @@ static void fd_name(char *out, const char *prefix, int fd)
     *out = 0;
 }
 
-static char *append_u64(char *out, uint64_t value, char end)
+static int copy_bounded(char *dst, size_t cap, const char *src)
 {
-    char digits[21];
-    int count = 0;
-    do { digits[count++] = (char)('0' + value % 10); value /= 10; } while (value);
-    while (count) *out++ = digits[--count];
-    if (end) *out++ = end;
-    *out = 0;
-    return out;
+    size_t n = strlen(src);
+    if (n >= cap)
+        return -ENAMETOOLONG;
+    memcpy(dst, src, n + 1);
+    return 0;
 }
 
 /* execve's permission check (execute for the real ids), from the file's
@@ -281,6 +267,7 @@ long proot_execve_context(long number, long a[6], const struct proot_path_contex
         s->argv = (char **)array;
     }
     long transport = -1;
+    long handoff_fd = -1;
     long ret;
     long fd_copy = -1;
     /* Isolation mode: the program (the final ELF) and its interpreter as
@@ -397,121 +384,49 @@ long proot_execve_context(long number, long a[6], const struct proot_path_contex
             if (!elf_magic(magic, n)) { ret = -ELIBBAD; goto done; }
         }
     }
-    size_t pos = 0;
-    s->argv[pos++] = cfg->loader_path;
-    s->argv[pos++] = "--child-loader";
-    s->argv[pos++] = "--mode";
-    s->argv[pos++] = cfg->mode == CONFIG_MODE_CONTAINER ? "container" : "compat";
-    if (cfg->root[0]) {
-        s->argv[pos++] = "--root";
-        s->argv[pos++] = cfg->root;
-    }
-    for (int i = 0; i < cfg->lower_count && i < CONFIG_MAX_LOWERS; i++) {
-        s->argv[pos++] = "--lower";
-        s->argv[pos++] = (char *)cfg->lower[i];
-        if (cfg->lower_image[i][0]) {
-            s->argv[pos++] = "--lower-image";
-            s->argv[pos++] = (char *)cfg->lower_image[i];
-        }
-    }
-    if (cfg->net_addr) {
-        char *o = s->net_addr;
-        for (int shift = 24; shift >= 0; shift -= 8) {
-            unsigned part = (cfg->net_addr >> shift) & 255;
-            if (part >= 100) *o++ = (char)('0' + part / 100);
-            if (part >= 10) *o++ = (char)('0' + part / 10 % 10);
-            *o++ = (char)('0' + part % 10);
-            if (shift) *o++ = '.';
-        }
-        *o = 0;
-        s->argv[pos++] = "--net-addr";
-        s->argv[pos++] = s->net_addr;
-        if (cfg->net_peers[0]) {
-            s->argv[pos++] = "--net-peers";
-            s->argv[pos++] = (char *)cfg->net_peers;
-        }
-    }
-    for (int i = 0; i < cfg->bind_count; i++) {
-        /* CLI serializes volumes as host:guest. Colons need a richer protocol. */
-        if (strchr(cfg->binds[i].src, ':') || strchr(cfg->binds[i].dst, ':')) {
-            ret = -EOPNOTSUPP;
-            goto done;
-        }
-        strcpy(s->volumes[i], cfg->binds[i].dst);
-        strcat(s->volumes[i], ":");
-        strcat(s->volumes[i], cfg->binds[i].src);
-        s->argv[pos++] = "-v";
-        s->argv[pos++] = s->volumes[i];
-    }
-    s->argv[pos++] = "--exec-target";
-    s->argv[pos++] = target;
-    s->argv[pos++] = "--exec-path";
-    s->argv[pos++] = exec_fd >= 0 ? fd_guest : s->guest;
-    if (cfg->isolate) {
-        fd_name(s->exec_fd, "", (int)target_fd);
-        s->argv[pos++] = CONFIG_CHILD_EXEC_FD;
-        s->argv[pos++] = s->exec_fd;
-        if (interp_fd >= 0) {
-            fd_name(s->interp_fd, "", (int)interp_fd);
-            s->argv[pos++] = CONFIG_CHILD_EXEC_INTERP_FD;
-            s->argv[pos++] = s->interp_fd;
-        }
-        fd_name(s->loader_fd, "", cfg->loader_fd);
-        s->argv[pos++] = CONFIG_CHILD_LOADER_FD;
-        s->argv[pos++] = s->loader_fd;
-        s->argv[pos++] = CONFIG_CHILD_LOADER_PATH;
-        s->argv[pos++] = cfg->loader_path;
-        char *out = s->case_folds;
-        int folded = 0;
-        for (int i = 0; i < cfg->bind_count; i++) {
-            if (i) *out++ = ',';
-            fd_name(out, "", (int)cfg->binds[i].fold);
-            out += strlen(out);
-            folded |= cfg->binds[i].fold != 0;
-        }
-        if (folded) {
-            s->argv[pos++] = CONFIG_CHILD_CASE_FOLDS;
-            s->argv[pos++] = s->case_folds;
-        }
-        if (cfg->owner_count > 0) {
-            out = s->owners;
-            for (int i = 0; i < cfg->owner_count && i < CONFIG_OWNERS; i++) {
-                if (i) *out++ = ',';
-                fd_name(out, "", (int)cfg->owners[i][0]);
-                out += strlen(out);
-                *out++ = ':';
-                fd_name(out, "", (int)cfg->owners[i][1]);
-                out += strlen(out);
-            }
-            s->argv[pos++] = CONFIG_CHILD_OWNERS;
-            s->argv[pos++] = s->owners;
-        }
-    } else if (exec_fd >= 0) {
-        fd_name(s->exec_fd, "", (int)fd_copy);
-        s->argv[pos++] = CONFIG_CHILD_EXEC_FD;
-        s->argv[pos++] = s->exec_fd;
-    }
-    /* The kernel's exe for a script is its interpreter. */
-    s->argv[pos++] = CONFIG_CHILD_EXEC_EXE;
-    s->argv[pos++] = script ? s->interpreter_guest : s->guest;
+    /* Populate binary child-loader handoff struct (transferred via memfd). */
+    memset(&s->handoff, 0, sizeof(s->handoff));
+    s->handoff.magic = SVBOX_HANDOFF_MAGIC;
+    s->handoff.version = SVBOX_HANDOFF_VERSION;
+    s->handoff.size = sizeof(svbox_handoff_t);
+    memcpy(&s->handoff.cfg, cfg, sizeof(s->handoff.cfg));
+    s->handoff.cfg.guest_auxv_bytes = 0;
+    s->handoff.cfg.protected_count = 0;
+
+    if ((ret = copy_bounded(s->handoff.exec_target, sizeof(s->handoff.exec_target), target)) < 0 ||
+        (ret = copy_bounded(s->handoff.exec_path, sizeof(s->handoff.exec_path),
+                            exec_fd >= 0 ? fd_guest : s->guest)) < 0 ||
+        (ret = copy_bounded(s->handoff.exec_exe, sizeof(s->handoff.exec_exe),
+                            script ? s->interpreter_guest : s->guest)) < 0)
+        goto done;
+
     /* Kernel comm: basename of the path as passed (symlink name included). */
     const char *name = path;
     for (const char *p = path; *p; p++)
         if (*p == '/' && p[1]) name = p + 1;
     if (*name && *name != '/') {
-        s->argv[pos++] = CONFIG_CHILD_EXEC_NAME;
-        s->argv[pos++] = (char *)name;
+        if ((ret = copy_bounded(s->handoff.exec_name, sizeof(s->handoff.exec_name), name)) < 0)
+            goto done;
     }
+
+    if (dynamic && !cfg->isolate && cfg->guard == GUARD_READS) {
+        if ((ret = copy_bounded(s->handoff.exec_interp, sizeof(s->handoff.exec_interp),
+                                s->elf_interp_host)) < 0)
+            goto done;
+    }
+
+    s->handoff.exec_fd = cfg->isolate ? (int32_t)target_fd :
+                         (exec_fd >= 0 ? (int32_t)fd_copy : -1);
+    s->handoff.exec_interp_fd = (cfg->isolate && interp_fd >= 0) ? (int32_t)interp_fd : -1;
+
     uint32_t ids[8];
-    int changed = fake_ids_current(ids);
+    fake_ids_current(ids);
     /* A set-user/group-ID program (the final ELF, interpreter for scripts)
-     * runs with its reported owner as effective, saved and fs id, like
-     * PRoot's fake_id0; only the new image gets them. */
+     * runs with its reported owner as effective, saved and fs id; only the
+     * new image gets them. */
     struct stat program;
     if (!(target_fd >= 0 ? raw_syscall(__NR_fstat, target_fd, (long)&program, 0, 0, 0, 0) :
           raw_syscall(__NR_newfstatat, AT_FDCWD, (long)target, (long)&program, 0, 0, 0))) {
-        /* With an owner database: its owner and mode (the host may have
-         * refused the set-id bits). */
         uint32_t owner_of[2] = {fake_ids_reported_owner(program.st_uid, 0),
                                 fake_ids_reported_owner(program.st_gid, 1)};
         uint32_t mode = program.st_mode;
@@ -521,129 +436,54 @@ long proot_execve_context(long number, long a[6], const struct proot_path_contex
             if (!(mode & (group ? 02000 : 04000))) continue;
             uint32_t owner = owner_of[group];
             ids[group * 4 + 1] = ids[group * 4 + 2] = ids[group * 4 + 3] = owner;
-            changed |= owner != 0;
         }
     }
-    if (changed) {
-        char *out = s->fake_ids;
-        for (int i = 0; i < 8; i++) {
-            char digits[12];
-            int count = 0;
-            uint32_t value = ids[i];
-            do { digits[count++] = '0' + value % 10; value /= 10; } while (value);
-            while (count) *out++ = digits[--count];
-            *out++ = i < 7 ? ':' : 0;
-        }
-        s->argv[pos++] = CONFIG_CHILD_FAKE_IDS;
-        s->argv[pos++] = s->fake_ids;
-    }
-    if (cfg->link_copy) s->argv[pos++] = "--link-copy";
-    if (cfg->seccomp_backstop) s->argv[pos++] = "--seccomp-backstop";
-    if (cfg->isolate) {
-        fd_name(s->isolate_fd, "", cfg->isolate_fd);
-        s->argv[pos++] = CONFIG_CHILD_ISOLATE_FD;
-        s->argv[pos++] = s->isolate_fd;
-        if (cfg->device_mask) {
-            fd_name(s->device_mask, "", (int)cfg->device_mask);
-            s->argv[pos++] = CONFIG_CHILD_ISOLATE_DEVICES;
-            s->argv[pos++] = s->device_mask;
-        }
-    }
+    memcpy(s->handoff.cfg.fake_ids, ids, sizeof(ids));
+
     uint32_t groups[32];
     int group_count = fake_ids_groups(groups);
-    if (group_count != 1 || groups[0]) {
-        char *out = s->fake_groups;
-        if (!group_count) *out++ = '-';
-        for (int i = 0; i < group_count; i++) {
-            char digits[12];
-            int count = 0;
-            uint32_t value = groups[i];
-            do { digits[count++] = '0' + value % 10; value /= 10; } while (value);
-            while (count) *out++ = digits[--count];
-            if (i + 1 < group_count) *out++ = ',';
-        }
-        *out = 0;
-        s->argv[pos++] = CONFIG_CHILD_FAKE_GROUPS;
-        s->argv[pos++] = s->fake_groups;
-    }
-    if (cfg->kernel_release[0]) {
-        s->argv[pos++] = "--kernel-release";
-        s->argv[pos++] = cfg->kernel_release;
-    }
-    if (cfg->kernel_sysname[0]) {
-        s->argv[pos++] = "--kernel-sysname";
-        s->argv[pos++] = cfg->kernel_sysname;
-    }
-    if (cfg->hostname[0]) {
-        s->argv[pos++] = "--hostname";
-        s->argv[pos++] = (char *)cfg->hostname;
-    }
-    if (cfg->glue_dir[0]) {
-        s->argv[pos++] = CONFIG_CHILD_GLUE_DIR;
-        s->argv[pos++] = (char *)cfg->glue_dir;
-    }
-    /* The container's shared state: inherited FDs (container_state.h). */
-    if (cfg->mount_table_fd >= 0) {
-        fd_name(s->mount_table_fd, "", cfg->mount_table_fd);
-        s->argv[pos++] = CONFIG_CHILD_MOUNT_TABLE_FD;
-        s->argv[pos++] = s->mount_table_fd;
-        if (cfg->mount_scratch[0]) {
-            s->argv[pos++] = CONFIG_CHILD_MOUNT_SCRATCH;
-            s->argv[pos++] = cfg->mount_scratch;
-        }
-    }
-    if (cfg->owner_db_fd >= 0) {
-        fd_name(s->owner_db_fd, "", cfg->owner_db_fd);
-        s->argv[pos++] = CONFIG_CHILD_OWNER_DB_FD;
-        s->argv[pos++] = s->owner_db_fd;
-    }
-    if (dynamic && !cfg->isolate && cfg->guard == GUARD_READS) {
-        s->argv[pos++] = CONFIG_CHILD_EXEC_INTERP;
-        s->argv[pos++] = s->elf_interp_host;
-    }
+    s->handoff.cfg.fake_group_count = group_count;
+    for (int i = 0; i < group_count && i < 32; i++)
+        s->handoff.cfg.fake_groups[i] = groups[i];
+
+    /* Export FD runtime snapshot BEFORE creating handoff_fd so the snapshot
+     * never records the internal handoff descriptor. */
     if (cfg->guard != GUARD_NONE) {
-        if (cfg->mount_access_observe[0]) {
-            static const char *const option[] = {
-                [GUARD_OBSERVE] = "--observe-mount-access", [GUARD_PATHS] = "--guard-path-mutations",
-                [GUARD_FILES] = "--guard-file-mutations", [GUARD_READS] = "--guard-file-access"};
-            s->argv[pos++] = (char *)option[cfg->guard];
-            s->argv[pos++] = cfg->mount_access_observe;
-        } else {
-            s->argv[pos++] = "--fd-track";
-        }
-        if (cfg->revalidate_file_fds)s->argv[pos++] = "--revalidate-file-fds";
-        if (cfg->fd_capacity > 0) {
-            char *digit = s->fd_capacity + sizeof(s->fd_capacity) - 1;
-            unsigned value = (unsigned)cfg->fd_capacity;
-            *digit = 0;
-            do { *--digit = '0' + value % 10; value /= 10; } while (value);
-            s->argv[pos++] = "--fd-capacity";
-            s->argv[pos++] = digit;
-        }
-        if (cfg->allow_pipe_output)s->argv[pos++] = "--allow-pipe-output";
-        if (cfg->allow_local_output)s->argv[pos++] = "--allow-local-output";
-        if (cfg->allow_stdio_output)s->argv[pos++] = "--allow-stdio-output";
-        if (cfg->allow_stream_input)s->argv[pos++] = "--allow-stream-input";
-        if (cfg->passed_count) {
-            char *out = s->passed_fds;
-            for (int k = 0; k < cfg->passed_count; k++) {
-                const struct passed_fd *f = &cfg->passed[k];
-                out = append_u64(out, (uint32_t)f->fd, ':');
-                out = append_u64(out, f->flags, ':');
-                out = append_u64(out, f->dev, ':');
-                out = append_u64(out, f->ino, k + 1 < cfg->passed_count ? ',' : 0);
-            }
-            s->argv[pos++] = CONFIG_CHILD_PASSED_FDS;
-            s->argv[pos++] = s->passed_fds;
-        }
         transport = fd_runtime_export();
         if (transport < 0) { ret = transport; goto done; }
-        unsigned value = (unsigned)transport;
-        char *digit = s->fd_state + sizeof(s->fd_state) - 1;
-        *digit = 0;
-        do { *--digit = '0' + value % 10; value /= 10; } while (value);
-        s->argv[pos++] = "--fd-state";
-        s->argv[pos++] = digit;
+        s->handoff.cfg.fd_state = (int32_t)transport;
+    } else {
+        s->handoff.cfg.fd_state = -1;
+    }
+
+    handoff_fd = raw_syscall(__NR_memfd_create, (long)"svbox-handoff", 1 /* MFD_CLOEXEC */,
+                             0, 0, 0, 0);
+    if (handoff_fd < 0) { ret = handoff_fd; goto done; }
+    if (handoff_fd < 3) {
+        long high = raw_syscall(__NR_fcntl, handoff_fd, F_DUPFD_CLOEXEC, 3, 0, 0, 0);
+        raw_syscall(__NR_close, handoff_fd, 0, 0, 0, 0, 0);
+        if (high < 0) { handoff_fd = -1; ret = high; goto done; }
+        handoff_fd = high;
+    }
+    const char *src_bytes = (const char *)&s->handoff;
+    size_t written = 0;
+    while (written < sizeof(s->handoff)) {
+        long w = raw_syscall(__NR_write, handoff_fd, (long)(src_bytes + written),
+                             (long)(sizeof(s->handoff) - written), 0, 0, 0);
+        if (w <= 0) { ret = w < 0 ? w : -EIO; goto done; }
+        written += (size_t)w;
+    }
+    if ((ret = raw_syscall(__NR_lseek, handoff_fd, 0, 0, 0, 0, 0)) < 0)
+        goto done;
+
+    fd_name(s->handoff_fd, "", (int)handoff_fd);
+    size_t pos = 0;
+    s->argv[pos++] = cfg->loader_path;
+    s->argv[pos++] = SVBOX_CHILD_HANDOFF_FD;
+    s->argv[pos++] = s->handoff_fd;
+    if (s->handoff.exec_exe[0] == '/') {
+        s->argv[pos++] = SVBOX_CHILD_EXEC_EXE;
+        s->argv[pos++] = s->handoff.exec_exe;
     }
     s->argv[pos++] = "--";
     if (script) {
@@ -663,13 +503,15 @@ long proot_execve_context(long number, long a[6], const struct proot_path_contex
     s->argv[pos] = NULL;
     /* The signed loader starts the same embedded backend. Do not fall back
      * to raw target exec, which would lose the guest filesystem view. */
+    ret = raw_syscall(__NR_fcntl, handoff_fd, F_SETFD, 0, 0, 0, 0);
+    if (ret < 0) goto done;
     if (transport >= 0) {
         ret = raw_syscall(__NR_fcntl, transport, F_SETFD, 0, 0, 0, 0);
         if (ret < 0) goto done;
     }
     struct reentry_slot *lease = reentry_exec_release();
     /* Isolation mode: the guest filter only lets an FD run. */
-    /* The empty path of the loader's constant page (--isolate-device). */
+    /* The empty path of the loader's constant page (--allow-device). */
     if (cfg->isolate)
         ret = raw_syscall(__NR_execveat, cfg->loader_fd,
                           cfg->empty_path ? (long)cfg->empty_path : (long)"", (long)s->argv,
@@ -679,6 +521,7 @@ long proot_execve_context(long number, long a[6], const struct proot_path_contex
                           (long)env, 0, 0, 0);
     reentry_exec_restore(lease);
  done:
+    if (handoff_fd >= 0) raw_syscall(__NR_close, handoff_fd, 0, 0, 0, 0, 0);
     if (transport >= 0) raw_syscall(__NR_close, transport, 0, 0, 0, 0, 0);
     if (fd_copy >= 0) raw_syscall(__NR_close, fd_copy, 0, 0, 0, 0, 0);
     if (target_fd >= 0) raw_syscall(__NR_close, target_fd, 0, 0, 0, 0, 0);

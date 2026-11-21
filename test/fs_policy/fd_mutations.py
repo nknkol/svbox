@@ -22,8 +22,8 @@ with tempfile.TemporaryDirectory(prefix='fd-guard-', dir=build) as tmp:
                     '-fno-builtin', '-fno-stack-protector', str(repo / 'test/fs_policy/fd_mutations.c'),
                     '-o', str(root / 'probe')], check=True)
     p = subprocess.run([str(loader), '--mode', 'container', '--root', str(root),
-                        '-v', f'{root}/ro:/ro', '-v', f'{root}/rw:/rw',
-                        '--guard-file-mutations', 'drw', '--', './probe'],
+                        '--root-mode', 'deny', '-v', f'{root}/ro:/ro:ro', '-v', f'{root}/rw:/rw:rw',
+                        '--guard', 'files', '--', './probe'],
                        cwd=root, capture_output=True, text=True, timeout=20)
     assert p.returncode == 0, (p.returncode, p.stdout, p.stderr)
     assert p.stdout == '', p.stdout

@@ -64,9 +64,9 @@ with tempfile.TemporaryDirectory(prefix='dup-race-', dir=build) as tmp:
     (root / 'rw/file').write_text('rw')
     (root / 'rw/unknown').write_text('unknown')
     python = str(Path(sys.executable).resolve())
-    p = subprocess.run([str(loader), '--mode', 'container', '--root', '/',
-                        '-v', f'{root}/rw:/dup-rw', '--guard-file-mutations', 'rw',
-                        '--allow-stdio-output', '--allow-pipe-output', '--',
+    p = subprocess.run([str(loader), '--mode', 'container', '--root', '/', '--root-mode', 'ro',
+                        '-v', f'{root}/rw:/dup-rw:rw', '--guard', 'files',
+                        '--allow-stdio', '--allow-pipes', '--',
                         python.lstrip('/'), '-B', '-c', GUEST, '/dup-rw/file', 'dup-rw/unknown'],
                        cwd='/', capture_output=True, text=True, timeout=120)
     errors = [l for l in p.stderr.splitlines() if 'HiLogBase' not in l]

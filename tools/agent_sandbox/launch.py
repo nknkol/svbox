@@ -160,14 +160,12 @@ def command_line(compiled, root, loader, workdir, command, env, backend='isolate
         argv.append('--isolate')
     elif backend != 'in-process':
         raise ProfileError(f'Unknown backend {backend!r}')
-    vector = 'd'
+    argv += ['--root-mode', 'deny', '--sandbox']
     for mount in compiled['mounts']:
         if ':' in mount['source'] or ':' in mount['target']:
-            raise ProfileError('Mount paths cannot contain ":" for the loader volume syntax')
-        argv += ['-v', f'{mount["source"]}:{mount["target"]}']
-        vector += 'r' if mount['access'] == 'ro' else 'w'
-    argv += ['--guard-file-access', vector, '--allow-stdio-output', '--allow-pipe-output',
-             '--allow-local-output', '--allow-stream-input', '--revalidate-file-fds']
+            raise ProfileError('Mount paths cannot contain ":" for the svbox bind syntax')
+        mode = 'ro' if mount['access'] == 'ro' else 'rw'
+        argv += ['-v', f'{mount["source"]}:{mount["target"]}:{mode}']
     for fd in pass_fds:   # (writable to the guest as opened; the loader records each object)
         argv += ['--pass-fd', str(fd)]
     for entry in env:

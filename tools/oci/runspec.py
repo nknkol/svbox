@@ -254,28 +254,28 @@ def build(record, rootfs, cdir, isolate=False, extra_env=(), workdir=None, user=
     if isolate:
         argv.append('--isolate')
         for device in host.get('IsolateDevices') or []:
-            argv += ['--isolate-device', device]
+            argv += ['--allow-device', device]
     argv += ['--mode', 'container', '--root', str(rootfs), '--link-copy']
     if lower:
         import union
         # R6: the shared image rootfs, or the image's layer images.
         for cache, image in union.lowers(lower):
-            argv += ['--lower', str(cache)] + (['--lower-image', str(image)] if image else [])
+            argv += ['--lower', f'{cache}:{image}' if image else str(cache)]
     # Mounts the container makes (R4): a table every process of it shares
     # (docker exec joins it through the file), tmpfs directories below.
     argv += ['--mount-table', str(cdir / 'mounts.table'), '--mount-scratch', str(cdir / 'mounts')]
     if host.get('Owners'):
         argv += ['--owner-db', str(cdir / 'owners.db')]
     argv += list(loader_extra)   # container networks (network.py)
-    vector = 'r' if ro_root else 'w'
+    if ro_root:
+        argv += ['--root-mode', 'ro']
     for src, dst, mode in all_binds:
         if ':' in src or ':' in dst:
             raise SpecError(f'volume paths cannot contain ":": {src}:{dst}')
-        argv += ['-v', f'{src}:{dst}']
-        vector += 'r' if mode == 'ro' else 'w'
+        argv += ['-v', f'{src}:{dst}:{mode}' if guarded else f'{src}:{dst}']
     if guarded:
-        argv += ['--guard-path-mutations', vector]
-    argv += ['--cwd', cwd, '--user', f'{uid}:{gid}', '--hostname', cfg['Hostname'][:64]]
+        argv += ['--guard', 'paths']
+    argv += ['-w', cwd, '-u', f'{uid}:{gid}', '--hostname', cfg['Hostname'][:64]]
     for key, value in env.items():
         argv += ['-e', f'{key}={value}']
     if len(str(cdir / 'mounts').encode()) >= MAX_PATH - 48:

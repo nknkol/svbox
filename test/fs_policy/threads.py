@@ -72,10 +72,10 @@ with tempfile.TemporaryDirectory(prefix='threads-', dir=build) as tmp:
     before = (root / 'ro/file').stat()
     python = str(Path(sys.executable).resolve())
     # Root "/" readonly keeps the interpreter and its libraries reachable.
-    p = subprocess.run([str(loader), '--mode', 'container', '--root', '/',
-                        '-v', f'{root}/rw:/elf-rw', '-v', f'{root}/ro:/elf-ro',
-                        '--guard-file-mutations', 'rwr', '--allow-stdio-output',
-                        '--allow-pipe-output', '--allow-local-output', '--revalidate-file-fds',
+    p = subprocess.run([str(loader), '--mode', 'container', '--root', '/', '--root-mode', 'ro',
+                        '-v', f'{root}/rw:/elf-rw:rw', '-v', f'{root}/ro:/elf-ro:ro',
+                        '--guard', 'files', '--allow-stdio',
+                        '--allow-pipes', '--allow-local-io', '--revalidate-fds',
                         '--', python.lstrip('/'), '-B', '-c', GUEST, '/elf-rw', '/elf-ro'],
                        cwd='/', capture_output=True, text=True, timeout=300)
     assert p.returncode == 0, (p.returncode, p.stdout, p.stderr[-3000:])

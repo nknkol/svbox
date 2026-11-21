@@ -25,9 +25,8 @@ with tempfile.TemporaryDirectory(prefix='xattr-', dir=build) as tmp:
         'assert "user.elf_xattr" in os.listxattr(p); os.removexattr(p,"user.elf_xattr")',
         str(capability)], capture_output=True, text=True, timeout=10)
     assert p.returncode == 0, ('native backing xattr capability required', p.returncode, p.stderr)
-    modes = [None] if normal else ['--guard-path-mutations', '--guard-file-mutations',
-                                   '--observe-mount-access', None]
-    for option in modes:
+    modes = [None] if normal else ['paths', 'files', 'observe', None]
+    for level in modes:
         for directory in ('ro', 'rw', 'deny', 'nested'):
             path = root / directory
             path.mkdir(exist_ok=True)
@@ -40,7 +39,7 @@ with tempfile.TemporaryDirectory(prefix='xattr-', dir=build) as tmp:
             if link.is_symlink():
                 link.unlink()
             link.symlink_to(target)
-        guarded = option in ('--guard-path-mutations', '--guard-file-mutations')
+        guarded = level in ('paths', 'files')
         protected = {name: ((root / name / 'file').stat().st_ctime_ns,
                             os.getxattr(root / name / 'file', 'user.elf_xattr'))
                      for name in ('ro', 'deny')}
@@ -48,12 +47,16 @@ with tempfile.TemporaryDirectory(prefix='xattr-', dir=build) as tmp:
                         '-fno-builtin', '-fno-stack-protector', *(['-DGUARDED'] if guarded else []),
                         str(repo / 'test/fs_policy/xattrs.c'), '-o', str(root / 'probe.next')], check=True)
         (root / 'probe.next').replace(root / 'probe')
-        command = [str(loader), '--mode', 'container', '--root', str(root),
-                   '-v', f'{root}/ro:/ro', '-v', f'{root}/rw:/rw',
-                   '-v', f'{root}/deny:/deny', '-v', f'{root}/nested:/ro/nested',
-                   *([option, 'drwdw'] if option else []), '--', './probe']
+        if level:
+            policy = ['--root-mode', 'deny', '-v', f'{root}/ro:/ro:ro', '-v', f'{root}/rw:/rw:rw',
+                      '-v', f'{root}/deny:/deny:deny', '-v', f'{root}/nested:/ro/nested:rw',
+                      '--guard', level]
+        else:
+            policy = ['-v', f'{root}/ro:/ro', '-v', f'{root}/rw:/rw',
+                      '-v', f'{root}/deny:/deny', '-v', f'{root}/nested:/ro/nested']
+        command = [str(loader), '--mode', 'container', '--root', str(root), *policy, '--', './probe']
         p = subprocess.run(command, cwd=root, capture_output=True, text=True, timeout=20)
-        assert p.returncode == 0, (option, p.returncode, p.stdout, p.stderr)
+        assert p.returncode == 0, (level, p.returncode, p.stdout, p.stderr)
         for directory in ('ro', 'rw', 'deny', 'nested'):
             assert (root / directory / 'file').read_bytes() == b'unchanged'
         for directory in ('rw', 'nested'):
@@ -63,4 +66,4 @@ with tempfile.TemporaryDirectory(prefix='xattr-', dir=build) as tmp:
                 path = root / directory / 'file'
                 assert (path.stat().st_ctime_ns, os.getxattr(path, 'user.elf_xattr')) == expected
         assert (root / 'rw/dangling').is_symlink() and not (root / 'rw/absent').exists()
-        print('PASS: real xattr paths, links, cwd, nested binds and host state:', option or suffix or 'normal')
+        print('PASS: real xattr paths, links, cwd, nested binds and host state:', level or suffix or 'normal')

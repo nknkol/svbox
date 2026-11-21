@@ -17,8 +17,7 @@ with tempfile.TemporaryDirectory(prefix='policy-transport-', dir=build) as tmp:
     root = Path(tmp)
     for name in ('ro', 'rw'):
         (root / name).mkdir()
-    base = [str(loader), '--mode', 'container', '--root', str(root),
-            '-v', f'{root}/ro:/ro', '-v', f'{root}/rw:/rw']
+    base = [str(loader), '--mode', 'container', '--root', str(root)]
     def run(options):
         return subprocess.run([*base, *options, '--', './probe'], cwd=root,
                               capture_output=True, text=True, timeout=20)
@@ -29,18 +28,30 @@ with tempfile.TemporaryDirectory(prefix='policy-transport-', dir=build) as tmp:
                         '-I' + str(repo / 'src/payload/include'),
                         str(repo / 'test/fs_policy/transport.c'), '-o', str(root / 'probe.next')], check=True)
         (root / 'probe.next').replace(root / 'probe')
-        p = run(['--observe-mount-access', 'drw'] if enabled else ['--fd-track'])
+        opts = (['--root-mode', 'deny', '-v', f'{root}/ro:/ro:ro', '-v', f'{root}/rw:/rw:rw',
+                 '--guard', 'observe'] if enabled
+                else ['-v', f'{root}/ro:/ro', '-v', f'{root}/rw:/rw', '--guard', 'track'])
+        p = run(opts)
         assert p.returncode == 0 and 'PASS: policy observation' in p.stdout, (p.returncode, p.stdout, p.stderr)
         print('PASS: real exec transport, observation enabled =', enabled)
-    for options in (['--observe-mount-access', v] for v in ('', 'dr', 'drww', 'drx', 'w'*18)):
+    for options in (['--root-mode', 'bad'],
+                    ['-v', f'{root}/ro:/ro:bad'],
+                    ['--guard', 'bogus'],
+                    ['--root-mode', 'ro', '--guard', 'none'],
+                    ['--root-mode', 'ro', '--guard', 'track'],
+                    ['--guard', 'observe', '--guard', 'observe'],
+                    ['--guard', 'observe', '--guard', 'paths'],
+                    ['--guard', 'observe', '--sandbox'],
+                    ['--sandbox', '--sandbox'],
+                    ['--__handoff-fd', '9999']):
         p = run(options)
-        assert p.returncode != 0 and 'mount access observation' in p.stdout+p.stderr, (options, p.stdout, p.stderr)
-    p = run(['--observe-mount-access', 'drw', '--observe-mount-access', 'drw'])
-    assert p.returncode != 0 and 'duplicate mount access observation' in p.stdout+p.stderr
-    for guard in ('--guard-path-mutations', '--guard-file-mutations'):
-        p = run(['--observe-mount-access', 'drw', guard, 'drw'])
-        assert p.returncode != 0 and 'duplicate mount access observation' in p.stdout+p.stderr
-    print('PASS: reject empty, malformed, oversized, mismatched and duplicate policies')
+        assert p.returncode != 0, (options, p.stdout, p.stderr)
+    # --help and --version smoke checks
+    p = subprocess.run([str(loader), '--help'], capture_output=True, text=True, timeout=10)
+    assert p.returncode == 0 and 'Usage: svbox' in p.stdout and '--__handoff-fd' not in p.stdout, p.stdout
+    p = subprocess.run([str(loader), '--version'], capture_output=True, text=True, timeout=10)
+    assert p.returncode == 0 and p.stdout.startswith('svbox '), p.stdout
+    print('PASS: reject malformed/conflicting CLI options, bad handoff FD, and verify --help/--version')
     # Verify the actual experimental payload layout has its own ABI version,
     # and old custom payload headers are rejected before guest startup.
     ABI = int(re.search(r'#define PAYLOAD_ABI_VERSION (\d+)', (repo / 'src/payload/include/elf_abi.h').read_text()).group(1))

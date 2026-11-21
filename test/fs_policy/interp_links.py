@@ -37,9 +37,9 @@ with tempfile.TemporaryDirectory(prefix='interp-links-', dir=build) as tmp:
     (root / 'tool').write_text('#!/wrapper -x\n')
     (root / 'wrapper').chmod(0o755)
     (root / 'tool').chmod(0o755)
-    for suffix, options in (('', []), ('-guarded', []),
-                            ('-guarded', ['--guard-file-access', 'r', '--allow-stdio-output',
-                                                '--allow-pipe-output'])):
+    for suffix, options in (('', []), ('-guarded', ['--guard', 'track']),
+                            ('-guarded', ['--root-mode', 'ro', '--guard', 'access',
+                                          '--allow-stdio', '--allow-pipes'])):
         loader = lib.loader(suffix)
         p = subprocess.run([str(loader), '--mode', 'container', '--root', str(root), *options, '--',
                             './bin/busybox', 'sh', '-c', 'echo direct=ok; /bin/busybox echo exec=ok; /tool a; '

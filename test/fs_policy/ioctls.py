@@ -30,25 +30,27 @@ with tempfile.TemporaryDirectory(prefix='ioctl-policy-', dir=build) as tmp:
     assert native.returncode == 0 and len(native.stdout)==64, (
         'native ioctl probe', native.returncode, native.stdout, native.stderr)
     print('Native permitted ioctl results:', struct.unpack('8q', native.stdout))
-    base = [str(loader), '--mode', 'container', '--root', str(root),
-            '-v', f'{root}/ro:/ro', '-v', f'{root}/rw:/rw', '-v', f'{root}/deny:/deny']
-    for option in (None, '--observe-mount-access', '--guard-path-mutations', '--guard-file-mutations'):
-        guarded = option == '--guard-file-mutations'
+    base = [str(loader), '--mode', 'container', '--root', str(root)]
+    pol_binds = ['--root-mode', 'deny', '-v', f'{root}/ro:/ro:ro',
+                 '-v', f'{root}/rw:/rw:rw', '-v', f'{root}/deny:/deny:deny']
+    raw_binds = ['-v', f'{root}/ro:/ro', '-v', f'{root}/rw:/rw', '-v', f'{root}/deny:/deny']
+    for level in (None, 'observe', 'paths', 'files'):
+        guarded = level == 'files'
         compile_probe(guarded)
-        command = [*base, *([option, 'drwd'] if option else []),
-                   *(['--allow-stdio-output'] if guarded else []), '--', './probe', 'guest']
+        command = [*base, *([*pol_binds, '--guard', level] if level else raw_binds),
+                   *(['--allow-stdio'] if guarded else []), '--', './probe', 'guest']
         p = subprocess.run(command, cwd=root, capture_output=True, timeout=20)
         assert p.returncode == 0 and p.stdout==native.stdout, (
-            option, p.returncode, p.stdout, p.stderr)
+            level, p.returncode, p.stdout, p.stderr)
         for name in ('ro', 'rw', 'deny'):
             assert (root / name / 'file').read_bytes()==b'unchanged'
         for name, timestamp in before.items():
             assert (root / name / 'file').stat().st_ctime_ns==timestamp
-        print('PASS: ioctl native parity and policy:', option or 'legacy')
+        print('PASS: ioctl native parity and policy:', level or 'none')
     master, slave = os.openpty()
     try:
-        p = subprocess.run([*base, '--guard-file-mutations', 'drwd',
-                            '--allow-stdio-output', '--', './probe', 'tty'], cwd=root,
+        p = subprocess.run([*base, *pol_binds, '--guard', 'files',
+                            '--allow-stdio', '--', './probe', 'tty'], cwd=root,
                            stdout=slave, stderr=subprocess.PIPE, timeout=20)
         assert p.returncode==0, (p.returncode, p.stderr)
         print('PASS: real PTY queries and mutation/injection rejection')

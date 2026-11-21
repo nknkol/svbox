@@ -236,7 +236,7 @@ static void exec_allowed(void)
 {
     pid_t pid = fork();
     if (!pid) {
-        char *argv[] = {"elfloader", "--guest-filter-dump", 0};
+        char *argv[] = {"svbox", "--dump-filter", 0};
         long rc = via(__NR_execveat, CONFIG_ISOLATE_LOADER_FD, (long)empty_path(), (long)argv, (long)environ,
                       AT_EMPTY_PATH, 0);
         printf("execveat-failed %ld\n", rc);

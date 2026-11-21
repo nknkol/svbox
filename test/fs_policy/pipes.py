@@ -22,9 +22,9 @@ with tempfile.TemporaryDirectory(prefix='pipe-guard-', dir=build) as tmp:
                     '-fno-builtin', '-fno-stack-protector', str(repo / 'test/fs_policy/pipes.c'),
                     '-o', str(root / 'probe')], check=True)
     p = subprocess.run([str(loader), '--mode', 'container', '--root', str(root),
-                        '-v', f'{root}/ro:/ro', '-v', f'{root}/rw:/rw',
-                        '--guard-file-mutations', 'drw', '--allow-stdio-output',
-                        '--allow-pipe-output', '--', './probe'],
+                        '--root-mode', 'deny', '-v', f'{root}/ro:/ro:ro', '-v', f'{root}/rw:/rw:rw',
+                        '--guard', 'files', '--allow-stdio',
+                        '--allow-pipes', '--', './probe'],
                        cwd=root, capture_output=True, text=True, timeout=20)
     assert p.returncode == 0, (p.returncode, p.stdout, p.stderr)
     assert p.stdout == 'PIPE-OK\n', p.stdout
@@ -50,15 +50,15 @@ for directory, shell, prefix, cat, tr in (
     ]
     for command, expected in zip(commands, ('PIPELINE\n', 'capture\n', 'forked\n')):
         p = subprocess.run([str(loader), '--mode', 'container', '--root', str(root),
-                            '--guard-file-mutations', 'r', '--allow-stdio-output',
-                            '--allow-pipe-output', '--', shell, *prefix, '-c', command],
+                            '--root-mode', 'ro', '--guard', 'files', '--allow-stdio',
+                            '--allow-pipes', '--', shell, *prefix, '-c', command],
                            cwd=root, text=True, capture_output=True, timeout=20)
         assert p.returncode == 0 and p.stdout == expected, (directory, command, p.returncode, p.stdout, p.stderr)
     print('PASS: protected pipeline, command substitution and subshell:', directory)
 
-for args, marker in ((['--allow-pipe-output'], 'pipe output requires file mutation guard'),
-                     (['--guard-file-mutations', 'r', '--allow-pipe-output', '--allow-pipe-output'],
-                      'duplicate pipe output option')):
+for args, marker in ((['--allow-pipes'], '--allow-pipes requires --guard files'),
+                     (['--root-mode', 'ro', '--guard', 'files', '--allow-pipes', '--allow-pipes'],
+                      'duplicate --allow-pipes option')):
     p = subprocess.run([str(loader), *args, '--', '/no-guest-needed'],
                        capture_output=True, text=True, timeout=20)
     assert p.returncode != 0 and marker in p.stdout+p.stderr, (p.stdout, p.stderr)

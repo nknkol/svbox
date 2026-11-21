@@ -77,7 +77,7 @@ with tempfile.TemporaryDirectory(prefix='loop-', dir=lib.mode_capable()) as tmp:
             (work / 'img.erofs').write_bytes(image_bytes)
             (work / 'plain').write_bytes(b'\0' * 8192)
             scratch = Path(tmp, 'scratch' + suffix + ''.join(isolate))
-            guard = ['--guard-path-mutations', 'rww'] if suffix else []
+            guard = ['--root-mode', 'ro', '--guard', 'paths'] if suffix else []
             for name, command, expected in STEPS:
                 p = subprocess.run([str(loader), *lib.ISOLATE_EXTRA, *isolate, '--mode', 'container',
                                     '--root', str(ALPINE), '-v', f'{work}:/w', '-v', '/dev/null:/dev/null',

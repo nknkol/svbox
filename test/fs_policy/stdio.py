@@ -21,10 +21,10 @@ with tempfile.TemporaryDirectory(prefix='stdio-guard-', dir=build) as tmp:
     subprocess.run(['clang', '-D_GNU_SOURCE', '-O1', '-nostdlib', '-static', '-ffreestanding',
                     '-fno-builtin', '-fno-stack-protector', str(repo / 'test/fs_policy/stdio.c'),
                     '-o', str(root / 'probe')], check=True)
-    base = [str(loader), '--mode', 'container', '--root', str(root),
-            '-v', f'{root}/ro:/ro', '--guard-file-mutations', 'dr']
+    base = [str(loader), '--mode', 'container', '--root', str(root), '--root-mode', 'deny',
+            '-v', f'{root}/ro:/ro:ro', '--guard', 'files']
     def run(mode, *, allow=True, output=subprocess.PIPE, data=None):
-        p = subprocess.run([*base, *(['--allow-stdio-output'] if allow else []),
+        p = subprocess.run([*base, *(['--allow-stdio'] if allow else []),
                             '--', './probe', mode], cwd=root, input=data,
                            stdout=output, stderr=subprocess.PIPE, timeout=20)
         assert p.returncode == 0, (mode, p.returncode, p.stdout, p.stderr)
@@ -68,10 +68,10 @@ with tempfile.TemporaryDirectory(prefix='stdio-guard-', dir=build) as tmp:
             print('PASS: verified terminal stdio output')
         finally:
             os.close(master);os.close(slave)
-    for args, marker in (([str(loader), '--allow-stdio-output', '--', str(root / 'probe')],
-                          b'stdio output requires file mutation guard'),
-                         ([*base, '--allow-stdio-output', '--allow-stdio-output', '--', './probe'],
-                          b'duplicate stdio output option')):
+    for args, marker in (([str(loader), '--allow-stdio', '--', str(root / 'probe')],
+                          b'--allow-stdio requires --guard files'),
+                         ([*base, '--allow-stdio', '--allow-stdio', '--', './probe'],
+                          b'duplicate --allow-stdio option')):
         p = subprocess.run(args, cwd=root, capture_output=True, timeout=20)
         assert p.returncode != 0 and marker in p.stdout+p.stderr, (p.stdout, p.stderr)
     print('PASS: invalid stdio option combinations rejected')
@@ -87,7 +87,7 @@ for directory, shell, args, marker in (
         print('SKIP: protected stdio rootfs unavailable:', directory)
         continue
     p = subprocess.run([str(loader), '--mode', 'container', '--root', str(root),
-                        '--guard-file-mutations', 'r', '--allow-stdio-output',
+                        '--root-mode', 'ro', '--guard', 'files', '--allow-stdio',
                         '--', shell, *args], cwd=root, input='STDIO-INPUT\n',
                        text=True, capture_output=True, timeout=20)
     assert p.returncode == 0 and 'STDIO-INPUT\n' in p.stdout and marker in p.stdout, (

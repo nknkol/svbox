@@ -30,18 +30,19 @@ with tempfile.TemporaryDirectory(prefix='case-alias-', dir=build) as tmp:
     (work / 'Secret/key').write_text('secret')
     insensitive = (work / 'secret').exists() and os.path.samefile(work / 'secret', work / 'Secret')
 
-    def run(policy):
+    def run(secret_mode):
         script = ('for p in /work/Secret /work/secret /work/SECRET /work/sEcReT; do '
                   './bin/busybox cat $p/key ; echo " $?"; done')
         return subprocess.run([str(loader), '--mode', 'container', '--root', str(alpine),
-                               '-v', f'{work}:/work', '-v', f'{work}/Secret:/work/Secret',
-                               '--guard-file-access', policy, '--allow-stdio-output', '--',
+                               '--root-mode', 'ro',
+                               '-v', f'{work}:/work:rw', '-v', f'{work}/Secret:/work/Secret:{secret_mode}',
+                               '--guard', 'access', '--allow-stdio', '--',
                                './bin/busybox', 'sh', '-c', script],
                               cwd=alpine, capture_output=True, text=True, timeout=60)
-    denied = run('rwd')
+    denied = run('deny')
     assert denied.returncode == 0 and 'secret' not in denied.stdout, \
         (denied.returncode, denied.stdout, denied.stderr[-500:])
-    same = run('rww')
+    same = run('rw')
     expect = ['secret 0'] * 4 if insensitive else ['secret 0', '1', '1', '1']
     assert same.returncode == 0 and [l.strip() for l in same.stdout.splitlines()] == expect, \
         (insensitive, same.returncode, same.stdout, same.stderr[-500:])

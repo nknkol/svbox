@@ -119,9 +119,9 @@ with tempfile.TemporaryDirectory(prefix='iso-parity-', dir=lib.mode_capable()) a
         """lazy_layer.c by the broker: rc of BROKER_LAZY_PATH on cache/rel."""
         runs[0] += 1
         p = subprocess.run([str(loader), *lib.ISOLATE_EXTRA, '--isolate', '--mode', 'container',
-                            '--root', str(upper), '--lower', str(cache), '--lower-image', str(image),
+                            '--root', str(upper), '--root-mode', 'deny', '--lower', f'{cache}:{image}',
                             '--mount-table', str(tmp / f'm{runs[0]}'), '--mount-scratch', str(tmp / f's{runs[0]}'),
-                            '--guard-file-access', 'd', '--allow-stdio-output', '--',
+                            '--guard', 'access', '--allow-stdio', '--',
                             './.elf-exec', 'h', 'lazypath', f'{cache}/{rel}'.rstrip('/'), str(op)],
                            capture_output=True, text=True, timeout=60, cwd='/')
         for line in p.stdout.splitlines():

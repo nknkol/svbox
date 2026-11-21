@@ -62,7 +62,11 @@ with tempfile.TemporaryDirectory(prefix='sock-', dir=base) as tmp:
     binds = ['-v', f'{root}/host-w:/w', '-v', f'{root}/host-r:/r']
 
     def run(path, mode, options):
-        return subprocess.run([str(path), '--mode', 'container', '--root', str(root), *binds,
+        if mode == 'guard':
+            b = ['--root-mode', 'deny', '-v', f'{root}/host-w:/w:rw', '-v', f'{root}/host-r:/r:ro']
+        else:
+            b = ['-v', f'{root}/host-w:/w', '-v', f'{root}/host-r:/r']
+        return subprocess.run([str(path), '--mode', 'container', '--root', str(root), *b,
                                *options, '--', './probe', mode, longpath, hostpath],
                               cwd=root, capture_output=True, timeout=30)
 
@@ -70,8 +74,8 @@ with tempfile.TemporaryDirectory(prefix='sock-', dir=base) as tmp:
         for name in ('s1', 's2', 't', 'd', f'{deep}/s'):
             (root / 'host-w' / name).unlink(missing_ok=True)
 
-    cases = [(experiment, 'guard', ['--guard-file-access', 'dwr']),
-             (experiment, 'plain', [])]
+    cases = [(experiment, 'guard', ['--guard', 'access']),
+             (experiment, 'plain', ['--guard', 'track'])]
     default = loader('')
     if default:
         cases.append((default, 'plain', []))

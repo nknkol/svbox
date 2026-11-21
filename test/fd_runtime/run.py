@@ -202,7 +202,7 @@ with tempfile.TemporaryDirectory(prefix='fd-runtime-', dir=build) as temp, \
     subprocess.run(['clang', '-O1', '-nostdlib', '-static', '-ffreestanding',
                     '-fno-builtin', '-fno-stack-protector',
                     str(repo / 'test/syscalls/runtime_probe.c'), '-o', str(guards)], check=True)
-    p = subprocess.run([str(loader), '--fd-track', '--mode', 'compat', '--', str(guards), 'b'],
+    p = subprocess.run([str(loader), '--guard', 'track', '--mode', 'compat', '--', str(guards), 'b'],
                        capture_output=True, text=True, timeout=20)
     assert p.returncode == 0 and 'NR=452\nRET=-38\n' in p.stdout, (p.returncode, p.stdout, p.stderr)
     assert p.stdout.count('RET=-38\n') == 14, p.stdout
@@ -212,14 +212,17 @@ with tempfile.TemporaryDirectory(prefix='fd-runtime-', dir=build) as temp, \
             assert f"NR={entry['number']}\nRET=-38\n" in p.stdout, entry
     print('PASS: experimental fatal syscall guards including native SIGSYS census and fchmodat2')
 
+    handoff_exec = work / 'handoff-exec'
+    subprocess.run(['clang', '-O1', '-I' + str(repo / 'src/payload/include'),
+                    str(repo / 'test/fd_runtime/handoff_exec.c'), '-o', str(handoff_exec)], check=True)
     bad_probe = work / 'restore-error'
     subprocess.run(['clang', '-O1', '-nostdlib', '-static', '-ffreestanding', '-fno-builtin',
                     '-fno-stack-protector', '-I' + str(repo / 'src/payload/include'),
                     str(repo / 'test/fd_runtime/restore_error.c'), '-o', str(bad_probe)], check=True)
     bad_state = os.memfd_create('unsealed-fd-state', flags=0)
     try:
-        p = subprocess.run([str(loader), '--child-loader', '--fd-state', str(bad_state),
-                            '--', str(bad_probe)], cwd=work, pass_fds=(bad_state,),
+        p = subprocess.run([str(handoff_exec), str(loader), str(bad_state), str(bad_probe)],
+                           cwd=work, pass_fds=(bad_state,),
                            capture_output=True, text=True, timeout=20)
         assert p.returncode == 0, (p.returncode, p.stdout, p.stderr)
     finally:
@@ -243,8 +246,8 @@ with tempfile.TemporaryDirectory(prefix='fd-runtime-', dir=build) as temp, \
             target = limit_probe if case == 'serial-limit' else bad_probe
             argument = str(inherited) if case == 'serial-limit' else str(
                 errno.EINVAL if case == 'cloexec-record' else errno.ESTALE)
-            p = subprocess.run([str(loader), '--child-loader', '--fd-state', str(state),
-                                '--', str(target), argument], cwd=work, pass_fds=(state, inherited),
+            p = subprocess.run([str(handoff_exec), str(loader), str(state), str(target), argument],
+                               cwd=work, pass_fds=(state, inherited),
                                capture_output=True, text=True, timeout=20)
             assert p.returncode == 0, (case, p.returncode, p.stdout, p.stderr)
         finally:
@@ -260,7 +263,7 @@ for directory, target, arguments, marker in [
     if not (root / target).exists():
         print('SKIP: optional rootfs smoke', directory)
         continue
-    p = subprocess.run([str(loader), '--fd-track', '--mode', 'container', '--root', str(root),
+    p = subprocess.run([str(loader), '--guard', 'track', '--mode', 'container', '--root', str(root),
                         '--', target, *arguments], cwd=root, text=True,
                        capture_output=True, timeout=20)
     assert p.returncode == 0 and marker in p.stdout, (directory, p.returncode, p.stdout, p.stderr)
@@ -276,7 +279,7 @@ for directory, shell, command, marker in [
     if not (root / shell).exists():
         print('SKIP: optional rootfs exec smoke', directory)
         continue
-    p = subprocess.run([str(loader), '--fd-track', '--mode', 'container', '--root', str(root),
+    p = subprocess.run([str(loader), '--guard', 'track', '--mode', 'container', '--root', str(root),
                         '--', shell, *command], cwd=root, capture_output=True, text=True, timeout=20)
     assert p.returncode == 0 and marker in p.stdout, (directory, p.returncode, p.stdout, p.stderr)
     print('PASS: experimental runtime rootfs shell exec', directory)

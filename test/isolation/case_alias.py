@@ -78,10 +78,13 @@ with tempfile.TemporaryDirectory(prefix='iso-case-', dir=base_dir) as tmp:
             guarded = suffix == '-guarded'
 
             def expect(args, checks):
-                argv = [str(loader), '--isolate', *lib.ISOLATE_EXTRA, '--mode', 'container', '--root', str(alpine),
-                        '-v', f'{work}:/work', '-v', f'{work}/Secret:/work/Secret', '-v', f'{work}/Ro:/work/Ro']
+                argv = [str(loader), '--isolate', *lib.ISOLATE_EXTRA, '--mode', 'container', '--root', str(alpine)]
                 if guarded:
-                    argv += ['--guard-file-access', 'rwdr', '--allow-stdio-output']
+                    argv += ['--root-mode', 'ro', '-v', f'{work}:/work:rw',
+                             '-v', f'{work}/Secret:/work/Secret:deny', '-v', f'{work}/Ro:/work/Ro:ro',
+                             '--guard', 'access', '--allow-stdio']
+                else:
+                    argv += ['-v', f'{work}:/work', '-v', f'{work}/Secret:/work/Secret', '-v', f'{work}/Ro:/work/Ro']
                 p = subprocess.run([*argv, '--', './iso-probe', *args], cwd=alpine, capture_output=True,
                                    text=True, timeout=120, stdin=subprocess.DEVNULL)
                 values = parse(p.stdout)

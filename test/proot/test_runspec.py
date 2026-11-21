@@ -44,7 +44,7 @@ with tempfile.TemporaryDirectory(prefix='runspec-', dir=lib.BUILD) as tmp:
         for isolate in ([], ['--isolate']):
             common = [str(loader), *lib.ISOLATE_EXTRA, *isolate, '--mode', 'container', '--root', '/',
                       '-v', f'{work}:/runspec', '-v', f'{bindir}:/runspec-bin', *extra]
-            p = subprocess.run([*common, '--cwd', '/runspec/sub', '--user', '1000:1001',
+            p = subprocess.run([*common, '--workdir', '/runspec/sub', '--user', '1000:1001',
                                 '--hostname', 'box1', *envs, '-e', 'PATH=/runspec-bin',
                                 '--', str(python).lstrip('/'), '-B', '-c', GUEST, str(python)],
                                cwd='/', capture_output=True, text=True, timeout=120)
@@ -55,7 +55,7 @@ with tempfile.TemporaryDirectory(prefix='runspec-', dir=lib.BUILD) as tmp:
                         'node': 'box1', 'envs': 100, 'child': 'box1 1000 /runspec/sub'}
             assert out == expected, (suffix, isolate, out)
             # A missing working directory: an error, the program never runs.
-            p = subprocess.run([*common, '--cwd', '/runspec/missing', '--', 'bin/true'],
+            p = subprocess.run([*common, '--workdir', '/runspec/missing', '--', 'bin/true'],
                                cwd='/', capture_output=True, text=True, timeout=60)
             assert p.returncode == 1 and 'cannot enter working directory' in p.stderr, \
                 (suffix, isolate, p.returncode, p.stderr)

@@ -56,7 +56,7 @@ def eof_after(stream, seconds):
 
 failures = []
 for suffix, loader in lib.loaders():
-    for log in ([], ['--log', '4']):
+    for log in ([], ['--log-level', '4']):
         what = (loader.name, *log)
         p = subprocess.Popen([str(loader), *lib.ISOLATE_EXTRA, '--isolate', *log, '--mode', 'container',
                               '--root', '/', '--', python, '-B', '-c', DAEMON], cwd='/',

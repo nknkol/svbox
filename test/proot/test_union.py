@@ -110,7 +110,7 @@ with tempfile.TemporaryDirectory(prefix='union-', dir=lib.mode_capable()) as tmp
         if kind == 'image':
             cache = Path(tmp, 'cache' + suffix + ''.join(isolate))
             cache.mkdir()
-            lower = ['--lower', str(cache), '--lower-image', str(image)]
+            lower = ['--lower', f'{cache}:{image}']
 
         def run(command, timeout=60):
             return subprocess.run([str(loader), *lib.ISOLATE_EXTRA, *isolate, '--mode', 'container',

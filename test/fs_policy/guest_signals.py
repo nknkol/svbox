@@ -20,7 +20,7 @@ with tempfile.TemporaryDirectory(prefix='segv-', dir=build) as tmp:
     probe = Path(tmp) / 'probe'
     subprocess.run([*lib.PROBE, str(repo / 'test/fs_policy/segv_probe.c'),
                     '-o', str(probe)], check=True)
-    for suffix, extra in (('', []), ('-guarded', ['--fd-track'])):
+    for suffix, extra in (('', []), ('-guarded', ['--guard', 'track'])):
         loader = lib.loader()
         def run(mode):
             return subprocess.run([str(loader), *extra, '--mode', 'container', '--root', str(alpine),

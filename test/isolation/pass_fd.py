@@ -63,8 +63,8 @@ with tempfile.TemporaryDirectory(prefix='iso-passfd-', dir=lib.mode_capable()) a
         for kind, fd in fds.items():
             for how in ('h', 'd'):
                 p = subprocess.run([str(loader), *lib.ISOLATE_EXTRA, *(['--isolate'] if backend == 'isolate' else []),
-                                    '--mode', 'container', '--root', str(root), '--guard-file-access', 'd',
-                                    '--allow-stdio-output', *passed, '--', './.elf-exec', how, 'fdcalls', str(fd)],
+                                    '--mode', 'container', '--root', str(root), '--root-mode', 'deny',
+                                    '--guard', 'access', '--allow-stdio', *passed, '--', './.elf-exec', how, 'fdcalls', str(fd)],
                                    capture_output=True, text=True, timeout=60, cwd='/', pass_fds=list(fds.values()))
                 got = dict(line.split() for line in p.stdout.splitlines() if line.startswith('fd-'))
                 results[(kind, how)] = {k: int(v) for k, v in got.items()} or p.stdout + p.stderr

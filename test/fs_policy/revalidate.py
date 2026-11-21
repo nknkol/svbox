@@ -23,9 +23,12 @@ with tempfile.TemporaryDirectory(prefix='file-revalidate-', dir=build) as tmp:
     subprocess.run(['clang', '-D_GNU_SOURCE', '-O1', '-nostdlib', '-static', '-ffreestanding',
                     '-fno-builtin', '-fno-stack-protector', str(repo/'test/fs_policy/revalidate.c'),
                     '-o', str(root/'probe')], check=True)
-    base = [str(loader), '--mode', 'container', '--root', str(root),
-            '-v', f'{work}/out:/out', '-v', f'{work}/ro:/ro']
-    p = subprocess.run([*base, '--guard-file-mutations', 'dwr', '--revalidate-file-fds',
+    handoff_exec = work / 'handoff-exec'
+    subprocess.run(['clang', '-O1', '-I' + str(repo / 'src/payload/include'),
+                    str(repo / 'test/fd_runtime/handoff_exec.c'), '-o', str(handoff_exec)], check=True)
+    p = subprocess.run([str(loader), '--mode', 'container', '--root', str(root),
+                        '--root-mode', 'deny', '-v', f'{work}/out:/out:rw', '-v', f'{work}/ro:/ro:ro',
+                        '--guard', 'files', '--revalidate-fds',
                         '--', './probe', 'start'], cwd=root, capture_output=True, timeout=20)
     assert p.returncode == 0, (p.returncode, p.stdout, p.stderr)
     assert (work/'out/file').read_bytes() == b'END'
@@ -43,9 +46,10 @@ with tempfile.TemporaryDirectory(prefix='file-revalidate-', dir=build) as tmp:
                                         fd, 0, 1, 1, 1, 2))
             fcntl.fcntl(state, fcntl.F_ADD_SEALS,
                         fcntl.F_SEAL_WRITE|fcntl.F_SEAL_GROW|fcntl.F_SEAL_SHRINK|fcntl.F_SEAL_SEAL)
-            p = subprocess.run([*base, *extra, '--guard-file-mutations', policy,
-                                *(['--revalidate-file-fds'] if enabled else []),
-                                '--child-loader', '--fd-state', str(state),
+            p = subprocess.run([str(handoff_exec), str(loader), str(state),
+                                '--root', str(root), '-v', f'{work}/out:/out', '-v', f'{work}/ro:/ro',
+                                *extra, '--guard', 'files', '--policy', policy,
+                                *(['--revalidate-fds'] if enabled else []),
                                 '--exec-target', str(root/'probe'), '--exec-path', '/probe',
                                 '--', '/probe', mode, str(fd)], cwd=root, pass_fds=(fd,state),
                                capture_output=True, timeout=20)
@@ -79,8 +83,8 @@ for directory, shell, prefix, cat in (
                    f'printf "appended\\n" | {cat} >> /out/result; '
                    f'exec {cat} /out/result')
         p = subprocess.run([str(loader), '--mode', 'container', '--root', str(root),
-                            '-v', f'{output}:/out', '--guard-file-mutations', 'rw',
-                            '--allow-stdio-output', '--allow-pipe-output', '--revalidate-file-fds',
+                            '--root-mode', 'ro', '-v', f'{output}:/out:rw', '--guard', 'files',
+                            '--allow-stdio', '--allow-pipes', '--revalidate-fds',
                             '--', shell, *prefix, '-c', command], cwd=root,
                            capture_output=True, text=True, timeout=20)
         assert p.returncode == 0 and p.stdout == 'redirected\nappended\n', (
@@ -88,9 +92,9 @@ for directory, shell, prefix, cat in (
         assert (output/'result').read_text() == p.stdout
     print('PASS: protected pipeline file redirection, append and exec:', directory)
 
-for args, marker in ((['--revalidate-file-fds'], 'file FD revalidation requires file mutation guard'),
-                     (['--guard-file-mutations', 'r', '--revalidate-file-fds', '--revalidate-file-fds'],
-                      'duplicate file FD revalidation option')):
+for args, marker in ((['--revalidate-fds'], '--revalidate-fds requires --guard files'),
+                     (['--root-mode', 'ro', '--guard', 'files', '--revalidate-fds', '--revalidate-fds'],
+                      'duplicate --revalidate-fds option')):
     p = subprocess.run([str(loader), *args, '--', '/no-guest-needed'],
                        capture_output=True, text=True, timeout=20)
     assert p.returncode != 0 and marker in p.stdout+p.stderr, (p.stdout, p.stderr)

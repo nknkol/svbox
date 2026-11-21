@@ -114,21 +114,6 @@ static void load(struct image *img, const char *path, int fd, unsigned long payl
 	z_close(fd);
 }
 
-/* Isolation mode: the case-alias marks the initial loader computed. */
-static void set_case_folds(payload_config_t *cfg, const char *folds)
-{
-	for (int i = 0; i < cfg->bind_count && *folds; i++) {
-		unsigned long v = 0;
-		while (*folds >= '0' && *folds <= '9' && v < CONFIG_MAX_PATH)
-			v = v * 10 + (unsigned long)(*folds++ - '0');
-		if (*folds && *folds != ',')
-			z_errx(1, "invalid value for " CONFIG_CHILD_CASE_FOLDS);
-		if (*folds)
-			folds++;
-		cfg->binds[i].fold = (uint32_t)v;
-	}
-}
-
 /* PT_INTERP of the program, as a host path: the payload resolved it for a
  * guarded child (read policy, guest symlinks); otherwise it is resolved
  * through the root and binds here. NULL for a static program. */
@@ -304,6 +289,14 @@ void z_entry(unsigned long *sp, void (*fini)(void))
 	Elf_auxv_t *auxv = (Elf_auxv_t *)p;
 
 	options_parse(argc, argv, &cfg, &opt);
+	if (opt.show_help) {
+		options_print_help(1);
+		z_exit(0);
+	}
+	if (opt.show_version) {
+		z_fdprintf(1, "svbox %s\n", SVBOX_VERSION);
+		z_exit(0);
+	}
 	if (opt.filter_dump) {
 		guest_filter_dump(cfg.device_mask);
 		z_exit(0);
@@ -315,14 +308,11 @@ void z_entry(unsigned long *sp, void (*fini)(void))
 		normalize_host_path(cfg.lower[i], CONFIG_MAX_PATH);
 	for (int i = 0; i < cfg.bind_count; i++)
 		normalize_host_path(cfg.binds[i].dst, CONFIG_MAX_PATH);
-	/* An isolated child cannot name files: what the initial loader looked
-	 * up comes in its arguments. */
+	/* An isolated child cannot name files: its state came via handoff FD. */
 	int isolated_child = opt.child && cfg.isolate;
 	if (isolated_child) {
 		if (cfg.loader_fd < 0 || !cfg.loader_path[0] || opt.exec_fd < 0)
 			z_errx(1, "isolated child loader needs its loader and program FDs");
-		if (opt.case_folds)
-			set_case_folds(&cfg, opt.case_folds);
 	} else {
 		mark_case_aliases(&cfg);
 		resolve_self_path(cfg.loader_path, CONFIG_MAX_PATH);

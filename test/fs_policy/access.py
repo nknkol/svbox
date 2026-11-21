@@ -45,20 +45,24 @@ with tempfile.TemporaryDirectory(prefix='access-policy-',dir=build) as tmp:
                     f'-DNATIVE_CWD_W_OK={cwd_result}',str(repo/'test/fs_policy/access.c'),'-o',str(root/'probe')],check=True)
     fd=os.open(root/'rw/file',os.O_RDWR)
     try:
-        modes=[(None,'none')] if normal else [(None,'none'),('--observe-mount-access','none'),
-                            ('--guard-path-mutations','gp'),('--guard-file-mutations','gf')]
-        for option,kind in modes:
-            p=subprocess.run([str(loader),'--mode','container','--root',str(root),
-                              '-v',f'{root}/ro:/ro','-v',f'{root}/rw:/rw',
-                              '-v',f'{root}/deny:/deny','-v',f'{root}/nested:/ro/nested',
-                              *([option,'drwdw'] if option else []),
+        modes=[(None,'none')] if normal else [(None,'none'),('observe','none'),
+                            ('paths','gp'),('files','gf')]
+        for level,kind in modes:
+            if level:
+                policy=['--root-mode','deny','-v',f'{root}/ro:/ro:ro','-v',f'{root}/rw:/rw:rw',
+                        '-v',f'{root}/deny:/deny:deny','-v',f'{root}/nested:/ro/nested:rw',
+                        '--guard',level]
+            else:
+                policy=['-v',f'{root}/ro:/ro','-v',f'{root}/rw:/rw',
+                        '-v',f'{root}/deny:/deny','-v',f'{root}/nested:/ro/nested']
+            p=subprocess.run([str(loader),'--mode','container','--root',str(root),*policy,
                               '--','./probe',kind,str(fd)],cwd=root,pass_fds=(fd,),capture_output=True,timeout=20)
-            assert p.returncode==0,(option,p.returncode,p.stdout,p.stderr)
+            assert p.returncode==0,(level,p.returncode,p.stdout,p.stderr)
             for name,old in before.items():
                 path=root/name/'file';new=path.stat()
                 assert path.read_bytes()==b'unchanged'
                 assert (old.st_mode,old.st_size,old.st_mtime_ns,old.st_ctime_ns)==(
                     new.st_mode,new.st_size,new.st_mtime_ns,new.st_ctime_ns)
-            print('PASS: write-access query paths, links, cwd, empty-path FDs and host state:',option or 'legacy')
+            print('PASS: write-access query paths, links, cwd, empty-path FDs and host state:',level or 'none')
     finally:
         os.close(fd)

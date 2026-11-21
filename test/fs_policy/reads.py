@@ -31,10 +31,11 @@ def tree(root):
         (root / name).write_bytes(data)
     (root / 'link-visible').symlink_to('/home/u/work/file')
     (root / 'host-work/to-secret').symlink_to('/root-secret')
-    return ['-v', f'{root}/host-work:/home/u/work', '-v', f'{root}/host-ro:/opt/ro',
-            '-v', f'{root}/host-private:/home/u/work/private',
-            '-v', f'{root}/host-pub:/home/u/work/private/pub',
-            '-v', f'{root}/host-deny:/deny', '-v', f'{root}/host-hidden:/home/u/work/hidden']
+    return ['--root-mode', 'deny',
+            '-v', f'{root}/host-work:/home/u/work:rw', '-v', f'{root}/host-ro:/opt/ro:ro',
+            '-v', f'{root}/host-private:/home/u/work/private:deny',
+            '-v', f'{root}/host-pub:/home/u/work/private/pub:ro',
+            '-v', f'{root}/host-deny:/deny:deny', '-v', f'{root}/host-hidden:/home/u/work/hidden:deny']
 
 
 def launch(root, binds, options, mode):
@@ -63,9 +64,8 @@ with tempfile.TemporaryDirectory(prefix='read-guard-', dir=build) as tmp:
                     '-o', str(root / 'probe')], check=True)
     (root / 'host-work/probe').write_bytes((root / 'probe').read_bytes())
     (root / 'host-work/probe').chmod(0o755)
-    policy = ['--guard-file-access', 'dwrdrdd', '--allow-pipe-output', '--allow-stdio-output',
-              '--revalidate-file-fds']
-    for mode, extra in (('main', []), ('stream', ['--allow-stream-input'])):
+    policy = ['--guard', 'access', '--allow-pipes', '--allow-stdio', '--revalidate-fds']
+    for mode, extra in (('main', []), ('stream', ['--allow-streams'])):
         p = launch(root, binds, [*policy, *extra], mode)
         assert p.returncode == 0, (mode, p.returncode, p.stdout, p.stderr)
         assert b'SECRET' not in p.stdout, p.stdout
@@ -73,25 +73,23 @@ with tempfile.TemporaryDirectory(prefix='read-guard-', dir=build) as tmp:
     assert (root / 'host-work/file').read_bytes() == b'work'
 
     # The mutation-only mode keeps its earlier read behavior.
-    p = launch(root, binds, ['--guard-file-mutations', 'dwrdrdd'], 'main')
+    p = launch(root, binds, ['--guard', 'files'], 'main')
     assert p.returncode != 0, (p.stdout, p.stderr)
     print('PASS: file mutation mode does not imply read denial')
 
     probe = root / 'probe'
     for options, marker in (
-            (['--allow-stream-input', '--', str(probe)], 'stream input requires file access guard'),
-            (['--guard-file-mutations', 'd', '--allow-stream-input', '--', str(probe)],
-             'stream input requires file access guard'),
-            (['--guard-file-access', 'd', '--allow-stream-input', '--allow-stream-input',
-              '--', str(probe)], 'duplicate stream input option'),
-            (['--guard-file-access', 'd', '--guard-file-mutations', 'd', '--', str(probe)],
-             'duplicate mount access observation'),
-            (['--guard-file-access', 'dw', '--', str(probe)],
-             'mount access observation requires root plus every bind'),
-            (['--guard-file-access', 'd', '--exec-interp', '/lib/ld.so', '--', str(probe)],
-             'exec interpreter requires file access child loader'),
-            (['--guard-file-access', 'd', '--exec-interp', 'relative', '--', str(probe)],
-             'invalid value for --exec-interp')):
+            (['--allow-streams', '--', str(probe)], '--allow-streams requires --guard access'),
+            (['--root-mode', 'deny', '--guard', 'files', '--allow-streams', '--', str(probe)],
+             '--allow-streams requires --guard access'),
+            (['--root-mode', 'deny', '--guard', 'access', '--allow-streams', '--allow-streams',
+              '--', str(probe)], 'duplicate --allow-streams option'),
+            (['--root-mode', 'deny', '--guard', 'access', '--guard', 'files', '--', str(probe)],
+             'duplicate --guard / --sandbox option'),
+            (['--root-mode', 'deny', '--guard', 'none', '--', str(probe)],
+             'cannot be used with --guard none'),
+            (['--root-mode', 'deny', '--guard', 'access', '--__exec-exe', '/bin/sh', '--', str(probe)],
+             'unexpected internal exec-exe option')):
         p = subprocess.run([str(loader), '--mode', 'container', '--root', str(root), *options],
                            capture_output=True, text=True, timeout=20)
         assert p.returncode != 0 and marker in p.stdout + p.stderr, (options, p.stdout, p.stderr)
@@ -121,16 +119,16 @@ for directory, shell, prefix, cat, ls in (
                 if path.is_symlink():
                     path = (root / os.readlink(path)).resolve()
                 if path.is_dir():
-                    binds += ['-v', f'{path}:/{name}']
+                    binds += ['-v', f'{path}:/{name}:ro']
             return binds
 
         def protected(binds, command):
-            vector = 'd' + 'r' * (len(binds) // 2) + 'w' + 'w'
             return subprocess.run([str(loader), '--mode', 'container', '--root', str(root),
-                                   *binds, '-v', f'{work}:/work', '-v', '/dev/null:/dev/null',
-                                   '--guard-file-access', vector, '--allow-stdio-output',
-                                   '--allow-pipe-output', '--allow-stream-input',
-                                   '--revalidate-file-fds', '--', shell, *prefix, '-c', command],
+                                   '--root-mode', 'deny',
+                                   *binds, '-v', f'{work}:/work:rw', '-v', '/dev/null:/dev/null:rw',
+                                   '--guard', 'access', '--allow-stdio',
+                                   '--allow-pipes', '--allow-streams',
+                                   '--revalidate-fds', '--', shell, *prefix, '-c', command],
                                   cwd=root, capture_output=True, text=True, timeout=30)
 
         p = protected(system(('bin', 'lib', 'usr', 'sbin')), command)

@@ -102,12 +102,14 @@ with tempfile.TemporaryDirectory(prefix='iso-lazy-', dir=lib.mode_capable()) as 
     erofs.expand(image, cache, 'protected')
     os.unlink(cache / 'protected' / 'new')   # a name an expansion would add back
     for vector in ('dwr', 'dwd'):
+        prot_mode = 'ro' if vector[-1] == 'r' else 'deny'
         before = snapshot(cache / 'protected')
 
         def forge(cache_dir, rel, op):
             p = subprocess.run([str(loader), *lib.ISOLATE_EXTRA, '--isolate', '--mode', 'container',
-                                '--root', str(root), '-v', f'{rw}:/rw', '-v', f'{cache}/protected:/prot',
-                                '--guard-file-access', vector, '--allow-stdio-output', '--',
+                                '--root', str(root), '--root-mode', 'deny',
+                                '-v', f'{rw}:/rw:rw', '-v', f'{cache}/protected:/prot:{prot_mode}',
+                                '--guard', 'access', '--allow-stdio', '--',
                                 './.elf-exec', 'h', 'lazy', str(image), str(cache_dir), rel, str(op)],
                                capture_output=True, text=True, timeout=60, cwd='/')
             for line in p.stdout.splitlines():
@@ -163,8 +165,9 @@ with tempfile.TemporaryDirectory(prefix='iso-lazy-', dir=lib.mode_capable()) as 
             # The broker starts with holder outside (its trees are opened
             # then); the moving starts once the guest is ready.
             p = subprocess.Popen([str(loader), *lib.ISOLATE_EXTRA, '--isolate', '--mode', 'container',
-                                  '--root', str(root), '-v', f'{rw}:/rw', '-v', f'{protected}:/prot',
-                                  '--guard-file-access', vector, '--allow-stdio-output', '--allow-stream-input',
+                                  '--root', str(root), '--root-mode', 'deny',
+                                  '-v', f'{rw}:/rw:rw', '-v', f'{protected}:/prot:{"ro" if vector[-1] == "r" else "deny"}',
+                                  '--guard', 'access', '--allow-stdio', '--allow-streams',
                                   '--', './.elf-exec', 'h', 'lazy', str(image2), str(cache3), rel, str(op), '400'],
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                  cwd='/')
@@ -217,8 +220,9 @@ with tempfile.TemporaryDirectory(prefix='iso-lazy-', dir=lib.mode_capable()) as 
             except OSError:
                 pass
     p = subprocess.Popen([str(loader), *lib.ISOLATE_EXTRA, '--isolate', '--mode', 'container',
-                          '--root', str(root), '-v', f'{rw}:/rw', '-v', f'{protected}:/prot',
-                          '--guard-file-access', 'dwr', '--allow-stdio-output', '--allow-stream-input',
+                          '--root', str(root), '--root-mode', 'deny',
+                          '-v', f'{rw}:/rw:rw', '-v', f'{protected}:/prot:ro',
+                          '--guard', 'access', '--allow-stdio', '--allow-streams',
                           '--', './.elf-exec', 'h', 'lazy', str(image3), str(cache4), '/many', '0', '400'],
                          stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd='/')
     first = p.stdout.readline()
@@ -239,7 +243,7 @@ with tempfile.TemporaryDirectory(prefix='iso-lazy-', dir=lib.mode_capable()) as 
         a host thread from the guest's "ready" until it is done; returns
         ({rc: count} or None, output). Without: (rc or None, output)."""
         cmd = [str(loader), *lib.ISOLATE_EXTRA, '--isolate', '--mode', 'container', *args,
-               '--allow-stdio-output', '--allow-stream-input', '--', './.elf-exec', 'h', *probe_args]
+               '--allow-stdio', '--allow-streams', '--', './.elf-exec', 'h', *probe_args]
         if mutate is None:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=60, cwd='/')
             for line in r.stdout.splitlines():
@@ -309,8 +313,8 @@ with tempfile.TemporaryDirectory(prefix='iso-lazy-', dir=lib.mode_capable()) as 
                         os.rmdir(q) if q.is_dir() and not q.is_symlink() else os.unlink(q)
                     except OSError:
                         pass
-    got, out = guest(['--root', str(root), '-v', f'{rw}:/rw', '-v', f'{protected}:/prot',
-                      '--guard-file-access', 'dwr'],
+    got, out = guest(['--root', str(root), '--root-mode', 'deny',
+                      '-v', f'{rw}:/rw:rw', '-v', f'{protected}:/prot:ro', '--guard', 'access'],
                      ['lazy', str(image5), str(cache5), '/d', '0', '400'], swapper)
     check('a link put at a made directory before its chmod never changes what it points to',
           got is not None and sum(got.values()) == 400 and file_state(sentinel5) == before5 and
@@ -345,8 +349,8 @@ with tempfile.TemporaryDirectory(prefix='iso-lazy-', dir=lib.mode_capable()) as 
                 i += 1
             except OSError:
                 pass
-    got, out = guest(['--root', str(root), '-v', f'{rw}:/rw', '-v', f'{protected}:/prot',
-                      '--guard-file-access', 'dwr'],
+    got, out = guest(['--root', str(root), '--root-mode', 'deny',
+                      '-v', f'{rw}:/rw:rw', '-v', f'{protected}:/prot:ro', '--guard', 'access'],
                      ['lazy', str(image6), str(cache6), '/f', '1', '400'], renamer)
     victims = sorted(kept6.iterdir())
     changed = [v.name for v in victims if v.read_bytes() != victim]
@@ -362,9 +366,15 @@ with tempfile.TemporaryDirectory(prefix='iso-lazy-', dir=lib.mode_capable()) as 
     shutil.copy2(probe, upper / '.elf-exec')
 
     def lower_args(cache_dir, img, binds, vector):
-        return ['--root', str(upper), '--lower', str(cache_dir), '--lower-image', str(img),
-                '--mount-table', str(tmp / 'mounts8'), '--mount-scratch', str(tmp / 'scratch8'),
-                *binds, '--guard-file-access', vector]
+        mode_map = {'d': 'deny', 'r': 'ro', 'w': 'rw'}
+        out = ['--root', str(upper), '--root-mode', mode_map[vector[0]],
+               '--lower', f'{cache_dir}:{img}',
+               '--mount-table', str(tmp / 'mounts8'), '--mount-scratch', str(tmp / 'scratch8')]
+        b_idx = 1
+        for i in range(0, len(binds), 2):
+            out += ['-v', f'{binds[i + 1]}:{mode_map[vector[b_idx]]}']
+            b_idx += 1
+        return out + ['--guard', 'access']
     lower7, lower8 = tmp / 'lower7', tmp / 'lower8'
     for c in (lower7, lower8):
         c.mkdir()
@@ -472,8 +482,8 @@ with tempfile.TemporaryDirectory(prefix='iso-lazy-', dir=lib.mode_capable()) as 
                         ok = False
                     if not ok:
                         lost.append(q.name)
-        got, out = guest(['--root', str(root), '-v', f'{rw}:/rw', '-v', f'{protected}:/prot',
-                          '--guard-file-access', 'dwr'],
+        got, out = guest(['--root', str(root), '--root-mode', 'deny',
+                          '-v', f'{rw}:/rw:rw', '-v', f'{protected}:/prot:ro', '--guard', 'access'],
                          ['lazy', str(image10), str(cache10), '/d', '0', '400'], claimer)
         check('a name made meanwhile is never replaced by the expansion (and no temporary name is left)',
               got is not None and sum(got.values()) == 400 and not lost and

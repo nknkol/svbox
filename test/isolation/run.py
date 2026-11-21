@@ -109,15 +109,15 @@ with tempfile.TemporaryDirectory(prefix='iso-accept-', dir=socket_capable()) as 
     try:
         for suffix, loader in lib.loaders():
             guarded = suffix == '-guarded'
-            volumes = [(base / 'ro', '/ro'), (base / 'hidden', '/hidden'), (base / 'rw', '/rw'),
-                       ('/dev/null', '/dev/null'), ('/proc', '/proc')]
-            policy = ['--guard-file-access', 'wrdwwr', '--allow-stdio-output', '--allow-stream-input'] if guarded else []
+            volumes = [(base / 'ro', '/ro', 'ro'), (base / 'hidden', '/hidden', 'deny'), (base / 'rw', '/rw', 'rw'),
+                       ('/dev/null', '/dev/null', 'rw'), ('/proc', '/proc', 'ro')]
+            policy = ['--guard', 'access', '--allow-stdio', '--allow-streams'] if guarded else []
 
             def run(*args, isolate=True, shell=False, control=False):
                 argv = [str(loader), *(['--isolate', *lib.ISOLATE_EXTRA] if isolate else []), '--mode', 'container',
                         '--root', str(alpine)]
-                for host, guest in volumes:
-                    argv += ['-v', f'{host}:{guest}']
+                for host, guest, mode in volumes:
+                    argv += ['-v', f'{host}:{guest}:{mode}' if guarded else f'{host}:{guest}']
                 command = ['./bin/busybox', 'sh', '-c', '/iso-probe ' + ' '.join(args)] if shell \
                     else ['./iso-probe', *args]
                 p = subprocess.run([*argv, *policy, '--', *command], cwd=alpine, capture_output=True,

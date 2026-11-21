@@ -30,20 +30,21 @@ class LaunchTests(unittest.TestCase):
     def test_vector_follows_volume_order(self):
         argv = launch.command_line(self.compiled, self.state/'root', Path('/l'), '/workspace',
                                    ['/bin/sh', '-c', 'true'], ['A=1'])
-        self.assertEqual(argv[argv.index('--guard-file-access') + 1], 'drwwww')
+        self.assertEqual(argv[argv.index('--root-mode') + 1], 'deny')
+        self.assertIn('--sandbox', argv)
         volumes = [argv[i + 1] for i, a in enumerate(argv) if a == '-v']
-        self.assertEqual(volumes[0], f'{self.root}/brew:/opt/brew')
+        self.assertEqual(volumes[0], f'{self.root}/brew:/opt/brew:ro')
+        self.assertEqual(volumes[1], f'{self.root}/workspace:/workspace:rw')
         self.assertEqual(argv[argv.index('--'):], ['--', './.elf-exec', '/workspace',
                                                    '/bin/sh', '/bin/sh', '-c', 'true'])
-        self.assertIn('--revalidate-file-fds', argv)
-        self.assertIn('--allow-local-output', argv)
         self.assertIn('--isolate', argv[:argv.index('--')])   # the broker by default
 
     def test_backends(self):
         args = (self.compiled, self.state/'root', Path('/l'), '/workspace', ['/bin/true'], [])
         inproc = launch.command_line(*args, backend='in-process')
         self.assertNotIn('--isolate', inproc)
-        self.assertEqual(inproc[inproc.index('--guard-file-access') + 1], 'drwwww')
+        self.assertEqual(inproc[inproc.index('--root-mode') + 1], 'deny')
+        self.assertIn('--sandbox', inproc)
         with self.assertRaises(launch.ProfileError):
             launch.command_line(*args, backend='none')
 

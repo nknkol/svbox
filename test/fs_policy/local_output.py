@@ -21,11 +21,11 @@ with tempfile.TemporaryDirectory(prefix='local-output-', dir=build) as tmp:
                     '-fno-builtin', '-fno-stack-protector', str(repo / 'test/fs_policy/local_output.c'),
                     '-o', str(root / 'probe')], check=True)
     base = [str(loader), '--mode', 'container', '--root', str(root), '-v', f'{root}/rw:/rw']
-    for mode, extra in (('on', ['--allow-local-output']), ('off', [])):
+    for mode, extra in (('on', ['--allow-local-io']), ('off', [])):
         inherited, peer = socket.socketpair()
         os.dup2(inherited.fileno(), 10)
         try:
-            p = subprocess.run([*base, '--guard-file-mutations', 'rw', *extra, '--', './probe', mode],
+            p = subprocess.run([*base, '--root-mode', 'ro', '--guard', 'files', *extra, '--', './probe', mode],
                                cwd=root, capture_output=True, pass_fds=(10,), timeout=30)
         finally:
             os.close(10)
@@ -40,11 +40,11 @@ with tempfile.TemporaryDirectory(prefix='local-output-', dir=build) as tmp:
         assert leaked == b'', leaked
         assert (root / 'rw/file').read_bytes() == b'seed'
         print('PASS: local socket/eventfd/memfd output, dup/fork/exec and existing contracts:', mode)
-    p = subprocess.run([*base, '--allow-local-output', '--', './probe', 'on'],
+    p = subprocess.run([*base, '--allow-local-io', '--', './probe', 'on'],
                        cwd=root, capture_output=True, text=True, timeout=20)
-    assert p.returncode != 0 and 'local output requires file mutation guard' in p.stdout + p.stderr
-    p = subprocess.run([*base, '--guard-file-mutations', 'rw', '--allow-local-output',
-                        '--allow-local-output', '--', './probe', 'on'],
+    assert p.returncode != 0 and '--allow-local-io requires --guard files' in p.stdout + p.stderr
+    p = subprocess.run([*base, '--root-mode', 'ro', '--guard', 'files', '--allow-local-io',
+                        '--allow-local-io', '--', './probe', 'on'],
                        cwd=root, capture_output=True, text=True, timeout=20)
-    assert p.returncode != 0 and 'duplicate local output option' in p.stdout + p.stderr
+    assert p.returncode != 0 and 'duplicate --allow-local-io option' in p.stdout + p.stderr
     print('PASS: invalid local output option combinations rejected')

@@ -54,8 +54,11 @@ static long loader_argv(Bridge *b, long pid, size_t *start, const char **exe)
             *start = (size_t)(at + 3);
             return total - (long)*start;
         }
-        if (!strcmp(arg, CONFIG_CHILD_EXEC_EXE) && at + 15 < total)
-            *exe = b->proc_data + at + strlen(arg) + 1;
+        if (!strcmp(arg, SVBOX_CHILD_EXEC_EXE)) {
+            long next = at + (long)strlen(arg) + 1;
+            if (next < total)
+                *exe = b->proc_data + next;
+        }
     }
     return 0;
 }

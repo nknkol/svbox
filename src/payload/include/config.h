@@ -17,75 +17,46 @@
 #define CONFIG_MODE_COMPAT     0
 #define CONFIG_MODE_CONTAINER  1
 
+#define SVBOX_VERSION "0.1.0"
+
 #define CONFIG_MAX_PATH     256
 #define CONFIG_AUXV_PAIRS   64
 #define CONFIG_MAX_BINDS    64
-#define CONFIG_CHILD_LOADER_ARG "--child-loader"
-#define CONFIG_CHILD_EXEC_TARGET "--exec-target"
-#define CONFIG_CHILD_EXEC_PATH "--exec-path"
-/* Payload-resolved host path of the target PT_INTERP (file access mode). */
-#define CONFIG_CHILD_EXEC_INTERP "--exec-interp"
-/* Guest path of the executed binary (/proc/self/exe). */
-#define CONFIG_CHILD_EXEC_EXE "--exec-exe"
-/* Basename of the path as passed to execve, for the kernel comm. */
-#define CONFIG_CHILD_EXEC_NAME "--exec-name"
-/* Base directory of the glue tree, fixed by the initial loader. */
-#define CONFIG_CHILD_GLUE_DIR "--glue-dir"
-/* Guest credentials r:e:s:fs uid then gid (PRoot fake_id0), when not root. */
-#define CONFIG_CHILD_FAKE_IDS "--fake-ids"
-/* Supplementary groups, comma separated ("-" for none). */
-#define CONFIG_CHILD_FAKE_GROUPS "--fake-groups"
-/* fexecve: a descriptor of the program itself; the loader opens it through
- * /proc/self/fd and closes it. */
-#define CONFIG_CHILD_EXEC_FD "--exec-fd"
-/* Isolation mode: the inherited control socket of the broker. */
-#define CONFIG_CHILD_ISOLATE_FD "--isolate-fd"
-/* Isolation mode: the guest cannot name files, so a child loader gets its
- * own binary as an inherited FD (re-executed with execveat), its host path,
- * the case-alias marks of the binds and the interpreter as an FD. */
-#define CONFIG_CHILD_LOADER_FD "--loader-fd"
-#define CONFIG_CHILD_LOADER_PATH "--loader-path"
-#define CONFIG_CHILD_CASE_FOLDS "--case-folds"
-#define CONFIG_CHILD_EXEC_INTERP_FD "--exec-interp-fd"
-/* Isolation mode: real owners (uid:gid,...) of the user, root and binds,
- * looked up once by the initial loader (fake_id0 reports them as root). */
-#define CONFIG_CHILD_OWNERS "--owners"
+
+/* Internal child-loader exec handoff (not part of the public CLI).
+ * --__handoff-fd carries a binary svbox_handoff_t in an unlinked memfd;
+ * --__exec-exe remains in argv so /proc/<pid>/exe inspection of sibling
+ * processes can recover the guest executable path from /proc/<pid>/cmdline. */
+#define SVBOX_HANDOFF_MAGIC    0x53564258484E4431ull /* "SVBXHND1" */
+#define SVBOX_HANDOFF_VERSION  1u
+#define SVBOX_CHILD_HANDOFF_FD "--__handoff-fd"
+#define SVBOX_CHILD_EXEC_EXE   "--__exec-exe"
+
 #define CONFIG_OWNERS (CONFIG_MAX_BINDS + 2)
-/* Isolation mode: the GPU devices the guest may open itself (bit i: entry i
- * of the loader's constant page). */
-#define CONFIG_CHILD_ISOLATE_DEVICES "--isolate-devices"
 #define CONFIG_ISOLATE_DEVICES 4
 /* Isolation mode: the loader FD every guest exec runs (the filter knows it). */
 #define CONFIG_ISOLATE_LOADER_FD 898
 /* Container mounts (docs/OCI.md, R4): the shared mount table every process
  * of the view maps (inherited at this number), and where tmpfs mounts get
- * their directories. The initial loader takes --emulate-mounts and
- * --mount-scratch; child loaders get the FD. */
+ * their directories. */
 #define CONFIG_MOUNT_TABLE_FD 901
 #define CONFIG_MAX_MOUNTS 48
 #define CONFIG_MOUNT_TABLE_BYTES 53248 /* container_state.h checks it */
 /* Mount ids of one view: 0 the root, 1.. the binds, then the table slots. */
 #define CONFIG_MOUNT_IDS (CONFIG_MAX_BINDS + 1 + CONFIG_MAX_MOUNTS)
-#define CONFIG_CHILD_MOUNT_TABLE_FD "--mount-table-fd"
-#define CONFIG_CHILD_MOUNT_SCRATCH "--mount-scratch"
 /* Owner metadata (docs/OCI.md, R5): the owner database file, opened by the
  * initial loader (--owner-db PATH) and inherited at this number. */
 #define CONFIG_OWNER_DB_FD 902
-#define CONFIG_CHILD_OWNER_DB_FD "--owner-db-fd"
 /* Copy-on-write root (docs/OCI.md, R6): read-only lower directories under
- * the root, topmost first (--lower DIR, repeated); the root is the upper.
- * --lower-image IMAGE makes the preceding lower the cache of a layer image. */
+ * the root, topmost first (--lower DIR[:IMAGE], repeated); the root is upper. */
 #define CONFIG_MAX_LOWERS 8
 /* FDs the runtime holds: the loader FD (898), the isolation control
  * socket (899 up), the broker channels (900 up), the mount table (901) and
  * the owner database (902). --pass-fd refuses these numbers. */
 #define CONFIG_RESERVED_FD_MIN 898
-/* --pass-fd N (guarded build): an inherited FD the caller hands to the
- * guest, writable when it was opened for writing. Known by its object
- * (dev, ino) and its access flags, taken by the initial loader, so a later
- * FD at that number is no grant; child loaders get --passed-fds. */
+/* --pass-fd N: an inherited FD the caller hands to the guest, writable when
+ * it was opened for writing. Known by its object (dev, ino) and access flags. */
 #define CONFIG_MAX_PASSED_FDS 16
-#define CONFIG_CHILD_PASSED_FDS "--passed-fds"
 struct passed_fd {
     int32_t fd;
     uint32_t flags;  /* O_ACCMODE | O_APPEND as opened */
@@ -196,5 +167,20 @@ typedef struct payload_config {
 } payload_config_t;
 
 extern payload_config_t g_payload_config;
+
+/* Binary child-loader exec handoff transferred across execve via memfd. */
+typedef struct svbox_handoff {
+    uint64_t magic;
+    uint32_t version;
+    uint32_t size;
+    payload_config_t cfg;
+    char exec_target[CONFIG_MAX_PATH];
+    char exec_path[CONFIG_MAX_PATH];
+    char exec_exe[CONFIG_MAX_PATH];
+    char exec_interp[CONFIG_MAX_PATH];
+    char exec_name[CONFIG_MAX_PATH];
+    int32_t exec_fd;
+    int32_t exec_interp_fd;
+} svbox_handoff_t;
 
 #endif /* PAYLOAD_CONFIG_H */

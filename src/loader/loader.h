@@ -34,28 +34,28 @@
 
 #define LOADER_MAX_ENVS 512
 
-/* Command line: the user's options, and the child-loader protocol the
- * payload uses to re-execute the loader for a guest exec. */
+/* Command line: the user's options, and the child-loader handoff state. */
 struct loader_options {
-	int child;              /* --child-loader */
+	int child;              /* internal --__handoff-fd child exec */
+	int show_help;          /* -h / --help */
+	int show_version;       /* -V / --version */
 	int target;             /* argv index of the program and its arguments */
 	const char *payload;    /* --payload: a payload file, not the embedded one */
 	const char *envs[LOADER_MAX_ENVS]; /* -e KEY=VALUE */
 	int env_count;
-	/* Child protocol (config.h CONFIG_CHILD_*). */
+	/* Child exec handoff fields (populated from svbox_handoff_t). */
 	const char *exec_target; /* host path the payload resolved */
 	const char *exec_path;   /* the path the guest passed (AT_EXECFN) */
 	const char *exec_interp; /* payload-resolved PT_INTERP (file access guard) */
 	const char *exec_exe;    /* guest path of the program (/proc/self/exe) */
 	const char *exec_name;   /* basename for the kernel comm */
-	int exec_fd;             /* fexecve: a copy of the program's descriptor */
+	int exec_fd;             /* fexecve or isolated program FD */
 	int isolate;             /* --isolate: start the broker (initial loader) */
 	int exec_interp_fd;      /* isolation: the interpreter, opened by the broker */
-	const char *case_folds;  /* isolation: bind fold marks, comma separated */
-	int filter_dump;         /* --guest-filter-dump: print the guest filter */
-	const char *cwd;         /* --cwd: guest working directory of the program */
+	int filter_dump;         /* --dump-filter: print the guest filter */
+	const char *cwd;         /* -w / --workdir: guest working directory */
 	int emulate_mounts;      /* --emulate-mounts: a new shared mount table */
-	const char *mount_table; /* --mount-table: a mount table file (shared by docker exec) */
+	const char *mount_table; /* --mount-table: a mount table file (shared by exec) */
 	const char *owner_db;    /* --owner-db: the owner database file */
 };
 
@@ -76,6 +76,7 @@ int isolate_device_index(const char *path);
 
 /* options.c */
 void options_parse(int argc, char **argv, payload_config_t *cfg, struct loader_options *opt);
+void options_print_help(int fd);
 
 /* paths.c: host paths and the guest view the loader itself needs. */
 void copy_cstr(char *dst, size_t cap, const char *src);

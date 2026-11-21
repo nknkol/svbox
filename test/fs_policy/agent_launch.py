@@ -63,7 +63,7 @@ with tempfile.TemporaryDirectory(prefix='agent-launch-', dir=build) as tmp:
     assert p.returncode == 0, p.stderr
     printed = json.loads(p.stdout)
     assert printed['enforcement'] == 'isolate-broker' and '--isolate' in printed['argv'], printed
-    assert '--guard-file-access' in printed['argv'] and not state.exists(), printed
+    assert '--sandbox' in printed['argv'] and not state.exists(), printed
     p = run(*common, '--backend', 'in-process', '--print', '--', '/bin/sh', '-c', 'true')
     printed = json.loads(p.stdout)
     assert printed['enforcement'] == 'experimental-file-access-guard' and '--isolate' not in printed['argv'], printed
@@ -177,7 +177,7 @@ with tempfile.TemporaryDirectory(prefix='agent-launch-', dir=build) as tmp:
     assert p.returncode == 0 and printed.count('--pass-fd') == 2, (p.returncode, p.stderr, printed)
     # The loader itself refuses the same (it records the object at start).
     loader_cmd = [str(build / 'svbox'), '--mode', 'container', '--root', str(alpine),
-                  '--guard-file-mutations', 'w']
+                  '--guard', 'files']
     for value, why in ((str(closed), 'not an open FD'), ('899', "runtime's own")):
         p = subprocess.run([*loader_cmd, '--pass-fd', value, '--', '/bin/true'], capture_output=True,
                            text=True, timeout=60)

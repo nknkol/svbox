@@ -71,9 +71,9 @@ with tempfile.TemporaryDirectory(prefix='path-race-', dir=build) as tmp:
     (outside / 'file').chmod(0o644)
     chmod_works = (outside / 'file').stat().st_mode & 0o777 == 0o644
     python = str(Path(sys.executable).resolve())
-    p = subprocess.run([str(loader), '--mode', 'container', '--root', '/',
-                        '-v', f'{root}/rw:/rw', '--guard-file-mutations', 'rw',
-                        '--allow-stdio-output', '--allow-pipe-output', '--',
+    p = subprocess.run([str(loader), '--mode', 'container', '--root', '/', '--root-mode', 'ro',
+                        '-v', f'{root}/rw:/rw:rw', '--guard', 'files',
+                        '--allow-stdio', '--allow-pipes', '--',
                         python.lstrip('/'), '-B', '-c', GUEST, '/rw', str(outside)],
                        cwd='/', capture_output=True, text=True, timeout=120)
     assert p.returncode == 0, (p.returncode, p.stdout, p.stderr[-2000:])

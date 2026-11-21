@@ -34,14 +34,15 @@ with tempfile.TemporaryDirectory(prefix='glue-', dir=build) as tmp:
     (Path(tmp) / 'f').write_text('bound\n')
     base = Path(tmp) / 'base'
     base.mkdir()
-    for suffix, options in (('', []), ('-guarded', []),
-                            ('-guarded', ['--guard-file-access', 'rrrr',
-                                                '--allow-stdio-output', '--allow-pipe-output',
-                                                '--revalidate-file-fds'])):
+    for suffix, options, ro in (('', [], False), ('-guarded', ['--guard', 'track'], False),
+                                ('-guarded', ['--root-mode', 'ro', '--guard', 'access',
+                                              '--allow-stdio', '--allow-pipes',
+                                              '--revalidate-fds'], True)):
         loader = lib.loader(suffix)
+        mode = ':ro' if ro else ''
         p = subprocess.run([str(loader), '--mode', 'container', '--root', str(alpine),
-                            '-v', '/proc:/proc', '-v', f'{tmp}/f:/glue/deep/w2/file',
-                            '-v', f'{tmp}:/glue/deep/w', *options, '--', './bin/busybox', 'sh',
+                            '-v', f'/proc:/proc{mode}', '-v', f'{tmp}/f:/glue/deep/w2/file{mode}',
+                            '-v', f'{tmp}:/glue/deep/w{mode}', *options, '--', './bin/busybox', 'sh',
                             '-c', SCRIPT], cwd=alpine, capture_output=True, text=True, timeout=60,
                            env={**os.environ, 'PROOT_TMP_DIR': str(base)})
         assert p.returncode == 0, (suffix, options, p.stdout, p.stderr[-1500:])

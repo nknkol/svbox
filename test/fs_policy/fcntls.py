@@ -39,15 +39,21 @@ with tempfile.TemporaryDirectory(prefix='fcntl-policy-', dir=build) as tmp:
             assert results[1] in (-11,-13) if contended else results[1]==0,results
             assert results[4] in (-11,-13) if contended else results[4]==0,results
             print('Native fcntl results, contended =',contended,results)
-            for option in (None,'--observe-mount-access','--guard-path-mutations','--guard-file-mutations'):
-                guarded=option=='--guard-file-mutations'
+            for level in (None,'observe','paths','files'):
+                guarded=level=='files'
                 compile_probe(guarded)
+                if level:
+                    policy=['--root-mode','deny','-v',f'{root}/ro:/ro:ro',
+                            '-v',f'{root}/rw:/rw:rw','-v',f'{root}/deny:/deny:deny',
+                            '--guard',level]
+                else:
+                    policy=['-v',f'{root}/ro:/ro','-v',f'{root}/rw:/rw',
+                            '-v',f'{root}/deny:/deny','--guard','track']
                 p=subprocess.run([str(loader),'--mode','container','--root',str(root),
-                                  '-v',f'{root}/ro:/ro','-v',f'{root}/rw:/rw','-v',f'{root}/deny:/deny',
-                                  *([option,'drwd'] if option else ['--fd-track']),
-                                  *(['--allow-stdio-output'] if guarded else []),
+                                  *policy,
+                                  *(['--allow-stdio'] if guarded else []),
                                   '--','./probe','guest'],cwd=root,capture_output=True,timeout=20)
-                assert p.returncode==0 and p.stdout==expected,(option,p.returncode,p.stdout,p.stderr)
+                assert p.returncode==0 and p.stdout==expected,(level,p.returncode,p.stdout,p.stderr)
                 # Closing another FD for rw/file in this process would release
                 # its POSIX lock; inspect through the held FD instead.
                 holder.seek(0)
@@ -56,7 +62,7 @@ with tempfile.TemporaryDirectory(prefix='fcntl-policy-', dir=build) as tmp:
                     assert (root/name/'file').read_bytes()==b'unchanged'
                 for name,stamp in before.items():
                     assert (root/name/'file').stat().st_ctime_ns==stamp
-                print('PASS: high-bit FD tracking, native fcntl parity and policy:',option or 'legacy',
+                print('PASS: high-bit FD tracking, native fcntl parity and policy:',level or 'track',
                       'contended =',contended)
             if contended:
                 fcntl.lockf(holder,fcntl.LOCK_UN,1)

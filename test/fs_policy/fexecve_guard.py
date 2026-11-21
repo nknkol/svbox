@@ -40,9 +40,9 @@ print("known", run(known), "unknown", run(unknown))
 with tempfile.TemporaryDirectory(prefix='fexecve-guard-', dir=build) as tmp:
     shutil.copy2(Path(true).resolve(), Path(tmp) / 'true')
     python = str(Path(sys.executable).resolve())
-    p = subprocess.run([str(loader), '--mode', 'container', '--root', '/', '-v', f'{tmp}:/fexec',
-                        '--guard-file-access', 'rr', '--allow-stdio-output',
-                        '--allow-pipe-output', '--',
+    p = subprocess.run([str(loader), '--mode', 'container', '--root', '/', '--root-mode', 'ro',
+                        '-v', f'{tmp}:/fexec:ro', '--guard', 'access', '--allow-stdio',
+                        '--allow-pipes', '--',
                         python.lstrip('/'), '-B', '-c', GUEST],
                        cwd='/', capture_output=True, text=True, timeout=120)
     assert p.returncode == 0, (p.returncode, p.stdout, p.stderr[-1500:])

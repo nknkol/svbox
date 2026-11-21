@@ -101,7 +101,7 @@ with tempfile.TemporaryDirectory(prefix='mounts-', dir=lib.mode_capable()) as tm
             (work / 't' / 't-host-file').write_text('t')
             (work / 't-host-file').write_text('t')
             scratch = Path(tmp, 'scratch' + suffix + ''.join(isolate))
-            guard = ['--guard-path-mutations', 'ww'] if suffix else []
+            guard = ['--guard', 'paths'] if suffix else []
             common = [str(loader), *lib.ISOLATE_EXTRA, *isolate, '--mode', 'container', '--root', '/',
                       '-v', f'{work}:/w', *guard]
             p = subprocess.run([*common, '--emulate-mounts', '--mount-scratch', str(scratch),

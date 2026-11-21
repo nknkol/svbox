@@ -52,16 +52,16 @@ with tempfile.TemporaryDirectory(prefix='proc-links-', dir=build) as tmp:
     release = (alpine / 'etc/alpine-release').read_text().strip()
     for suffix, options, guarded in (
             ('', [], False),
-            ('-guarded', [], False),
-            ('-guarded', ['--guard-file-access', 'rrww', '--allow-stdio-output',
-                                '--allow-pipe-output', '--allow-local-output',
-                                '--allow-stream-input', '--revalidate-file-fds'], True)):
+            ('-guarded', ['--guard', 'track'], False),
+            ('-guarded', ['--root-mode', 'ro', '--sandbox'], True)):
         fd = os.open(outside, os.O_RDONLY)
         os.dup2(fd, 9)
         try:
+            binds = (['-v', '/proc:/proc:ro', '-v', f'{work}:/work:rw', '-v', '/dev/null:/dev/null:rw']
+                     if guarded else
+                     ['-v', '/proc:/proc', '-v', f'{work}:/work', '-v', '/dev/null:/dev/null'])
             p = subprocess.run([str(loader(suffix)), '--mode', 'container', '--root', str(alpine),
-                                '-v', '/proc:/proc', '-v', f'{work}:/work', '-v', '/dev/null:/dev/null',
-                                *options, '--', './bin/busybox', 'sh', '-c', SCRIPT],
+                                *binds, *options, '--', './bin/busybox', 'sh', '-c', SCRIPT],
                                cwd=alpine, capture_output=True, text=True, pass_fds=(9,), timeout=60)
         finally:
             os.close(fd)

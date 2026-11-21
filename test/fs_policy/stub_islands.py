@@ -76,7 +76,7 @@ if (alpine / 'bin/busybox').exists():
         probe = Path(tmp) / 'probe'
         subprocess.run([*lib.PROBE, '-Wl,--no-rosegment',
                         str(repo / 'test/fs_policy/code_only_probe.c'), '-o', str(probe)], check=True)
-        for suffix, extra in (('', []), ('-guarded', ['--fd-track'])):
+        for suffix, extra in (('', []), ('-guarded', ['--guard', 'track'])):
             loader = lib.loader()
             for options, literal in (([], 'literal=patched'), (['--seccomp-backstop'], 'literal=intact')):
                 p = subprocess.run([str(loader), *extra, '--mode', 'container', '--root', str(alpine), *options,

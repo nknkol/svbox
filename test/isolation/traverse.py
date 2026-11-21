@@ -69,8 +69,8 @@ with tempfile.TemporaryDirectory(prefix='iso-traverse-', dir=lib.mode_capable())
 
     def run(root, *args):
         p = subprocess.run([str(loader), *lib.ISOLATE_EXTRA, '--isolate', '--mode', 'container',
-                            '--root', str(root), '-v', f'{vol}:/mnt/vol', '--guard-file-access', 'dw',
-                            '--allow-stdio-output', '--', './.elf-exec', *args],
+                            '--root', str(root), '--root-mode', 'deny', '-v', f'{vol}:/mnt/vol:rw',
+                            '--guard', 'access', '--allow-stdio', '--', './.elf-exec', *args],
                            capture_output=True, text=True, timeout=60, cwd='/')
         return parse(p.stdout) + (p.stdout + p.stderr,)
 
@@ -100,8 +100,8 @@ with tempfile.TemporaryDirectory(prefix='iso-traverse-', dir=lib.mode_capable())
         for path in ('/', '/mnt'):
             shown = {'.elf-exec', 'mnt'} if path == '/' else {'vol'}
             p = subprocess.run([str(loader), *lib.ISOLATE_EXTRA, '--isolate', '--mode', 'container',
-                                '--root', str(root), '-v', f'{vol}:/mnt/vol', '--guard-file-access', 'dw',
-                                '--allow-stdio-output', '--', './.elf-exec', 'h', 'reopen', path],
+                                '--root', str(root), '--root-mode', 'deny', '-v', f'{vol}:/mnt/vol:rw',
+                                '--guard', 'access', '--allow-stdio', '--', './.elf-exec', 'h', 'reopen', path],
                                capture_output=True, text=True, timeout=60, cwd='/')
             out = p.stdout + p.stderr
             values = {}
@@ -121,8 +121,8 @@ with tempfile.TemporaryDirectory(prefix='iso-traverse-', dir=lib.mode_capable())
                       ok and 'hidden-secret' not in out, out)
         # A name added while the guest holds the FD.
         p = subprocess.Popen([str(loader), *lib.ISOLATE_EXTRA, '--isolate', '--mode', 'container',
-                              '--root', str(root), '-v', f'{vol}:/mnt/vol', '--guard-file-access', 'dw',
-                              '--allow-stdio-output', '--allow-stream-input', '--', './.elf-exec', 'h',
+                              '--root', str(root), '--root-mode', 'deny', '-v', f'{vol}:/mnt/vol:rw',
+                              '--guard', 'access', '--allow-stdio', '--allow-streams', '--', './.elf-exec', 'h',
                               'rawlistwait', '/'],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                              cwd='/')
