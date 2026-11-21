@@ -12,8 +12,8 @@
 #include "container_state.h"
 #include "reentry_guard.h"
 #include "syscall_nums.h"
-#include "proot_bridge.h"
-#include "proot_scratch.h"
+#include "vfs_bridge.h"
+#include "vfs_scratch.h"
 #include "fd_runtime.h"
 
 /* Guest argv entries held inline; longer vectors get their own mapping. */

@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: MIT */
 /* Internal to the PRoot path backend: the per-call Bridge and the helpers
- * its parts share. proot_bridge.c (path translation, dispatch, bridge
- * lifecycle), proot_mounts.c (R4 mount table, tmpfs, loop devices,
- * overlay, /proc/filesystems), proot_procfs.c (/proc links, cmdline,
+ * its parts share. vfs_bridge.c (path translation, dispatch, bridge
+ * lifecycle), vfs_mounts.c (R4 mount table, tmpfs, loop devices,
+ * overlay, /proc/filesystems), vfs_procfs.c (/proc links, cmdline,
  * mount tables). Not a public interface: include only from these. */
 #ifndef PROOT_BRIDGE_INTERNAL_H
 #define PROOT_BRIDGE_INTERNAL_H
@@ -25,14 +25,14 @@
 #include <string.h>
 #include "config.h"
 #include "syscall_nums.h"
-#include "proot_bridge.h"
+#include "vfs_bridge.h"
 #include "fake_ids.h"
 #include "container_state.h"
 #include "union_view.h"
 #include "net_view.h"
 #include "fd_runtime.h"
 #include "fs_policy.h"
-#include "proot_scratch.h"
+#include "vfs_scratch.h"
 #include "path/resolve_core.h"
 #include "path/binding_core.h"
 

@@ -113,7 +113,9 @@ with tempfile.TemporaryDirectory(prefix='union-', dir=lib.mode_capable()) as tmp
             lower = ['--lower', f'{cache}:{image}']
 
         def run(command, timeout=60):
-            return subprocess.run([str(loader), *lib.ISOLATE_EXTRA, *isolate, '--mode', 'container',
+            return subprocess.run([str(loader), *lib.ISOLATE_EXTRA, *isolate,
+                                   *(['--guard', 'track'] if suffix else []),
+                                   '--mode', 'container',
                                    '--root', str(upper), *lower, '-v', '/dev/null:/dev/null',
                                    '--mount-table', str(upper) + '.mounts', '--mount-scratch',
                                    str(upper) + '.scratch',

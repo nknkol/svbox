@@ -2,7 +2,7 @@
 /* PRoot path backend, /proc: links of loader-run processes (exe, cwd,
  * fd), their cmdline, readlink of /proc names, and the mount tables
  * generated from the R4 table. */
-#include "proot_bridge_internal.h"
+#include "vfs_bridge_internal.h"
 
 static long current_id(long number)
 {

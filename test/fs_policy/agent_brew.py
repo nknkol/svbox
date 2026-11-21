@@ -48,7 +48,7 @@ for backend in ('in-process', 'isolate'):
         workspace = base / 'workspace'
         workspace.mkdir()
         (workspace / 'note').write_text('workspace-note\n')
-        p = subprocess.run(['python3', str(repo / 'tools/agent_sandbox/launch.py'),
+        p = subprocess.run(['python3', str(repo / 'tools/agent/launch.py'),
                             str(repo / 'profiles/harmonyos-agent.json'), '--backend', backend,
                             '--brew-prefix', str(brew), '--workspace', str(workspace),
                             '--state', str(base / 'state'), '--',

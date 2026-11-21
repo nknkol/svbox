@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /* PRoot path backend, mounts: the R4 mount table (mount, umount2), tmpfs,
  * R6 overlay and emulated loop devices, /proc/filesystems. */
-#include "proot_bridge_internal.h"
+#include "vfs_bridge_internal.h"
 
 /* ---- R4: mount, umount2 and the /proc mount tables (docs/OCI.md) ----
  * A mount changes the shared table every process of the container reads

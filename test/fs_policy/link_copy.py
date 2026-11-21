@@ -25,7 +25,7 @@ SCRIPT = ('cd /work && printf data > file && chmod 640 file && ln file copy && '
           'echo "read=$(cat copy)" && echo "mode=$(stat -c %a copy)" && '
           'ln -s file sym && ln sym symcopy && echo "link=$(readlink symcopy)" && '
           'ln file copy 2>/dev/null; echo "again=$?"; ln missing other 2>/dev/null; echo "missing=$?"')
-with tempfile.TemporaryDirectory(prefix='link-copy-', dir=build) as tmp:
+with tempfile.TemporaryDirectory(prefix='link-copy-', dir=lib.mode_capable()) as tmp:
     probe = Path(tmp) / 'probe'
     probe.write_text('x')
     try:

@@ -1,75 +1,125 @@
-# ELF / PRoot 文件系统运行后端
+# svbox
 
-在 HarmonyOS 系统沙盒内，用 AArch64 ELF 加载与 SVC 指令改写接入 PRoot 的路径语义：
-guest 程序的每条系统调用跳到 payload，按 root/bind 视图翻译路径、伪造身份后再交给内核。
-不依赖 ptrace、namespace 或 bubblewrap（真机上都不可用）。主要用途是给 agent 提供
-文件视图与访问控制，其次是运行 Linux rootfs（Alpine、Ubuntu、apt、gcc、pip、node、cargo 已验证）。
+**AArch64 userspace syscall-rewriting sandbox, VFS virtualization, and container runtime (MIT License).**
+**面向 HarmonyOS / Linux AArch64 的用户态系统调用重写沙盒与容器运行时（纯 MIT 许可证）。**
 
-**这是兼容性后端，不是安全边界。** 进程内拦截无法阻止 guest 跳进 loader/payload 自身的
-系统调用指令；保护模式（guarded 构建）只约束正常程序的文件访问，尚未完成对抗验收。
+---
 
-## 构建与测试
+## English
 
-需要 Python 3、GNU make、Clang、ld.lld、llvm-objcopy 及 AArch64 Linux ABI 头文件。
+`svbox` runs unmodified AArch64 Linux binaries inside an isolated virtual filesystem view (root, bind mounts, copy-on-write lower layers, EROFS lazy layers, emulated mount tables, fake root/uid/gid, and virtual container networking) **without requiring `ptrace`, Linux namespaces, or root privileges**.
 
-```sh
-make build            # build/elfloader 与 build/elfloader-guarded
-make check            # 核心回归（两种构建）
-make check-guarded    # 保护模式回归
-make check-alpine ALPINE_ARCHIVE=../alpine-minirootfs-3.24.3-aarch64.tar.gz
-make check-ubuntu UBUNTU_ARCHIVE=../ubuntu-base-26.04.1-base-arm64.tar.gz
-make bench            # 原生与 loader 的系统调用开销对比
-```
+Guest executables are loaded by the static non-PIE `svbox` loader at a fixed address, with `svc #0` instructions rewritten to jump into an embedded position-independent payload. For stronger isolation (`--isolate`), `svbox` installs a strict seccomp-BPF guest filter and forks an out-of-process **broker** that enforces every filesystem policy (`rw` / `ro` / `deny`) and maintains an exec trust chain across `execve`.
 
-每个二进制旁有 `build/<名字>.json` 记录哈希，测试拒绝不是最近一次构建的二进制。
-镜像与构建产物不提交 Git。
+### Key Features
 
-## 运行
+- **100% MIT Licensed**: Clean-room MIT path/binding/canonicalization core (`src/path/`), zero GPL dependencies.
+- **Single Consolidated Binary**: One static binary (`build/svbox`) serves both fast-path containers (zero FD-tracking overhead when `--guard none`) and full guarded / `--sandbox` / `--isolate` enforcement.
+- **Clean CLI & Binary Exec Handoff**: Per-mount `:rw` / `:ro` / `:deny` access suffixes, `--sandbox` preset, and a hidden memfd binary handoff (`--__handoff-fd`) across guest `execve` calls.
+- **Real Linux Workloads Verified**: Alpine, Ubuntu (`apt`, `dpkg`, `gcc`, `pip`, `node`, `cargo`, Go runtime, Redis, Nginx), HarmonyOS agent sandboxes, and Docker/OCI containers (`tools/oci/`).
+
+### Build & Test
+
+Requires Python 3, GNU `make`, `clang`, `ld.lld`, `llvm-objcopy`, and AArch64 Linux ABI headers.
 
 ```sh
-build/elfloader --mode container --root /absolute/path/to/rootfs \
-  -v /absolute/path/to/workspace:/workspace -- ./bin/busybox sh
+make build            # Build build/svbox and build/svbox-exec
+make check            # Core regressions
+make check-guarded    # Guarded FD runtime and filesystem policy regressions
+make check-isolation  # Seccomp + broker isolation acceptance suite
+make check-oci        # OCI / docker CLI acceptance (needs build/alpine-test-root)
+make check-alpine ALPINE_ARCHIVE=/path/to/alpine-minirootfs-aarch64.tar.gz
+make check-ubuntu UBUNTU_ARCHIVE=/path/to/ubuntu-base-arm64.tar.gz
+make bench            # Native vs svbox syscall micro-benchmarks
 ```
+
+### Usage Examples
+
+Run a container shell with a writable workspace bind:
+
+```sh
+build/svbox --root /path/to/rootfs \
+  -v /path/to/workspace:/workspace -- ./bin/busybox sh
+```
+
+Run a read-only rootfs with a writable workspace and `--isolate` broker enforcement:
+
+```sh
+build/svbox --isolate --root /path/to/rootfs --root-mode ro \
+  -v /path/to/workspace:/workspace:rw --sandbox -- ./bin/busybox sh
+```
+
+Run an agent profile via the companion launcher:
+
+```sh
+python3 tools/agent/launch.py profiles/harmonyos-agent.json \
+  --brew-prefix /path/to/brew --workspace /path/to/work --state /path/to/state \
+  -- /bin/sh -c 'ls -la /workspace'
+```
+
+Run `build/svbox --help` for the complete option reference.
+
+---
+
+## 中文说明
+
+`svbox` 在 HarmonyOS 系统沙盒或无特权 Linux AArch64 环境下，通过静态 ELF 装载与 `svc #0` 指令重写提供完整的用户态文件系统视图与容器运行时（root、bind、写时复制下层与 EROFS 懒加载层、模拟挂载表、虚拟 root/uid/gid、虚拟容器网络），**完全不依赖 `ptrace`、namespace 或 root 权限**。
+
+### 核心特性
+
+- **100% 纯 MIT 许可**：路径规范化、绑定表与符号链接解析核心（`src/path/`）采用 Clean-room MIT 重写，彻底移除 GPL 依赖。
+- **单二进制架构**：合并原有的双构建为单一静态二进制 `build/svbox`；默认模式（`--guard none`）走快路径零 FD 追踪开销，开启 `--guard` / `--sandbox` / `--isolate` 即时启用运行时策略与进程隔离。
+- **简洁 CLI 与二进制 Exec 交接**：挂载权限直接内联在 `--root-mode rw|ro|deny` 和 `-v HOST:GUEST[:rw|ro|deny]`，跨 `execve` 状态通过单个私有 memfd（`--__handoff-fd`）二进制传递，不再向命令行暴露内部参数。
+- **三层安全模型**：
+  - **视图模式（默认）**：路径映射与容器语义视图，零追踪开销（非对抗边界）。
+  - **进程内策略（`--guard` / `--sandbox`）**：基于 FD 溯源与挂载策略（`rw`/`ro`/`deny`）拦截越权读写与元数据变更（面向合作程序）。
+  - **进程外隔离（`--isolate`）**：为 guest 安装 seccomp-BPF 过滤器，所有路径系统调用必须交由独立 **broker** 进程校验与代办，并维持跨 `execve` 的执行可信链（剩余风险见 [docs/ISOLATION.md](docs/ISOLATION.md)）。
+
+### 常用选项
 
 | 选项 | 作用 |
 | --- | --- |
-| `--root DIR` | guest 根目录（隐含 container 模式）；首个程序用相对 root 的路径 |
-| `-v HOST:GUEST` | bind（最多 16 个） |
-| `--mode compat\|container` | compat 保留宿主环境与身份；container 清空环境并伪装 root（同 PRoot -0） |
-| `-e KEY=VALUE` | 设置 guest 环境变量 |
-| `--link-copy` | 存储拒绝硬链接时改为复制（dpkg/apt 需要） |
-| `--kernel-release R`、`--kernel-sysname S` | 改写 uname（同 PRoot -k） |
-| `--seccomp-backstop` | seccomp 兜底：截获未改写的系统调用；每次调用约多 2 µs |
-| `--isolate` | 隔离模式：文件访问由 broker 进程授权，guest 装 seccomp 过滤器（[设计](docs/ISOLATION.md)） |
-| `--isolate-device DEV` | 隔离模式下允许 guest 自己打开 GPU 设备节点（`/dev/hvgr0` 等固定几个；可重复） |
-| `--log LEVEL` | loader 诊断输出（0-4）；非零时崩溃会打印寄存器转储 |
-| `--payload FILE` | 改用外部 payload（测试用；ABI 必须一致） |
+| `-h, --help` / `-V, --version` | 显示帮助或版本信息 |
+| `--mode compat\|container` | `compat` 保留宿主环境与身份；`container` 清空环境并伪装 root（指定 `--root` 时默认启用） |
+| `--root DIR` | 容器根目录；首个程序路径相对于根目录 |
+| `--root-mode rw\|ro\|deny` | 根目录访问策略（默认 `rw`） |
+| `-v, --bind HOST:GUEST[:MODE]` | 绑定挂载，`MODE` 可选 `rw`（默认）、`ro`、`deny`（最多 64 个） |
+| `--lower DIR[:IMAGE]` | 写时复制只读下层目录，可选绑定 EROFS 层镜像 |
+| `--guard none\|track\|observe\|paths\|files\|access` | 运行时策略级别（默认 `none` 快路径） |
+| `--sandbox` | 预设组合：`--guard access` + `--allow-stdio` / `--allow-pipes` / `--allow-local-io` / `--allow-streams` / `--revalidate-fds` |
+| `--isolate` | 启用 seccomp 过滤器 + broker 进程隔离 |
+| `--allow-device DEV` | 隔离模式下放行白名单 GPU 设备节点直连（如 `/dev/hvgr0`） |
+| `--pass-fd N` | 在受保护模式下显式授予继承的文件描述符 `N` |
+| `-w, --workdir DIR` | 指定 guest 初始工作目录 |
+| `-u, --user UID[:GID]` | 指定 guest 初始用户与用户组 |
+| `-e, --env KEY=VALUE` | 设置 guest 环境变量 |
+| `--link-copy` | 宿主存储拒绝硬链接时自动回退为复制（`dpkg`/`apt` 需要） |
+| `--emulate-mounts` / `--mount-table PATH` | 启用容器内 `mount(2)`/`umount2(2)` 模拟 |
+| `--owner-db PATH` | 启用虚拟文件属主与权限数据库 |
+| `--seccomp-backstop` | 启用 seccomp SIGSYS 兜底截获未改写的 `svc` |
+| `--log-level 0..4` | loader 诊断日志级别（默认 `0` 静默） |
 
-guarded 构建另有 `--guard-path-mutations`、`--guard-file-mutations`、`--guard-file-access`
-等访问策略选项，见 [保护模式说明](test/fd_runtime/README.md) 与
-[agent 启动器](tools/agent_sandbox/README.md)。
+### 代码地图
 
-## 代码地图
-
-见 [架构说明](docs/ARCHITECTURE.md)。
-
-| 位置 | 职责 |
+| 路径 | 职责 |
 | --- | --- |
-| `src/loader/` | 选项、ELF 装载与校验、桩岛、seccomp 兜底、启动栈 |
-| `src/payload/arch/aarch64/` | 入口、桩模板、分发、重入保护、clone 门 |
-| `src/payload/logic/` | 完整性检查、PRoot 语义（bridge/exec/auxv）、身份伪造、运行期补钩、guarded FD 运行时 |
-| `vendor/proot/src/path/` | 从 PRoot 提取的路径核心（来源见 `vendor/proot/UPSTREAM.md`） |
-| `tools/` | 构建脚本、agent 启动器 |
-| `test/` | 回归测试；公共辅助在 `test/lib.py` |
+| `src/path/` | 纯 MIT 路径核心（`path_helpers.c`、`binding_core.c`、`canon_core.c`、`resolve_core.c`） |
+| `src/loader/` | CLI 解析、二进制 handoff、ELF 装载与补钩、seccomp 过滤器、broker 进程、懒加载层 |
+| `src/payload/arch/aarch64/` | AArch64 汇编入口、桩模板、分发器、重入保护、payload 栈、clone 门 |
+| `src/payload/logic/` | VFS 桥接（`vfs_bridge.c`/`vfs_mounts.c`/`vfs_procfs.c`/`vfs_exec.c`/`vfs_auxv.c`）、FD 运行时与策略、联合视图、容器网络 |
+| `tools/agent/` | Agent 沙盒配置编译器（`plan.py`）与启动器（`launch.py`） |
+| `tools/oci/` | Docker/OCI 兼容工具、compose、镜像构建、EROFS 读写 |
+| `test/` | 全量单元与真机集成回归套件 |
 
-## 文档
+### 相关文档
 
-- [当前进度与验收](docs/STATUS.md)
 - [架构说明](docs/ARCHITECTURE.md)
+- [当前进度与验收](docs/STATUS.md)
 - [隔离模式设计](docs/ISOLATION.md)
-- [PRoot 移植记录](docs/SVC_PORT.md)
+- [OCI / Docker 兼容设计](docs/OCI.md)
 - [性能数据](docs/BENCHMARKS.md)
-- [FD 身份与只读策略](docs/FD_POLICY_PLAN.md)
-- [底层约束和经验](docs/SYSCALL_ENGINE_LESSONS.md)
-- [完整形态测试规范](docs/FULL_SYSTEM_TEST_PLAN.md)（目标清单）
-- [存储能力实测](docs/STORAGE_CAPABILITIES.md)
+- [Agent 沙盒启动器](tools/agent/README.md)
+
+## License
+
+MIT License — see [LICENSE](LICENSE).

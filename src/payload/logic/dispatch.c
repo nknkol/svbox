@@ -14,7 +14,7 @@
 #include "hook_runtime.h"
 #include "host_syscall.h"
 #include "platform.h"
-#include "proot_bridge.h"
+#include "vfs_bridge.h"
 
 #define PROT_READ     0x1
 #define PROT_WRITE    0x2

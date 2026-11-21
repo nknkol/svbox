@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """A Go program under the loader (goprobe/main.go, a static linux/arm64
-binary committed next to its source; rebuild: in test/proot/goprobe,
+binary committed next to its source; rebuild: in test/vfs/goprobe,
 GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -buildvcs=false
 -ldflags "-s -w" -o goprobe .). Go programs have their own svc
 instructions, keep g in x28, run goroutines on stacks of a few KiB, block

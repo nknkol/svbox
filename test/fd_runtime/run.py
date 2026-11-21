@@ -269,7 +269,7 @@ for directory, target, arguments, marker in [
     assert p.returncode == 0 and marker in p.stdout, (directory, p.returncode, p.stdout, p.stderr)
     print('PASS: experimental runtime rootfs cat', directory)
 
-subprocess.run(['python3', str(repo / 'test/proot/test_inotify.py'),
+subprocess.run(['python3', str(repo / 'test/vfs/test_inotify.py'),
                 '--guarded'], check=True)
 
 for directory, shell, command, marker in [

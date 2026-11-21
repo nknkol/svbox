@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: MIT */
 /* PRoot path backend: path translation, the syscall dispatch and the
- * per-call bridge (proot_bridge_internal.h lists the other parts). */
-#include "proot_bridge_internal.h"
+ * per-call bridge (vfs_bridge_internal.h lists the other parts). */
+#include "vfs_bridge_internal.h"
 
 /* The view holding a host path (union_find), NULL if none. */
 static const struct union_view *bridge_view(Bridge *b, const char *host, int *layer, const char **rel)
@@ -1679,8 +1679,18 @@ static long dispatch(Bridge *b, long number, long a[6], struct proot_open_origin
         }
         ret = -ENOENT;
     }
-    if (ret == -ENOENT)
-        ret = raw_syscall(number, AT_FDCWD, (long)b->host, a[2], a[3], a[4], a[5]);
+    if (ret == -ENOENT) {
+        long arg2 = a[2];
+        if ((number == __NR_faccessat || number == __NR_faccessat2) &&
+            g_payload_config.isolate && b->union_on && b->union_layer > 0 &&
+            (arg2 & 2) && b->uv && b->uv->layer[0] && b->uv->layer[0][0]) {
+            long up = raw_syscall(__NR_faccessat, AT_FDCWD, (long)b->uv->layer[0], 2, 0, 0, 0);
+            if (up < 0)
+                return up;
+            arg2 &= ~2L;
+        }
+        ret = raw_syscall(number, AT_FDCWD, (long)b->host, arg2, a[3], a[4], a[5]);
+    }
  opened:
     if (ret >= 0 && observed_open)
         *origin = (struct proot_open_origin){mount_id, true};

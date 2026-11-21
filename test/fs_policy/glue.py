@@ -30,7 +30,7 @@ SCRIPT = ('echo "read=$(cat /glue/deep/w/f)"; echo "type=$(stat -c %F /glue/deep
           'touch /glue/deep/file 2>/dev/null && echo "touch=created" || echo "touch=refused"; '
           'chmod 777 /glue 2>/dev/null && echo "chmod=changed" || echo "chmod=refused"; '
           'echo "owner=$(stat -c %u /glue)"')
-with tempfile.TemporaryDirectory(prefix='glue-', dir=build) as tmp:
+with tempfile.TemporaryDirectory(prefix='glue-', dir=lib.mode_capable()) as tmp:
     (Path(tmp) / 'f').write_text('bound\n')
     base = Path(tmp) / 'base'
     base.mkdir()

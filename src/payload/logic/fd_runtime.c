@@ -19,7 +19,7 @@
 #include "fd_close_exec.h"
 #include "clone_notify.h"
 #include "dispatch.h"
-#include "proot_bridge.h"
+#include "vfs_bridge.h"
 #include <string.h>
 /* The records: a direct table (FD n in slot n), mapped without reserve and
  * touched up to the highest FD held; outside the runtime, which a vfork

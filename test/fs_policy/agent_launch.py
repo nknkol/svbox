@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import lib  # noqa: E402
 repo = Path(__file__).resolve().parents[2]
 build = lib.BUILD
-launch = repo / 'tools/agent_sandbox/launch.py'
+launch = repo / 'tools/agent/launch.py'
 alpine = build / 'alpine-test-root'
 if not (alpine / 'bin/busybox').exists():
     print('SKIP: agent launch rootfs unavailable:', alpine)

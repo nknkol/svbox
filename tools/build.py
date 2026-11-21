@@ -41,7 +41,7 @@ manifest = {'sha256': hashlib.sha256(binary.read_bytes()).hexdigest()}
 helper = build / 'svbox-exec'
 subprocess.run(['clang', '-O1', '-static-pie', '-fPIE', '-nostdlib', '-ffreestanding',
                 '-fno-builtin', '-fno-stack-protector', '-I', str(repo / 'src/payload/include'),
-                str(repo / 'tools/agent_sandbox/exec_helper.c'), '-o', str(helper)], check=True)
+                str(repo / 'tools/agent/exec_helper.c'), '-o', str(helper)], check=True)
 manifest['exec_helper_sha256'] = hashlib.sha256(helper.read_bytes()).hexdigest()
 (build / f'{name}.json').write_text(json.dumps(manifest, indent=2))
 print('Built', binary)

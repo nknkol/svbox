@@ -33,6 +33,8 @@ import sys
 import tarfile
 import tempfile
 import threading
+
+os.umask(0o022)
 import time
 import urllib.parse
 from pathlib import Path

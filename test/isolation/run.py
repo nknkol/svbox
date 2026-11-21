@@ -234,7 +234,7 @@ with tempfile.TemporaryDirectory(prefix='iso-accept-', dir=socket_capable()) as 
             expect('H', ('h', 'cutoff', '/rw/file'), {'before': zero, 'close-control': zero,
                                                        'after': neg, 'after-stat': neg, 'after-child': neg})
             argv = [str(loader), '--isolate', *lib.ISOLATE_EXTRA, '--mode', 'container', '--root', str(alpine),
-                    *sum((['-v', f'{h}:{g}'] for h, g in volumes), []), *policy, '--',
+                    *sum((['-v', f'{h}:{g}:{m}' if guarded else f'{h}:{g}'] for h, g, m in volumes), []), *policy, '--',
                     './iso-probe', 'h', 'killbroker', '/rw/file']
             guest_process = subprocess.Popen(argv, cwd=alpine, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                              stderr=subprocess.PIPE, text=True, start_new_session=True)

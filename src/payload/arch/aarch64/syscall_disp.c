@@ -5,7 +5,7 @@
 #include "dispatch.h"
 #include "integrity.h"
 #include "config.h"
-#include "proot_bridge.h"
+#include "vfs_bridge.h"
 #include "container_state.h"
 #include "union_view.h"
 #include "net_view.h"

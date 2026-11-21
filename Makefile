@@ -23,9 +23,9 @@ check: build
 	$(PYTHON) test/fd_table/check_notify.py
 	$(PYTHON) test/fd_table/check_fd_clone.py
 	$(PYTHON) test/fd_table/check_payload_abi.py
-	$(PYTHON) test/proot/test_paths.py
-	$(PYTHON) test/proot/test_svc.py
-	$(PYTHON) test/proot/test_modify.py
+	$(PYTHON) test/vfs/test_paths.py
+	$(PYTHON) test/vfs/test_svc.py
+	$(PYTHON) test/vfs/test_modify.py
 	$(PYTHON) test/fs_policy/xattrs.py --normal
 	$(PYTHON) test/fs_policy/access.py --normal
 	$(PYTHON) test/fs_policy/ids.py
@@ -41,26 +41,26 @@ check: build
 	$(PYTHON) test/fs_policy/isolate.py
 	$(PYTHON) test/fs_policy/glue.py
 	$(PYTHON) test/fs_policy/interp_links.py
-	$(PYTHON) test/proot/test_inotify.py
-	$(PYTHON) test/proot/test_exec.py
-	$(PYTHON) test/proot/test_runspec.py
-	$(PYTHON) test/proot/test_mounts.py
-	$(PYTHON) test/proot/test_owners.py
-	$(PYTHON) test/proot/test_union.py
-	$(PYTHON) test/proot/test_loop.py
-	$(PYTHON) test/proot/test_net.py
-	$(PYTHON) test/proot/test_caps.py
-	$(PYTHON) test/proot/test_go_abi.py
-	$(PYTHON) test/proot/test_many_blocked.py
-	$(PYTHON) test/proot/test_go.py
-	$(PYTHON) test/proot/test_async_io.py
-	$(PYTHON) test/proot/test_auxv.py
-	$(PYTHON) test/proot/test_jit.py
+	$(PYTHON) test/vfs/test_inotify.py
+	$(PYTHON) test/vfs/test_exec.py
+	$(PYTHON) test/vfs/test_runspec.py
+	$(PYTHON) test/vfs/test_mounts.py
+	$(PYTHON) test/vfs/test_owners.py
+	$(PYTHON) test/vfs/test_union.py
+	$(PYTHON) test/vfs/test_loop.py
+	$(PYTHON) test/vfs/test_net.py
+	$(PYTHON) test/vfs/test_caps.py
+	$(PYTHON) test/vfs/test_go_abi.py
+	$(PYTHON) test/vfs/test_many_blocked.py
+	$(PYTHON) test/vfs/test_go.py
+	$(PYTHON) test/vfs/test_async_io.py
+	$(PYTHON) test/vfs/test_auxv.py
+	$(PYTHON) test/vfs/test_jit.py
 	$(PYTHON) test/syscalls/check_dispatch.py
 	$(PYTHON) test/syscalls/newer_paths.py
 	$(PYTHON) test/syscalls/check_guard.py
 	$(PYTHON) test/syscalls/check_runtime.py
-	$(PYTHON) -m unittest discover -s test/agent_sandbox -v
+	$(PYTHON) -m unittest discover -s test/agent -v
 	$(PYTHON) -m unittest discover -s test/alpine -p 'test_*.py' -v
 # Validate archive arguments before invoking a potentially expensive build.
 check-alpine:

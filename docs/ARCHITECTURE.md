@@ -1,24 +1,24 @@
 # 架构说明
 
-当前版本的总览（2026-11-05，payload ABI 29）。各子系统的设计与验收在专门文档里：隔离模式
-[ISOLATION.md](ISOLATION.md)、Docker/OCI [OCI.md](OCI.md)、agent 启动器 `tools/agent_sandbox/README.md`，
-当前状态与已知限制 [STATUS.md](STATUS.md) 开头的“当前版本”一节。
+当前版本的总览（2026-11-21，`svbox` 单二进制，payload ABI 30，纯 MIT 许可）。各子系统的设计与验收在专门文档里：隔离模式
+[ISOLATION.md](ISOLATION.md)、Docker/OCI [OCI.md](OCI.md)、agent 启动器 `tools/agent/README.md`，
+当前状态与已知限制见 [STATUS.md](STATUS.md) 开头的“当前版本”一节。
 
 ## 进程模型
 
 ```
-build/elfloader[-guarded] [选项] -- 程序 参数
+build/svbox [选项] -- 程序 参数
   ├─ 装载 payload（内嵌，固定地址 0x3f80000000）
   ├─ 装载程序与解释器：可执行段复制为匿名页，svc 改写为跳到桩岛，再设为可执行
-  ├─ 把配置（root、bind、下层、身份、策略、挂载表、网络、guest auxv、保护区）写入 payload
+  ├─ 把配置（guard、root、bind、下层、身份、策略、挂载表、网络、guest auxv、保护区）写入 payload
   ├─ --isolate：先 fork 出 broker（不受过滤），再打开自身为 FD 898，装 guest 过滤器
   └─ 重建初始栈，跳到程序入口
-guest 的每次 exec → payload 以 --child-loader 重新执行同一个 loader
+guest 的每次 exec → payload 通过 memfd 二进制 handoff（--__handoff-fd）重新执行同一个 svbox
                     （--isolate 下只能是 execveat(898, 常量页空串, AT_EMPTY_PATH)）
 
           ┌──────────── guest 进程（同一地址空间）────────────┐
-          │ 程序 ──svc──▶ 桩 ──▶ payload（PRoot 语义、视图）   │
-          │                        │ 直接系统调用（默认/guarded）│
+          │ 程序 ──svc──▶ 桩 ──▶ payload（VFS 语义、视图）    │
+          │                        │ 直接系统调用（默认/guard）│
           │                        │ 按路径与改元数据的调用      │
           │                        ▼ （--isolate：过滤器强制）   │
           └────────────── 私有 SOCK_SEQPACKET 通道 ─────────────┘
@@ -27,10 +27,9 @@ guest 的每次 exec → payload 以 --child-loader 重新执行同一个 loader
                          deny/ro/rw 打开、检查、执行，回传结果或 FD
 ```
 
-三种强度：
-- **默认构建**：PRoot 语义的视图（root、bind、身份、挂载表、写时复制、网络），不是边界。
-- **guarded 构建**：payload 内按挂载的 deny/ro/rw 检查（`--guard-*`），对合作程序有效，与 guest 同一地址
-  空间，不是对抗边界。
+三种运行强度（同一 `build/svbox` 二进制运行时切换）：
+- **默认快路径（`--guard none`）**：VFS 语义视图（root、bind、身份、挂载表、写时复制、网络），`entry.S` 跳过 FD 追踪表，零追踪开销，不是安全边界。
+- **进程内策略（`--guard track|observe|paths|files|access` 或 `--sandbox`）**：payload 内启用 FD 溯源与按挂载的 `deny`/`ro`/`rw` 检查，对合作程序有效，与 guest 同地址空间，不是对抗边界。
 - **`--isolate`**：guest 过滤器拒绝所有按路径访问文件与改元数据的调用，payload 只能请 broker 代办；
   执行可信链保证每个受过滤进程都在运行 loader 映像。剩余风险见 ISOLATION.md。agent 启动器默认用它。
 
@@ -38,37 +37,38 @@ loader 是静态、非 PIE 的二进制，固定在 0x3f00000000；guest 进程�
 loader 与 payload 地址固定，seccomp 兜底与 guest 过滤器才能按地址比较（常量页、自身系统调用）。
 
 宿主侧工具（Python，见 STATUS.md“当前版本”）：`tools/oci/`（Docker 兼容命令、compose、build、Engine API）
-在容器运行期间以监视进程、端口转发器常驻；`tools/agent_sandbox/` 生成启动参数后 exec 到 loader，不常驻。
+在容器运行期间以监视进程、端口转发器常驻；`tools/agent/` 生成启动参数后 exec 到 `svbox`，不常驻。
 
 ## 一次系统调用的路径
 
 ```
 guest svc → 桩（stub.c 模板，按 w8 判断 rt_sigreturn/clone；帧在 SP 下方 64 字节之外）
-  → entry.S（w8 规范化，快路径透传；慢路径在 guest 栈上只存通用寄存器，
-            重入检查与认领 payload 栈后切过去，SIMD 与之后的 C 帧都在 payload 栈上）
+  → entry.S（w8 规范化，读取 g_payload_config.guard[offset 0]；guard=0 时跳过 fd_runtime_syscalls.inc 快路径透传；
+             慢路径在 guest 栈上只存通用寄存器，重入检查与认领 payload 栈后切过去，SIMD 与之后的 C 帧都在 payload 栈上）
   → syscall_disp.c: syscall_dispatcher
        1. integrity_check   自身完整性：保护区封印、兜底下的 W^X 与 SIGSYS
-       2. guarded 构建: fd_runtime_dispatch（FD 来源记录与访问策略）
-       3. dispatch_syscall  PRoot 语义（proot_bridge/proot_exec/proot_auxv）、
+       2. guard != none:    fd_runtime_dispatch（FD 来源记录与访问策略）
+       3. dispatch_syscall  VFS 语义（vfs_bridge/vfs_exec/vfs_auxv）、
                             fake_ids、可执行内存补钩、平台不支持的调用、透传
        4. 结果加工          stat 属主、uname、socket 名
 ```
 
-guest 程序对 SP 附近与寄存器的前提照 Linux 保留（Go 运行时全部依赖它们，`test/proot/test_go_abi.py`）：
+guest 程序对 SP 附近与寄存器的前提照 Linux 保留（Go 运行时全部依赖它们，`test/vfs/test_go_abi.py`）：
 - 桩不写 SP 下方 64 字节（`STUB_RED_ZONE`）；clone 子进程的新栈下方同样保留 64 字节（`CLONE_CHILD_KEEP`）：Go 的
   runtime.clone 把 m、g、fn 与魔数放在那里，子进程先 gettid 再读。
 - guest 栈只放桩帧与通用寄存器（vfork 子进程最深 1 KiB，`small_stack.py` 上限 1280 字节）：goroutine 在系统调用处
   SP 下方只有几百字节，再往下是别的 goroutine 的栈。payload 栈每个 64 KiB，按线程认领、首次用时映射。
 - 每个停在调用里的线程占一个重入槽、一个 payload 栈，`--isolate` 下还有一个 broker 通道（线程退出前一直保留）。
-  三者都是 1024 个，扫描只到曾同时用到的最多个数（`test/proot/test_many_blocked.py`：300 个线程同时阻塞）。
+  三者都是 1024 个，扫描只到曾同时用到的最多个数（`test/vfs/test_many_blocked.py`：300 个线程同时阻塞）。
 - payload 编译时 `-ffixed-x28`：线程在 payload 里时到达的信号，guest 处理器看到的 x28 仍是 guest 的（Go 的 g）。
 
 ## 目录与模块
 
 | 模块 | 内容 |
 | --- | --- |
+| `src/path/` | 纯 MIT Clean-room 路径核心（`path_helpers.c`、`binding_core.c`、`canon_core.c`、`resolve_core.c`） |
 | `src/loader/main.c` | 编排：选项 → payload → 程序/解释器 → 配置 → 启动栈 → 跳转 |
-| `src/loader/options.c` | 命令行与 child-loader 协议（`config.h` 的 `CONFIG_CHILD_*`） |
+| `src/loader/options.c` | 命令行解析、`--help`/`--version` 与内部二进制 handoff 读取（`--__handoff-fd`） |
 | `src/loader/elf_load.c` | ELF 整体校验、装载与补钩、payload 装载与重定位 |
 | `src/loader/paths.c` | 宿主路径规范化、大小写别名标记、PT_INTERP 解析 |
 | `src/loader/hook.c` | 桩岛的 loader 端实现（共用 `stub_island.h`） |
@@ -79,33 +79,32 @@ guest 程序对 SP 附近与寄存器的前提照 Linux 保留（Go 运行时全
 | `src/payload/include/elf_abi.h` | loader、payload、测试共用的固定数字（ABI 版本、固定地址、私有 prctl） |
 | `src/payload/include/integrity.h` | 自身完整性规则（loader 与 payload 共用 W^X 判定） |
 | `src/payload/logic/dispatch.c` | 通用分发（见上） |
-| `src/payload/logic/proot_bridge.c` | PRoot 路径翻译、系统调用分发、每次调用的 Bridge 生命周期 |
-| `src/payload/logic/proot_mounts.c` | R4 挂载表（mount/umount2）、tmpfs、R6 overlay 与 loop 设备、`/proc/filesystems` |
-| `src/payload/logic/proot_procfs.c` | `/proc` 伪造：loader 进程的 exe/cwd/fd 链接、cmdline、readlink、按挂载表生成的 mounts/mountinfo |
-| `src/payload/logic/proot_bridge_internal.h` | 上面三者共享的 Bridge 结构与 `pb_` 前缀的内部函数（不对外） |
-| `src/payload/logic/proot_exec.c`、`proot_auxv.c` | exec 链、auxv |
-| `src/payload/logic/fd_*.c`、`fs_policy.c`、`vm_write_guard.c` | guarded 构建的 FD 运行时与策略 |
+| `src/payload/logic/vfs_bridge.c` | VFS 路径翻译、系统调用分发、每次调用的 Bridge 生命周期 |
+| `src/payload/logic/vfs_mounts.c` | R4 挂载表（mount/umount2）、tmpfs、R6 overlay 与 loop 设备、`/proc/filesystems` |
+| `src/payload/logic/vfs_procfs.c` | `/proc` 伪造：loader 进程的 exe/cwd/fd 链接、cmdline、readlink、按挂载表生成的 mounts/mountinfo |
+| `src/payload/logic/vfs_bridge_internal.h` | 上面三者共享的 Bridge 结构与 `pb_` 前缀的内部函数（不对外） |
+| `src/payload/logic/vfs_exec.c`、`vfs_auxv.c` | 二进制 handoff exec 链、auxv |
+| `src/payload/logic/fd_*.c`、`fs_policy.c`、`vm_write_guard.c` | FD 运行时与文件系统访问策略（按 `cfg->guard` 运行时启用） |
 | `src/payload/logic/broker_client.c` | `--isolate` 下按路径的调用改由 broker 执行（协议 `broker_proto.h`） |
 | `src/payload/logic/container_state.c` | 共享挂载表（FD 901）、属主库（FD 902）、loop 设备槽 |
 | `src/payload/logic/union_view.c`、`lazy_layer.c` | 写时复制的合并视图；层镜像缓存的按需展开与填充 |
 | `src/payload/logic/net_view.c` | 容器网络：回环地址池、端口映射、peers |
 | `tools/oci/` | Docker 兼容工具（宿主侧 Python）：`union.py`/`guestfs.py` 在宿主侧读写同一合并视图，`erofs.py` 写读层镜像 |
-| `tools/agent_sandbox/` | agent 配置校验（`plan.py`）与启动器（`launch.py`，默认 `--isolate`） |
-| `vendor/proot/src/path/` | PRoot 路径核心（canonicalize、绑定表、解析） |
+| `tools/agent/` | agent 配置校验（`plan.py`）与启动器（`launch.py`，默认 `--isolate`） |
 
 ## 约定
 
-- **构建变体**：只有 `GUARDED` 一个编译开关（`make build` 产出 `elfloader` 与 `elfloader-guarded`）。
-  配置结构在两种构建中布局相同，只有一个 `PAYLOAD_ABI_VERSION`；改动 `payload_config_t`
-  或桩约定时必须递增它。
+- **单构建**：`make build` 仅产出 `build/svbox` 与 `build/svbox-exec`（无条件编译变体）。
+  `payload_config_t` 的 `guard` 字段位于偏移 0 供 `entry.S` 零开销快路径判定；改动 `payload_config_t`
+  或桩约定时必须递增 `PAYLOAD_ABI_VERSION`。
 - **系统调用号**：一律用内核的 `__NR_*`，判断时按 32 位（内核以 int 解释 w8）。
 - **错误**：payload 函数返回 `-errno`；loader 内部函数返回 0/-1，致命错误统一 `z_errx`
   （失败即退出，绝不留下未改写的系统调用指令）。
-- **日志**：loader 用 `z_printf`，仅在 `--log` 非零时输出，默认对 guest 完全静默；payload 不打印。
+- **日志**：loader 用 `z_printf`，仅在 `--log-level` 非零时输出，默认对 guest 完全静默；payload 不打印。
 - **常量**：私有 prctl、固定地址、陷阱标记只定义在 `elf_abi.h`（Python 侧经 `tools/elf_abi.py` 读取）；
   不写裸数字。
-- **注释**：代码注释用英文，文档用中文。
-- **测试**：用 `test/lib.py`（`lib.loader()`、`lib.loaders()`、`lib.build_probe()`、`lib.guest()`）；
+- **注释**：代码注释用英文，文档用中文/双语。
+- **测试**：用 `test/lib.py`（`lib.loader()`、`lib.build_probe()`、`lib.guest()`）；
   修复必须附带在修复前构建上会失败的用例。
 
 ## 同一语义的多套实现
@@ -116,5 +115,5 @@ guest 程序对 SP 附近与寄存器的前提照 Linux 保留（Go 运行时全
 | 语义 | 实现 | 共享的验收 |
 | --- | --- | --- |
 | 写时复制合并视图（whiteout、opaque、复制上来） | payload `union_view.c`；宿主 `tools/oci/union.py`、`guestfs.py` | `test/oci/run.py` 的 `--cow` 与层镜像用例（同一容器内外对照） |
-| 层镜像（erofs）读取与按需展开 | loader/payload `lazy_layer.c`；宿主 `tools/oci/erofs.py` | `test/oci/erofs_check.py`、`test/proot/test_loop.py`、`test_union.py` |
-| 路径到权限的解析 | payload `proot_bridge.c` + `fs_policy.c`；broker `broker.c` 树表 | guarded 与 `--isolate` 跑同一组用例（`test/fs_policy/agent_launch.py` 比较两种后端输出一致） |
+| 层镜像（erofs）读取与按需展开 | loader/payload `lazy_layer.c`；宿主 `tools/oci/erofs.py` | `test/oci/erofs_check.py`、`test/vfs/test_loop.py`、`test_union.py` |
+| 路径到权限的解析 | payload `vfs_bridge.c` + `fs_policy.c`；broker `broker.c` 树表 | 进程内 guard 与 `--isolate` 跑同一组用例（`test/fs_policy/agent_launch.py` 比较两种后端输出一致） |

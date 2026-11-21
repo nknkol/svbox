@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import lib  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
-spec = importlib.util.spec_from_file_location('plan', ROOT/'tools/agent_sandbox/plan.py')
+spec = importlib.util.spec_from_file_location('plan', ROOT/'tools/agent/plan.py')
 plan = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(plan)
 

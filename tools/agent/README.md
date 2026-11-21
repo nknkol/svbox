@@ -57,11 +57,11 @@ expecting readonly or default-deny isolation.
 From the repository root, with real absolute paths:
 
 ```sh
-python3 tools/agent_sandbox/plan.py profiles/agent.json \
+python3 tools/agent/plan.py profiles/agent.json \
   --brew-prefix /path/to/brew \
   --workspace /path/to/project \
   --state /path/to/private-run
-python3 -m unittest discover -s test/agent_sandbox -v
+python3 -m unittest discover -s test/agent -v
 ```
 
 The profile exposes the brew prefix at its original guest pathname (readonly),
@@ -93,7 +93,7 @@ before claiming hostile-agent isolation.
 
 ```sh
 make check-guarded   # or: python3 tools/build.py --guarded
-python3 tools/agent_sandbox/launch.py profiles/agent.json \
+python3 tools/agent/launch.py profiles/agent.json \
   --brew-prefix /path/to/brew --workspace /path/to/project \
   --state /path/to/private-run -- /bin/sh -l
 ```
@@ -149,7 +149,7 @@ For the functioning experimental path backend and its tests, see
 ## Observe backing storage before selecting it
 
 ```sh
-python3 tools/agent_sandbox/probe_storage.py \
+python3 tools/agent/probe_storage.py \
   /storage/Users/currentUser /tmp /data/storage/el2/base/files
 ```
 

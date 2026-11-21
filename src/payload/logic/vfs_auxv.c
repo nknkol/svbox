@@ -3,7 +3,7 @@
 #include <errno.h>
 #include <stddef.h>
 #include "config.h"
-#include "proot_bridge.h"
+#include "vfs_bridge.h"
 extern long raw_syscall(long, long, long, long, long, long, long);
 
 long proot_get_auxv(long a[6])

@@ -1,18 +1,24 @@
 # 当前进度与验收快照
 
-## 当前版本（2026-11-06，分支 `feat/fexecve` / `device-test`，payload ABI 29）
+## 当前版本（2026-11-21，`svbox` 独立 MIT 仓库，分支 `main`，payload ABI 30）
 
 本节是唯一的当前状态说明；下面“历史增量”按时间记录每次改动，其中的 ABI 号、容量与“尚未接入”等描述
 只代表当时。架构总览见 [ARCHITECTURE.md](ARCHITECTURE.md)。
+
+**`svbox` 架构与许可证清理（2026-11-21）**：
+- **纯 MIT 许可证**：彻底移除 `vendor/proot/`（GPLv2+），以 Clean-room MIT 重写 `src/path/`（`path_helpers.c`、`binding_core.c`、`canon_core.c`、`resolve_core.c`），147 个自研文件全部切换至 `SPDX-License-Identifier: MIT`。
+- **单二进制合并**：合并 `elfloader` / `elfloader-guarded` 为单一静态二进制 `build/svbox`（+ `build/svbox-exec`），`entry.S` 通过偏移 0 的 `g_payload_config.guard` 实现快路径零追踪开销。
+- **全新 CLI 与二进制 Exec Handoff**：以 `--root-mode rw|ro|deny`、`-v/--bind HOST:GUEST[:rw|ro|deny]`、`--lower DIR[:IMAGE]`、`--guard none|track|observe|paths|files|access`、`--sandbox`、`--allow-device`、`-h/--help`、`-V/--version` 取代旧的平铺参数；以单个私有 memfd 二进制交接（`--__handoff-fd`）取代全部 21 个 `CONFIG_CHILD_*` 参数。
+- **去 PRoot 命名**：`proot_*.c/h` 重命名为 `vfs_*.c/h`，`test/proot/` -> `test/vfs/`，`tools/agent_sandbox/` -> `tools/agent/`。
 
 **组成与强度**
 
 | 部分 | 状态 |
 | --- | --- |
-| 默认构建 `elfloader` | PRoot 语义视图：root、bind、身份、挂载表（R4）、属主（R5）、写时复制与层镜像（R6）、`mount -o loop`、容器网络。不是边界 |
-| guarded 构建 `elfloader-guarded` | 进程内按挂载 deny/ro/rw 检查（`--guard-*`），对合作程序有效，不是对抗边界 |
-| `--isolate`（两种构建） | guest 过滤器 + broker 进程代办按路径的调用；执行可信链（FD 898、常量页空串、常量页与 loader 文件受保护）对所有 `--isolate` 生效；`--isolate-device` 另放行选中 GPU 设备的 openat |
-| agent 启动器 `tools/agent_sandbox/launch.py` | 默认 `--backend isolate`（broker）；`--backend in-process` 为进程内 guard。两种后端视图一致 |
+| 视图模式 `svbox`（`--guard none`） | VFS 语义视图：root、bind、身份、挂载表（R4）、属主（R5）、写时复制与层镜像（R6）、`mount -o loop`、容器网络。快路径零追踪开销，不是边界 |
+| 策略模式 `svbox --guard ...` / `--sandbox` | 进程内按挂载 `deny`/`ro`/`rw` 检查与 FD 溯源，对合作程序有效，不是对抗边界 |
+| 隔离模式 `svbox --isolate` | guest 过滤器 + broker 进程代办按路径的调用；执行可信链（FD 898、常量页空串、常量页与 loader 文件受保护）生效；`--allow-device` 另放行选中 GPU 设备的 `openat` |
+| agent 启动器 `tools/agent/launch.py` | 默认 `--backend isolate`（broker）；`--backend in-process` 为进程内 guard。两种后端视图一致 |
 | Docker/OCI `tools/oci/` | R1–R6 与 compose 网络、副本已实现（[OCI.md](OCI.md)）；宿主侧 Python，容器运行期间监视进程与 `-p` 转发器常驻 |
 
 **验收基线**（HarmonyOS 真机 HAD-W32，2026-11-03）：`make check` 306（含 `test_go_abi.py`、`test_caps.py`、`test_many_blocked.py`、`test_go.py`、`test_async_io.py`）、`make check-guarded` 175、
