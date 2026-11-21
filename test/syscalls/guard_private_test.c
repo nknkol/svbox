@@ -4,7 +4,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/syscall.h>
+#include "config.h"
 #include "reentry_guard.h"
+payload_config_t g_payload_config = { .guard = GUARD_TRACK };
 static long tid=100;
 static int maps;
 long raw_syscall(long n,long a,long b,long c,long d,long e,long f) {

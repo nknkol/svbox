@@ -8,7 +8,9 @@
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "config.h"
 #include "reentry_guard.h"
+payload_config_t g_payload_config;
 /* reentry_guard.c GUARD_SLOTS: the table holds this many owners at once.
  * Simulated TIDs of the full-table cases start far above the fixed ones. */
 #define SLOTS 1024

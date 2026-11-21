@@ -44,7 +44,7 @@ with tempfile.TemporaryDirectory(prefix='fcntl-policy-', dir=build) as tmp:
                 compile_probe(guarded)
                 p=subprocess.run([str(loader),'--mode','container','--root',str(root),
                                   '-v',f'{root}/ro:/ro','-v',f'{root}/rw:/rw','-v',f'{root}/deny:/deny',
-                                  *([option,'drwd'] if option else []),
+                                  *([option,'drwd'] if option else ['--fd-track']),
                                   *(['--allow-stdio-output'] if guarded else []),
                                   '--','./probe','guest'],cwd=root,capture_output=True,timeout=20)
                 assert p.returncode==0 and p.stdout==expected,(option,p.returncode,p.stdout,p.stderr)

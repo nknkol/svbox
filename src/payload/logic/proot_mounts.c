@@ -37,7 +37,6 @@ static bool guest_string(const char *s, size_t max)
  * policy ('w' without one). */
 static uint32_t mount_access_of(Bridge *b, const char *guest)
 {
-#ifdef GUARDED
     size_t id;
     if (!g_payload_config.mount_access_observe[0] || g_payload_config.guard < GUARD_PATHS ||
         binding_table_mount_id(&b->table, guest, &id) < 0)
@@ -48,10 +47,6 @@ static uint32_t mount_access_of(Bridge *b, const char *guest)
     }
     size_t slot = id - 1 - (size_t)g_payload_config.bind_count;
     return slot < (size_t)b->mount_count && b->mounts[slot].access ? b->mounts[slot].access : 'd';
-#else
-    (void)b; (void)guest;
-    return 'w';
-#endif
 }
 
 static uint32_t cap_access(uint32_t access, unsigned long flags)

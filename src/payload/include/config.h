@@ -101,18 +101,22 @@ struct bind_entry {
     uint32_t fold;
 };
 
-/* Guarded build: what the mount access policy enforces (each level
- * includes the previous ones). Not isolation. */
+/* What the FD runtime and mount access policy enforce (each level includes
+ * the previous ones). GUARD_NONE disables the FD runtime completely for
+ * zero fast-path overhead. */
 enum guard_level {
-    GUARD_OBSERVE, /* --observe-mount-access: record origins only */
-    GUARD_PATHS,   /* --guard-path-mutations: path-based changes */
-    GUARD_FILES,   /* --guard-file-mutations: and FD-based changes */
-    GUARD_READS,   /* --guard-file-access: and reads, listings, exec */
+    GUARD_NONE = 0, /* Fast path: no FD runtime overhead */
+    GUARD_TRACK,    /* FD tracking runtime enabled, no mount policy */
+    GUARD_OBSERVE,  /* --observe-mount-access: record origins only */
+    GUARD_PATHS,    /* --guard-path-mutations: path-based changes */
+    GUARD_FILES,    /* --guard-file-mutations: and FD-based changes */
+    GUARD_READS,    /* --guard-file-access: and reads, listings, exec */
 };
 
-/* Written by the loader into the payload before the guest runs; the same
- * layout in both builds (PAYLOAD_ABI_VERSION). */
+/* Written by the loader into the payload before the guest runs
+ * (PAYLOAD_ABI_VERSION). `guard` MUST remain at offset 0 for entry.S. */
 typedef struct payload_config {
+    int32_t guard;           /* enum guard_level; offset 0 read by entry.S */
     int32_t log_level;       /* LOG_LEVEL_* */
     int32_t mode;            /* CONFIG_MODE_* */
     int32_t bind_count;
@@ -166,7 +170,6 @@ typedef struct payload_config {
     int32_t revalidate_file_fds; /* Re-derive regular-file origins, never trust snapshot tags. */
     int32_t allow_pipe_output; /* Newly created pipe2 write ends only. */
     int32_t allow_stdio_output; /* Revalidate pipe/TTY stdout+stderr, write/writev only. */
-    int32_t guard; /* enum guard_level; meaningful with mount_access_observe. */
     int32_t allow_stream_input; /* Inherited pipe/socket/verified TTY reads in read guard mode. */
     int32_t allow_local_output; /* Writes to locally created sockets/eventfd/memfd. */
     /* R4: shared mount table FD (-1: mount calls are not emulated) and the

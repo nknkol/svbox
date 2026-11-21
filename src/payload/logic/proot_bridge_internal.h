@@ -30,10 +30,8 @@
 #include "container_state.h"
 #include "union_view.h"
 #include "net_view.h"
-#ifdef GUARDED
 #include "fd_runtime.h"
 #include "fs_policy.h"
-#endif
 #include "proot_scratch.h"
 #include "path/resolve_core.h"
 #include "path/binding_core.h"
@@ -99,7 +97,6 @@ typedef struct {
      * component swapped for a symlink after resolution cannot redirect it. */
     bool secure;
     int walk_fd[4], walk_count;
-#ifdef GUARDED
     bool reads; /* Immutable read policy snapshot below is active. */
     enum fs_access access[CONFIG_MOUNT_IDS];
     struct fs_policy policy;
@@ -108,7 +105,6 @@ typedef struct {
     /* Private getdents64 bounce: hidden names never reach guest memory. */
     unsigned char dirents[4096];
     char classified[PATH_MAX];
-#endif
     const struct proot_path_context *context;
     int anchor_fd;
     struct proot_open_origin anchor;

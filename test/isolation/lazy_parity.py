@@ -35,7 +35,7 @@ sys.path.insert(0, str(lib.REPO / 'tools/oci'))
 import erofs  # noqa: E402
 
 failures = []
-loader = lib.BUILD / 'elfloader-guarded'
+loader = lib.BUILD / 'svbox'
 
 
 def check(tag, ok, detail=''):

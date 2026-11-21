@@ -225,6 +225,7 @@ static int thread_clone(unsigned long flags)
 }
 int clone_observer_before(struct clone_event *event)
 {
+    if(g_payload_config.guard == GUARD_NONE)return 0;
     unsigned long allowed=CLONE_CHILD_SETTID|CLONE_CHILD_CLEARTID;
     int vf=event->flags==(CLONE_VM|CLONE_VFORK|17ul);
     int thread=thread_clone(event->flags);
@@ -278,6 +279,7 @@ int clone_observer_before(struct clone_event *event)
 }
 void clone_observer_finish(const struct clone_event *event,long result)
 {
+    if(g_payload_config.guard == GUARD_NONE)return;
     int vf=event->flags==(CLONE_VM|CLONE_VFORK|17ul);
     if(thread_clone(event->flags)) {
         /* The new thread starts in guest code with its own TID and slots; the
@@ -564,7 +566,7 @@ static int mount_decision(size_t mount, bool known, enum fs_operation operation)
 }
 int fd_runtime_check_path_mutation(size_t mount, bool known)
 {
-    if(g_payload_config.guard == GUARD_OBSERVE)return 0;
+    if(g_payload_config.guard < GUARD_PATHS)return 0;
     return mount_decision(mount,known,FS_MUTATE);
 }
 /* File-content and metadata mutations only. No syscall, allocation or path

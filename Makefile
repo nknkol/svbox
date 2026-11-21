@@ -1,4 +1,4 @@
-# Run from the repository root. Outputs: build/elfloader, build/elfloader-guarded.
+# Run from the repository root. Output: build/svbox (plus build/svbox-exec).
 .DEFAULT_GOAL := build
 .NOTPARALLEL:
 PYTHON ?= python3
@@ -6,16 +6,15 @@ ALPINE_ARCHIVE ?=
 UBUNTU_ARCHIVE ?=
 .PHONY: check-oci check-isolation help build check check-alpine check-ubuntu check-guarded bench
 help:
-	@echo 'make build          Build build/elfloader and build/elfloader-guarded'
-	@echo 'make check          Core regressions (both builds)'
-	@echo 'make check-guarded  Guarded runtime regressions'
+	@echo 'make build          Build build/svbox and build/svbox-exec'
+	@echo 'make check          Core regressions'
+	@echo 'make check-guarded  Guarded FD runtime and filesystem policy regressions'
 	@echo 'make check-alpine ALPINE_ARCHIVE=/path/to/rootfs.tar.gz'
 	@echo 'make check-ubuntu UBUNTU_ARCHIVE=/path/to/rootfs.tar.gz'
-	@echo 'make bench          Native vs loader micro benchmarks (both builds)'
+	@echo 'make bench          Native vs svbox micro benchmarks'
 	@echo 'make check-oci      docker command acceptance (docs/OCI.md); needs build/alpine-test-root'
 build:
 	$(PYTHON) tools/build.py
-	$(PYTHON) tools/build.py --guarded
 check: build
 	$(PYTHON) test/fs_policy/run.py
 	$(PYTHON) test/fs_policy/vm_model.py

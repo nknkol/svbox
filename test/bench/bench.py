@@ -32,26 +32,27 @@ with tempfile.TemporaryDirectory(prefix='bench-', dir=build) as tmp:
     subprocess.run(['clang', '-O2', '-nostdlib', '-static', '-ffreestanding', '-fno-builtin',
                     '-fno-stack-protector', str(repo / 'test/bench/bench.c'), '-o', str(probe)],
                    check=True)
+    svbox = str(build / 'svbox')
     configs = {
         'native': ([str(probe), str(work)], None),
-        'default': ([str(build / 'elfloader'), '--mode', 'container', '--root', str(root),
+        'default': ([svbox, '--mode', 'container', '--root', str(root),
                      '-v', f'{work}:/work', '--', './bench', '/work'], root),
-        'experiment': ([str(build / 'elfloader-guarded'), '--mode', 'container',
-                        '--root', str(root), '-v', f'{work}:/work', '--', './bench', '/work'], root),
-        'mutation': ([str(build / 'elfloader-guarded'), '--mode', 'container',
+        'fd-track': ([svbox, '--fd-track', '--mode', 'container',
+                      '--root', str(root), '-v', f'{work}:/work', '--', './bench', '/work'], root),
+        'mutation': ([svbox, '--mode', 'container',
                       '--root', str(root), '-v', f'{work}:/work', '--guard-file-mutations', 'dw',
                       '--allow-stdio-output', '--', './bench', '/work'], root),
-        'guarded': ([str(build / 'elfloader-guarded'), '--mode', 'container',
+        'guarded': ([svbox, '--mode', 'container',
                      '--root', str(root), '-v', f'{work}:/work', '--guard-file-access', 'dw',
                      '--allow-stdio-output', '--', './bench', '/work'], root),
         # Isolation mode: host path calls go to the broker process.
-        'isolate': ([str(build / 'elfloader'), '--isolate', '--mode', 'container', '--root', str(root),
+        'isolate': ([svbox, '--isolate', '--mode', 'container', '--root', str(root),
                      '-v', f'{work}:/work', '--', './bench', '/work'], root),
-        'isolate-g': ([str(build / 'elfloader-guarded'), '--isolate', '--mode', 'container',
+        'isolate-g': ([svbox, '--isolate', '--mode', 'container',
                        '--root', str(root), '-v', f'{work}:/work', '--guard-file-access', 'dw',
                        '--allow-stdio-output', '--', './bench', '/work'], root),
         # Default build with the opt-in seccomp backstop (filter on every call).
-        'backstop': ([str(build / 'elfloader'), '--mode', 'container', '--root', str(root),
+        'backstop': ([svbox, '--mode', 'container', '--root', str(root),
                       '--seccomp-backstop', '-v', f'{work}:/work', '--', './bench', '/work'], root),
     }
     results = {}

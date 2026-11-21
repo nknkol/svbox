@@ -32,20 +32,21 @@ real_entry:
     cmp     x8, #__NR_rt_sigreturn
     b.eq    fast_path_sigreturn
 
-    /* Direct entry callers keep raw clone. PRoot generated stubs use the
-     * separate notification gate; legacy stubs bypass before touching SP.
-     * Never execute clone inside the ordinary dispatcher/guard C frames. */
+    /* Direct entry callers keep raw clone when guard is off. When the FD
+     * runtime is active (g_payload_config.guard != 0 at offset 0), clone and
+     * FD-runtime syscalls route to slow_path; otherwise they stay on the fast
+     * passthrough path. x16/x17 are caller-saved scratch in stub.c/backstop.c. */
+    adrp    x16, g_payload_config
+    ldr     w17, [x16, :lo12:g_payload_config]
     cmp     x8, #__NR_clone
-#ifdef GUARDED
-    b.eq    slow_path
-#else
-    b.eq    fast_passthrough
-#endif
-
+    b.ne    1f
+    cbnz    w17, slow_path
+    b       fast_passthrough
+1:
+    cbz     w17, 2f
 #define SLOW_SYSCALL(n) cmp x8, n; b.eq slow_path
-#ifdef GUARDED
 #include "fd_runtime_syscalls.inc"
-#endif
+2:
 #include "slow_syscalls.inc"
 #undef SLOW_SYSCALL
     b       fast_passthrough
@@ -79,14 +80,13 @@ slow_path:
      * Built general-registers-only, as payload_stack_claim: the SIMD
      * registers are not saved yet. */
     bl      reentry_try_enter
-#ifdef GUARDED
     cbnz    x0, 1f
+    adrp    x16, g_payload_config
+    ldr     w17, [x16, :lo12:g_payload_config]
+    cbz     w17, reentry_bypass
     mov     x0, #-35 /* EDEADLK; never bypass nested metadata mutations */
     b       guard_error
 1:
-#else
-    cbz     x0, reentry_bypass
-#endif
     tbnz    x0, #63, guard_error
     mov     x19, x0
     ldr     x21, [x19] /* Owner TID: leave releases only its own lease. */

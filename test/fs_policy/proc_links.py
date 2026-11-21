@@ -19,10 +19,7 @@ if not (alpine / 'bin/busybox').exists():
 
 
 def loader(suffix):
-    path = build / f'elfloader{suffix}'
-    manifest = json.loads((build / f'elfloader{suffix}.json').read_text())
-    assert hashlib.sha256(path.read_bytes()).hexdigest() == manifest['sha256']
-    return path
+    return lib.loader(suffix)
 
 
 SCRIPT = r'''

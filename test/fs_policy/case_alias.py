@@ -18,10 +18,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import lib  # noqa: E402
 repo = Path(__file__).resolve().parents[2]
 build = lib.BUILD
-loader = build / 'elfloader-guarded'
+loader = lib.loader()
 alpine = build / 'alpine-test-root'
-assert hashlib.sha256(loader.read_bytes()).hexdigest() == json.loads(
-    (build / 'elfloader-guarded.json').read_text())['sha256']
 if not (alpine / 'bin/busybox').exists():
     print('SKIP: rootfs unavailable:', alpine)
     raise SystemExit(0)

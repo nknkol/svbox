@@ -46,9 +46,9 @@ with tempfile.TemporaryDirectory(prefix='elf-layout-', dir=build) as tmp:
     patch_load(good, work / 'offset', lambda d, o: struct.pack_into('<Q', d, o + 8, len(d) - 8))
     script = '; '.join(f'/work/{n} >/dev/null 2>&1; echo {n}=$?' for n in
                        ('over-loader', 'over-payload', 'filesz', 'offset'))
-    for suffix in ('', '-guarded'):
-        loader = build / f'elfloader{suffix}'
-        p = subprocess.run([str(loader), '--mode', 'container', '--root', str(alpine),
+    for suffix, extra in (('', []), ('-guarded', ['--fd-track'])):
+        loader = lib.loader()
+        p = subprocess.run([str(loader), *extra, '--mode', 'container', '--root', str(alpine),
                             '-v', f'{work}:/work', '--', './bin/busybox', 'sh', '-c',
                             f'/work/good; {script}'],
                            cwd=alpine, capture_output=True, text=True, timeout=60)

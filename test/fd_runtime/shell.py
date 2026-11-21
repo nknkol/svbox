@@ -4,7 +4,7 @@ import subprocess
 from pathlib import Path
 
 build = Path(__file__).resolve().parents[2] / 'build'
-loader = build / 'elfloader-guarded'
+loader = build / 'svbox'
 for directory, shell, prefix, cat in (
         ('alpine-test-root', './bin/busybox', ['sh'], '/bin/busybox cat'),
         ('ubuntu-root', './usr/bin/dash', [], '/usr/bin/cat')):
@@ -15,7 +15,7 @@ for directory, shell, prefix, cat in (
 
     def run(command):
         return subprocess.run(
-            [str(loader), '--mode', 'container', '--root', str(root),
+            [str(loader), '--fd-track', '--mode', 'container', '--root', str(root),
              '-v', '/dev/null:/dev/null', '--', shell, *prefix, '-c', command],
             cwd=root, capture_output=True, text=True, timeout=20)
 

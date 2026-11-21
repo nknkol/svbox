@@ -13,9 +13,7 @@
 #include "config.h"
 #include "host_syscall.h"
 #include "platform.h"
-#ifdef GUARDED
 #include "fd_runtime.h"
-#endif
 
 extern long raw_syscall(long number, long a1, long a2, long a3, long a4, long a5, long a6);
 
@@ -488,14 +486,12 @@ static void close_unreserved(unsigned long fd, unsigned flags)
         return;
     long nr = flags & CLOSE_RANGE_CLOEXEC_ ? __NR_fcntl : __NR_close;
     long a[6] = {(long)fd, 2 /* F_SETFD */, 1 /* FD_CLOEXEC */, 0, 0, 0};
-#ifdef GUARDED
-    fd_runtime_dispatch(nr, a); /* The FD runtime keeps its records. */
-#else
-    raw_syscall(nr, a[0], a[1], a[2], 0, 0, 0);
-#endif
+    if (g_payload_config.guard != GUARD_NONE)
+        fd_runtime_dispatch(nr, a); /* The FD runtime keeps its records. */
+    else
+        raw_syscall(nr, a[0], a[1], a[2], 0, 0, 0);
 }
 
-#ifndef GUARDED
 /* The kernel call on the stretches between the reserved FDs. */
 static long close_range_between(unsigned first, unsigned last, unsigned flags)
 {
@@ -529,7 +525,6 @@ static long close_range_between(unsigned first, unsigned last, unsigned flags)
     }
     return from <= last ? raw_syscall(__NR_close_range, (long)from, (long)last, flags, 0, 0, 0) : 0;
 }
-#endif
 
 /* Without the kernel call (HarmonyOS refuses it): the open FDs from a
  * /proc/self/fd listing, which the broker opens for this process; failing
@@ -576,13 +571,11 @@ static long close_range_unreserved(unsigned first, unsigned last, unsigned flags
 {
     if (first > last || (flags & ~(CLOSE_RANGE_UNSHARE_ | CLOSE_RANGE_CLOEXEC_)))
         return -EINVAL;
-#ifndef GUARDED
-    if (!platform_is_harmonyos()) {
+    if (g_payload_config.guard == GUARD_NONE && !platform_is_harmonyos()) {
         long rc = close_range_between(first, last, flags);
         if (rc != -ENOSYS)
             return rc;
     }
-#endif
     /* Unsharing the table needs the kernel call. */
     if (flags & CLOSE_RANGE_UNSHARE_)
         return -ENOSYS;

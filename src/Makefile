@@ -1,12 +1,8 @@
-# AArch64 loader with the embedded payload. Built by tools/build.py;
-# GUARDED=1 selects the guarded runtime.
-TARGET := elfloader
+# AArch64 svbox loader with the embedded payload. Built by tools/build.py.
+TARGET := svbox
 
 CPPFLAGS += -I$(CURDIR)/include -I$(CURDIR)/loader -I$(CURDIR)/payload/include \
 	-I$(CURDIR)/payload/arch/aarch64 -DELFCLASS=ELFCLASS64
-ifeq ($(GUARDED),1)
-CPPFLAGS += -DGUARDED
-endif
 CFLAGS += -pipe -Wall -Wextra -Os -fno-ident -fno-stack-protector -U_FORTIFY_SOURCE \
 	-fvisibility=hidden -fno-asynchronous-unwind-tables -fno-unwind-tables
 LDFLAGS += -nostartfiles -nodefaultlibs -nostdlib -s
@@ -26,7 +22,7 @@ $(TARGET): $(OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^
 
 $(PAYLOAD_BIN):
-	$(MAKE) -C payload CC="$(CC)" LD="$(LD)" GUARDED=$(GUARDED)
+	$(MAKE) -C payload CC="$(CC)" LD="$(LD)"
 
 $(PAYLOAD_OBJ): $(PAYLOAD_BIN)
 	$(OBJCOPY) -I binary -O elf64-littleaarch64 -B aarch64 $< $@

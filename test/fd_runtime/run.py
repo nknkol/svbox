@@ -202,7 +202,7 @@ with tempfile.TemporaryDirectory(prefix='fd-runtime-', dir=build) as temp, \
     subprocess.run(['clang', '-O1', '-nostdlib', '-static', '-ffreestanding',
                     '-fno-builtin', '-fno-stack-protector',
                     str(repo / 'test/syscalls/runtime_probe.c'), '-o', str(guards)], check=True)
-    p = subprocess.run([str(loader), '--mode', 'compat', '--', str(guards), 'b'],
+    p = subprocess.run([str(loader), '--fd-track', '--mode', 'compat', '--', str(guards), 'b'],
                        capture_output=True, text=True, timeout=20)
     assert p.returncode == 0 and 'NR=452\nRET=-38\n' in p.stdout, (p.returncode, p.stdout, p.stderr)
     assert p.stdout.count('RET=-38\n') == 14, p.stdout
@@ -260,7 +260,7 @@ for directory, target, arguments, marker in [
     if not (root / target).exists():
         print('SKIP: optional rootfs smoke', directory)
         continue
-    p = subprocess.run([str(loader), '--mode', 'container', '--root', str(root),
+    p = subprocess.run([str(loader), '--fd-track', '--mode', 'container', '--root', str(root),
                         '--', target, *arguments], cwd=root, text=True,
                        capture_output=True, timeout=20)
     assert p.returncode == 0 and marker in p.stdout, (directory, p.returncode, p.stdout, p.stderr)
@@ -276,7 +276,7 @@ for directory, shell, command, marker in [
     if not (root / shell).exists():
         print('SKIP: optional rootfs exec smoke', directory)
         continue
-    p = subprocess.run([str(loader), '--mode', 'container', '--root', str(root),
+    p = subprocess.run([str(loader), '--fd-track', '--mode', 'container', '--root', str(root),
                         '--', shell, *command], cwd=root, capture_output=True, text=True, timeout=20)
     assert p.returncode == 0 and marker in p.stdout, (directory, p.returncode, p.stdout, p.stderr)
     print('PASS: experimental runtime rootfs shell exec', directory)

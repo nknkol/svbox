@@ -549,9 +549,9 @@ def new_record(st, a, image_id, image_text):
             tmpfs.append(dst)
         else:
             binds.append([src or f'anon-{cid[:12]}-{len(binds)}', dst, mode])
-    if (a.read_only or any(b[2] == 'ro' for b in binds)) and not Path(runspec.BUILD / 'elfloader-guarded').exists() \
-            and not os.environ.get('ELF_LOADER_GUARDED'):
-        raise Fail('read-only volumes need the guarded loader build (make build)')
+    if (a.read_only or any(b[2] == 'ro' for b in binds)) and not Path(runspec.BUILD / 'svbox').exists() \
+            and not os.environ.get('SVBOX') and not os.environ.get('ELF_LOADER'):
+        raise Fail('read-only volumes need build/svbox (make build)')
     restart = {'Name': 'no', 'MaximumRetryCount': 0}
     if a.restart:
         name, _, count = a.restart.partition(':')
@@ -1301,7 +1301,7 @@ def cmd_version(st, args):
 
 def cmd_info(st, args):
     print(f'Storage: {st.home}\nImages: {len(st.images())}\nContainers: {len(st.containers())}\n'
-          f'Runtime: elfloader ({runspec.BUILD})\nIsolation: --isolate (broker)\n'
+          f'Runtime: svbox ({runspec.BUILD})\nIsolation: --isolate (broker)\n'
           'Networking: host only\nArchitecture: aarch64')
 
 

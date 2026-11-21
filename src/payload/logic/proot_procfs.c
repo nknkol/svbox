@@ -128,11 +128,7 @@ int pb_proc_link(void *opaque, char *out, const char *path,
     strcpy(b->proc_guest, path);
     strcat(b->proc_guest, "/");
     strcat(b->proc_guest, component);
-#ifdef GUARDED
     int keep = fd && g_payload_config.guard != GUARD_READS;
-#else
-    int keep = fd;
-#endif
     if (keep) {
         strcpy(out, b->proc_guest);
         return FS_LINK_KEEP;

@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <asm/unistd.h>
 #include <linux/mman.h>
+#include "config.h"
 #include "reentry_guard.h"
 
 /* One slot per thread inside a call. Threads can be many at once, each
@@ -63,15 +64,15 @@ struct reentry_slot *reentry_try_enter(void)
                                           __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)
             ? &vfork_leases[i].slot : NULL;
     }
-#ifdef GUARDED
-    /* Bind once at entry, before acquiring any lease. Binding later inside
-     * dispatch would let a nested signal bypass the already-held old slot. */
-    if (!__atomic_load_n(&private_tid, __ATOMIC_ACQUIRE)) {
+    /* Bind once at entry in guarded mode, before acquiring any lease. Binding
+     * later inside dispatch would let a nested signal bypass the already-held
+     * old slot. */
+    if (g_payload_config.guard != GUARD_NONE &&
+        !__atomic_load_n(&private_tid, __ATOMIC_ACQUIRE)) {
         long empty_owner = 0;
         __atomic_compare_exchange_n(&private_tid, &empty_owner, tid, 0,
                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
     }
-#endif
     if (__atomic_load_n(&private_tid, __ATOMIC_ACQUIRE) == tid) {
         long empty = 0;
         return __atomic_compare_exchange_n(&private_slot.tid, &empty, tid, 0,
@@ -133,9 +134,8 @@ void reentry_leave_owned(struct reentry_slot *slot, long owner)
 
 struct reentry_slot *reentry_exec_release(void)
 {
-#ifdef GUARDED
-    return NULL; /* The FD experiment's exec path manages its own leases. */
-#else
+    if (g_payload_config.guard != GUARD_NONE)
+        return NULL; /* The FD runtime's exec path manages its own leases. */
     /* A vfork child shares this VM: its lease must not outlive its exec. */
     struct guard_table *table = __atomic_load_n(&g_table, __ATOMIC_ACQUIRE);
     long tid = raw_syscall(__NR_gettid, 0, 0, 0, 0, 0, 0);
@@ -147,7 +147,6 @@ struct reentry_slot *reentry_exec_release(void)
             return &table->slots[i];
     }
     return NULL;
-#endif
 }
 
 void reentry_exec_restore(struct reentry_slot *slot)
@@ -191,12 +190,12 @@ void reentry_private_fork(long tid)
 {
     __atomic_store_n(&private_slot.tid, 0, __ATOMIC_RELEASE);
     __atomic_store_n(&private_tid, tid, __ATOMIC_RELEASE);
-#ifdef GUARDED
-    /* The copied table names the parent's other threads, which do not exist
-     * here; a later reuse of such a TID must not look like recursion. */
-    struct guard_table *table = __atomic_load_n(&g_table, __ATOMIC_ACQUIRE);
-    if (table)
-        for (int i = 0; i < __atomic_load_n(&table->used, __ATOMIC_ACQUIRE); i++)
-            __atomic_store_n(&table->slots[i].tid, 0, __ATOMIC_RELEASE);
-#endif
+    if (g_payload_config.guard != GUARD_NONE) {
+        /* The copied table names the parent's other threads, which do not exist
+         * here; a later reuse of such a TID must not look like recursion. */
+        struct guard_table *table = __atomic_load_n(&g_table, __ATOMIC_ACQUIRE);
+        if (table)
+            for (int i = 0; i < __atomic_load_n(&table->used, __ATOMIC_ACQUIRE); i++)
+                __atomic_store_n(&table->slots[i].tid, 0, __ATOMIC_RELEASE);
+    }
 }

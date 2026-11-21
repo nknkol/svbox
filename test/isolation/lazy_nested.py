@@ -45,9 +45,9 @@ import erofs  # noqa: E402
 
 EACCES = -13
 failures = []
-loader = lib.BUILD / 'elfloader-guarded'
+loader = lib.BUILD / 'svbox'
 if not loader.exists():
-    print('SKIP: elfloader-guarded missing')
+    print('SKIP: svbox missing')
     sys.exit(0)
 
 

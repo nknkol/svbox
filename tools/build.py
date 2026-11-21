@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Build the loader (with its embedded payload) into build/.
+"""Build svbox (with its embedded payload) and svbox-exec into build/.
 
-build/elfloader, or build/elfloader-guarded with --guarded, plus a manifest
-(build/elfloader[-guarded].json) recording its hash: tests refuse a binary
-that is not the last one built. A failed build leaves no manifest."""
+Outputs build/svbox, build/svbox-exec, and build/svbox.json recording their
+hashes: tests refuse a binary that is not the last one built. A failed build
+leaves no manifest."""
 import argparse
 import hashlib
 import json
@@ -14,12 +14,11 @@ from pathlib import Path
 from elf_abi import LOADER_FIXED_BASE
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--guarded', action='store_true', help='include the guarded FD runtime')
 args = parser.parse_args()
 repo = Path(__file__).resolve().parents[1]
 build = repo / 'build'
 build.mkdir(exist_ok=True)
-name = 'elfloader-guarded' if args.guarded else 'elfloader'
+name = 'svbox'
 (build / f'{name}.json').unlink(missing_ok=True)
 # Dependency files hold absolute paths; drop them after repository moves.
 shutil.rmtree(repo / 'src/payload/path-build', ignore_errors=True)
@@ -28,18 +27,18 @@ with (build / f'{name}.log').open('w') as log:
     # processes, and the seccomp backstop allows the loader's own syscalls
     # by address across every exec.
     subprocess.run(['make', '-B', '-C', str(repo / 'src'), 'CC=clang', 'LD=ld.lld',
-                    'OBJCOPY=llvm-objcopy', f'GUARDED={int(args.guarded)}',
+                    'OBJCOPY=llvm-objcopy',
                     f'LDFLAGS=-nostdlib -static -no-pie -Wl,--image-base={LOADER_FIXED_BASE:#x} '
                     '-e z_start -Wl,--no-undefined,--build-id=none'],
                    stdout=log, stderr=subprocess.STDOUT, check=True)
 binary = build / name
 pending = build / f'{name}.next'
-shutil.copy2(repo / 'src/elfloader', pending)
+shutil.copy2(repo / 'src' / name, pending)
 pending.replace(binary)
-manifest = {'guarded': args.guarded, 'sha256': hashlib.sha256(binary.read_bytes()).hexdigest()}
+manifest = {'sha256': hashlib.sha256(binary.read_bytes()).hexdigest()}
 # First guest program of agent launches and containers (tools/oci). Static-pie
 # keeps it near the loader's stubs; it carries no relocations.
-helper = build / 'elf-exec-helper'
+helper = build / 'svbox-exec'
 subprocess.run(['clang', '-O1', '-static-pie', '-fPIE', '-nostdlib', '-ffreestanding',
                 '-fno-builtin', '-fno-stack-protector', '-I', str(repo / 'src/payload/include'),
                 str(repo / 'tools/agent_sandbox/exec_helper.c'), '-o', str(helper)], check=True)

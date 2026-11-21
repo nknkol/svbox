@@ -147,12 +147,10 @@ static const char *interpreter(const struct image *prog, const char *file,
 			return "(interpreter)";
 		if (opt->child && cfg->isolate)
 			z_errx(1, "interpreter not opened by the payload");
-#ifdef GUARDED
 		/* A target swapped after the payload's check must not fall back to
 		 * lexical mapping and bypass the read policy. */
 		if (opt->child && cfg->guard == GUARD_READS)
 			z_errx(1, "interpreter not authorized by payload");
-#endif
 		char name[CONFIG_MAX_PATH + 1];
 		int fd = z_openat(AT_FDCWD, file, O_RDONLY);
 		if (fd < 0 || z_lseek(fd, (off_t)p->p_offset, SEEK_SET) < 0 ||

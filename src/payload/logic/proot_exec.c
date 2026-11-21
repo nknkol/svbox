@@ -14,9 +14,7 @@
 #include "syscall_nums.h"
 #include "proot_bridge.h"
 #include "proot_scratch.h"
-#ifdef GUARDED
 #include "fd_runtime.h"
-#endif
 
 /* Guest argv entries held inline; longer vectors get their own mapping. */
 #define EXEC_ARGS 128
@@ -52,11 +50,9 @@ typedef struct {
     char owners[CONFIG_OWNERS * 24];
     char mount_table_fd[16], owner_db_fd[16];
     char net_addr[16];
-#ifdef GUARDED
     char fd_state[24];
     char fd_capacity[24];
     char passed_fds[CONFIG_MAX_PASSED_FDS * 64];
-#endif
     /* PT_INTERP as stored in the target, then its resolution in guest terms
      * (file access guard, isolation mode). */
     char elf_interp[CONFIG_MAX_PATH];
@@ -78,7 +74,6 @@ static void fd_name(char *out, const char *prefix, int fd)
     *out = 0;
 }
 
-#ifdef GUARDED
 static char *append_u64(char *out, uint64_t value, char end)
 {
     char digits[21];
@@ -89,7 +84,6 @@ static char *append_u64(char *out, uint64_t value, char end)
     *out = 0;
     return out;
 }
-#endif
 
 /* execve's permission check (execute for the real ids), from the file's
  * metadata: no round trip to the broker for an access(X_OK). */
@@ -286,9 +280,7 @@ long proot_execve_context(long number, long a[6], const struct proot_path_contex
         }
         s->argv = (char **)array;
     }
-#ifdef GUARDED
     long transport = -1;
-#endif
     long ret;
     long fd_copy = -1;
     /* Isolation mode: the program (the final ELF) and its interpreter as
@@ -380,10 +372,7 @@ long proot_execve_context(long number, long a[6], const struct proot_path_contex
     }
     int script = depth > 0;
     int dynamic = 0;
-    int resolve_interp = cfg->isolate;
-#ifdef GUARDED
-    resolve_interp |= cfg->guard == GUARD_READS;
-#endif
+    int resolve_interp = cfg->isolate | (cfg->guard == GUARD_READS);
     if (resolve_interp) {
         /* The dynamic linker is loaded content too: resolve it with guest
          * symlinks and the read policy instead of lexical host mapping (an
@@ -608,54 +597,54 @@ long proot_execve_context(long number, long a[6], const struct proot_path_contex
         s->argv[pos++] = CONFIG_CHILD_OWNER_DB_FD;
         s->argv[pos++] = s->owner_db_fd;
     }
-#ifdef GUARDED
-    if (dynamic && !cfg->isolate) {
+    if (dynamic && !cfg->isolate && cfg->guard == GUARD_READS) {
         s->argv[pos++] = CONFIG_CHILD_EXEC_INTERP;
         s->argv[pos++] = s->elf_interp_host;
     }
-#endif
-#ifdef GUARDED
-    if (cfg->mount_access_observe[0]) {
-        static const char *const option[] = {
-            [GUARD_OBSERVE] = "--observe-mount-access", [GUARD_PATHS] = "--guard-path-mutations",
-            [GUARD_FILES] = "--guard-file-mutations", [GUARD_READS] = "--guard-file-access"};
-        s->argv[pos++] = (char *)option[cfg->guard];
-        s->argv[pos++] = cfg->mount_access_observe;
-    }
-    if (cfg->revalidate_file_fds)s->argv[pos++] = "--revalidate-file-fds";
-    if (cfg->fd_capacity > 0) {
-        char *digit = s->fd_capacity + sizeof(s->fd_capacity) - 1;
-        unsigned value = (unsigned)cfg->fd_capacity;
+    if (cfg->guard != GUARD_NONE) {
+        if (cfg->mount_access_observe[0]) {
+            static const char *const option[] = {
+                [GUARD_OBSERVE] = "--observe-mount-access", [GUARD_PATHS] = "--guard-path-mutations",
+                [GUARD_FILES] = "--guard-file-mutations", [GUARD_READS] = "--guard-file-access"};
+            s->argv[pos++] = (char *)option[cfg->guard];
+            s->argv[pos++] = cfg->mount_access_observe;
+        } else {
+            s->argv[pos++] = "--fd-track";
+        }
+        if (cfg->revalidate_file_fds)s->argv[pos++] = "--revalidate-file-fds";
+        if (cfg->fd_capacity > 0) {
+            char *digit = s->fd_capacity + sizeof(s->fd_capacity) - 1;
+            unsigned value = (unsigned)cfg->fd_capacity;
+            *digit = 0;
+            do { *--digit = '0' + value % 10; value /= 10; } while (value);
+            s->argv[pos++] = "--fd-capacity";
+            s->argv[pos++] = digit;
+        }
+        if (cfg->allow_pipe_output)s->argv[pos++] = "--allow-pipe-output";
+        if (cfg->allow_local_output)s->argv[pos++] = "--allow-local-output";
+        if (cfg->allow_stdio_output)s->argv[pos++] = "--allow-stdio-output";
+        if (cfg->allow_stream_input)s->argv[pos++] = "--allow-stream-input";
+        if (cfg->passed_count) {
+            char *out = s->passed_fds;
+            for (int k = 0; k < cfg->passed_count; k++) {
+                const struct passed_fd *f = &cfg->passed[k];
+                out = append_u64(out, (uint32_t)f->fd, ':');
+                out = append_u64(out, f->flags, ':');
+                out = append_u64(out, f->dev, ':');
+                out = append_u64(out, f->ino, k + 1 < cfg->passed_count ? ',' : 0);
+            }
+            s->argv[pos++] = CONFIG_CHILD_PASSED_FDS;
+            s->argv[pos++] = s->passed_fds;
+        }
+        transport = fd_runtime_export();
+        if (transport < 0) { ret = transport; goto done; }
+        unsigned value = (unsigned)transport;
+        char *digit = s->fd_state + sizeof(s->fd_state) - 1;
         *digit = 0;
         do { *--digit = '0' + value % 10; value /= 10; } while (value);
-        s->argv[pos++] = "--fd-capacity";
+        s->argv[pos++] = "--fd-state";
         s->argv[pos++] = digit;
     }
-    if (cfg->allow_pipe_output)s->argv[pos++] = "--allow-pipe-output";
-    if (cfg->allow_local_output)s->argv[pos++] = "--allow-local-output";
-    if (cfg->allow_stdio_output)s->argv[pos++] = "--allow-stdio-output";
-    if (cfg->allow_stream_input)s->argv[pos++] = "--allow-stream-input";
-    if (cfg->passed_count) {
-        char *out = s->passed_fds;
-        for (int k = 0; k < cfg->passed_count; k++) {
-            const struct passed_fd *f = &cfg->passed[k];
-            out = append_u64(out, (uint32_t)f->fd, ':');
-            out = append_u64(out, f->flags, ':');
-            out = append_u64(out, f->dev, ':');
-            out = append_u64(out, f->ino, k + 1 < cfg->passed_count ? ',' : 0);
-        }
-        s->argv[pos++] = CONFIG_CHILD_PASSED_FDS;
-        s->argv[pos++] = s->passed_fds;
-    }
-    transport = fd_runtime_export();
-    if (transport < 0) { ret = transport; goto done; }
-    unsigned value = (unsigned)transport;
-    char *digit = s->fd_state + sizeof(s->fd_state) - 1;
-    *digit = 0;
-    do { *--digit = '0' + value % 10; value /= 10; } while (value);
-    s->argv[pos++] = "--fd-state";
-    s->argv[pos++] = digit;
-#endif
     s->argv[pos++] = "--";
     if (script) {
         /* Innermost interpreter first; each level's file is the name the
@@ -674,10 +663,10 @@ long proot_execve_context(long number, long a[6], const struct proot_path_contex
     s->argv[pos] = NULL;
     /* The signed loader starts the same embedded backend. Do not fall back
      * to raw target exec, which would lose the guest filesystem view. */
-#ifdef GUARDED
-    ret = raw_syscall(__NR_fcntl, transport, F_SETFD, 0, 0, 0, 0);
-    if (ret < 0) goto done;
-#endif
+    if (transport >= 0) {
+        ret = raw_syscall(__NR_fcntl, transport, F_SETFD, 0, 0, 0, 0);
+        if (ret < 0) goto done;
+    }
     struct reentry_slot *lease = reentry_exec_release();
     /* Isolation mode: the guest filter only lets an FD run. */
     /* The empty path of the loader's constant page (--isolate-device). */
@@ -690,9 +679,7 @@ long proot_execve_context(long number, long a[6], const struct proot_path_contex
                           (long)env, 0, 0, 0);
     reentry_exec_restore(lease);
  done:
-#ifdef GUARDED
     if (transport >= 0) raw_syscall(__NR_close, transport, 0, 0, 0, 0, 0);
-#endif
     if (fd_copy >= 0) raw_syscall(__NR_close, fd_copy, 0, 0, 0, 0, 0);
     if (target_fd >= 0) raw_syscall(__NR_close, target_fd, 0, 0, 0, 0, 0);
     if (interp_fd >= 0) raw_syscall(__NR_close, interp_fd, 0, 0, 0, 0, 0);

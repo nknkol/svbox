@@ -29,7 +29,7 @@ with tempfile.TemporaryDirectory(prefix='policy-transport-', dir=build) as tmp:
                         '-I' + str(repo / 'src/payload/include'),
                         str(repo / 'test/fs_policy/transport.c'), '-o', str(root / 'probe.next')], check=True)
         (root / 'probe.next').replace(root / 'probe')
-        p = run(['--observe-mount-access', 'drw'] if enabled else [])
+        p = run(['--observe-mount-access', 'drw'] if enabled else ['--fd-track'])
         assert p.returncode == 0 and 'PASS: policy observation' in p.stdout, (p.returncode, p.stdout, p.stderr)
         print('PASS: real exec transport, observation enabled =', enabled)
     for options in (['--observe-mount-access', v] for v in ('', 'dr', 'drww', 'drx', 'w'*18)):

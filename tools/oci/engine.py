@@ -508,7 +508,7 @@ def info(h):
                       'Driver': 'elf', 'DockerRootDir': str(st.home), 'OSType': 'linux',
                       'OperatingSystem': 'HarmonyOS (ELF loader)', 'Architecture': 'aarch64',
                       'KernelVersion': os.uname().release, 'NCPU': os.cpu_count() or 1, 'MemTotal': 0,
-                      'Labels': [], 'ExperimentalBuild': False, 'Runtimes': {'elf': {'path': 'elfloader'}},
+                      'Labels': [], 'ExperimentalBuild': False, 'Runtimes': {'svbox': {'path': 'svbox'}},
                       'DefaultRuntime': 'elf', 'SecurityOptions': [], 'Warnings': [
                           'no namespaces or cgroups: containers share the host network and PID space']})
 

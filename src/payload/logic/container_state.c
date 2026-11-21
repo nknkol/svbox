@@ -564,19 +564,15 @@ long mounts_render(int fd, int info)
     int count = mounts_snapshot(s->entries, MOUNT_TABLE_MAX), rows = 0;
     const char *root = cfg->root[0] ? cfg->root : "/";
     uint32_t root_flags = 0;
-#ifdef GUARDED
     if (cfg->mount_access_observe[0] == 'r' && cfg->guard >= GUARD_PATHS)
         root_flags = MS_RDONLY_;
-#endif
     s->rows[rows++] = (struct row){"/", root, "overlay", "overlay", root_flags, 20, 1};
     for (int i = 0; i < cfg->bind_count && i < CONFIG_MAX_BINDS; i++) {
         const char *host = cfg->binds[i].dst;
         strcpy(s->fstypes[i], mounts_fs_name(host));
         uint32_t flags = 0;
-#ifdef GUARDED
         if (cfg->mount_access_observe[i + 1] == 'r' && cfg->guard >= GUARD_PATHS)
             flags = MS_RDONLY_;
-#endif
         const char *fstype = s->fstypes[i];
         s->rows[rows++] = (struct row){cfg->binds[i].src, host,
                                        !strcmp(fstype, "proc") || !strcmp(fstype, "sysfs") ||

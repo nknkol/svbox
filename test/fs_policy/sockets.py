@@ -15,13 +15,7 @@ build = lib.BUILD
 
 
 def loader(suffix):
-    path = build / f'elfloader{suffix}'
-    manifest = build / f'elfloader{suffix}.json'
-    if not path.exists() or not manifest.exists():
-        return None
-    if hashlib.sha256(path.read_bytes()).hexdigest() != json.loads(manifest.read_text())['sha256']:
-        return None
-    return path
+    return lib.loader(suffix)
 
 
 def socket_capable():

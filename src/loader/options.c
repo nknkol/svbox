@@ -61,7 +61,6 @@ static void add_bind(payload_config_t *cfg, const char *spec)
 	copy_cstr(b->src, CONFIG_MAX_PATH, colon + 1);
 }
 
-#ifdef GUARDED
 static int pass_fd_given, passed_fds_given;
 
 /* --pass-fd N: the object open at N now (refused when N is not open or a
@@ -173,14 +172,23 @@ static int guarded_option(const char *arg, payload_config_t *cfg, int argc, char
 		*flag = 1;
 		return 1;
 	}
+	if (is(arg, "--fd-track")) {
+		if (cfg->guard == GUARD_NONE)
+			cfg->guard = GUARD_TRACK;
+		return 1;
+	}
 	if (is(arg, "--fd-state")) {
 		cfg->fd_state = (int32_t)number(value(argc, argv, i), 2147483647ul, "fd state");
+		if (cfg->guard == GUARD_NONE)
+			cfg->guard = GUARD_TRACK;
 		return 1;
 	}
 	if (is(arg, "--fd-capacity")) {
 		cfg->fd_capacity = (int32_t)number(value(argc, argv, i), 1ul << 20, "fd capacity");
 		if (!cfg->fd_capacity)
 			z_errx(1, "fd capacity must be positive");
+		if (cfg->guard == GUARD_NONE)
+			cfg->guard = GUARD_TRACK;
 		return 1;
 	}
 	return 0;
@@ -213,7 +221,6 @@ static void check_guarded(const payload_config_t *cfg, const struct loader_optio
 	if (opt->exec_interp && (!opt->child || cfg->guard != GUARD_READS))
 		z_errx(1, "exec interpreter requires file access child loader");
 }
-#endif
 
 void options_parse(int argc, char **argv, payload_config_t *cfg, struct loader_options *opt)
 {
@@ -425,12 +432,8 @@ void options_parse(int argc, char **argv, payload_config_t *cfg, struct loader_o
 			if (count < 0)
 				z_errx(1, "invalid value for %s", arg);
 			cfg->fake_group_count = count;
-		}
-#ifdef GUARDED
-		else if (guarded_option(arg, cfg, argc, argv, &i)) {
-		}
-#endif
-		else {
+		} else if (guarded_option(arg, cfg, argc, argv, &i)) {
+		} else {
 			z_errx(1, "unknown option %s", arg);
 		}
 	}
@@ -443,10 +446,5 @@ void options_parse(int argc, char **argv, payload_config_t *cfg, struct loader_o
 		z_errx(1, "--lower requires --root (the writable upper layer)");
 	if (cfg->device_mask && !opt->isolate && !cfg->isolate && !opt->filter_dump)
 		z_errx(1, "--isolate-device requires --isolate");
-#ifdef GUARDED
 	check_guarded(cfg, opt);
-#else
-	if (opt->exec_interp)
-		z_errx(1, "exec interpreter requires file access child loader");
-#endif
 }

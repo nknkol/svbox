@@ -21,8 +21,8 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('archive',type=Path)
     args=parser.parse_args();archive=args.archive.resolve(strict=True)
-    loader=BUILD/'elfloader'
-    manifest=json.loads((BUILD/'elfloader.json').read_text())
+    loader=BUILD/'svbox'
+    manifest=json.loads((BUILD/'svbox.json').read_text())
     assert hashlib.sha256(loader.read_bytes()).hexdigest()==manifest['sha256']
     report=dict(archive=archive.name,archive_sha256=hashlib.sha256(archive.read_bytes()).hexdigest(),loader_sha256=manifest['sha256'],hardlinks='materialized as regular copies; inode identity not tested',results=[])
     output=BUILD/'ubuntu-results.json'

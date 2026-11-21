@@ -19,16 +19,17 @@ class SpecError(Exception):
     pass
 
 
-def loader_path(guarded):
-    env = os.environ.get('ELF_LOADER_GUARDED' if guarded else 'ELF_LOADER')
-    path = Path(env) if env else BUILD / ('elfloader-guarded' if guarded else 'elfloader')
+def loader_path(guarded=False):
+    (void_guarded := guarded)
+    env = os.environ.get('SVBOX') or os.environ.get('ELF_LOADER')
+    path = Path(env) if env else BUILD / 'svbox'
     if not path.exists():
-        raise SpecError(f'{path} not found: run make build (or set ELF_LOADER)')
+        raise SpecError(f'{path} not found: run make build (or set SVBOX)')
     return path
 
 
 def helper_path():
-    path = Path(os.environ.get('ELF_EXEC_HELPER') or BUILD / 'elf-exec-helper')
+    path = Path(os.environ.get('SVBOX_EXEC') or os.environ.get('ELF_EXEC_HELPER') or BUILD / 'svbox-exec')
     if not path.exists():
         raise SpecError(f'{path} not found: run make build')
     return path

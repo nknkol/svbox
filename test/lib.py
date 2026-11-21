@@ -1,8 +1,8 @@
-"""Shared test helpers: build outputs, the loaders, probes and guest runs.
+"""Shared test helpers: build outputs, svbox, probes and guest runs.
 
 Tests import it after `sys.path.insert(0, <repo>/test)`:
     import lib
-    for suffix, loader in lib.loaders(): ...
+    loader = lib.loader()
 """
 import hashlib
 import json
@@ -16,10 +16,10 @@ BUILD = REPO / 'build'
 ALPINE = BUILD / 'alpine-test-root'
 UBUNTU = BUILD / 'ubuntu-test-root'
 SUFFIXES = ('', '-guarded')
-# Extra loader options for whole test runs, e.g. ELF_LOADER_OPTIONS=--isolate.
-EXTRA = os.environ.get('ELF_LOADER_OPTIONS', '').split()
+# Extra loader options for whole test runs, e.g. SVBOX_OPTIONS=--isolate.
+EXTRA = (os.environ.get('SVBOX_OPTIONS') or os.environ.get('ELF_LOADER_OPTIONS', '')).split()
 # The same minus --isolate, for tests that pass --isolate themselves
-# (e.g. ELF_LOADER_OPTIONS='--isolate --isolate-device /dev/hvgr0').
+# (e.g. SVBOX_OPTIONS='--isolate --isolate-device /dev/hvgr0').
 ISOLATE_EXTRA = [option for option in EXTRA if option != '--isolate']
 sys.path.insert(0, str(REPO / 'tools'))
 import elf_abi  # noqa: E402  (tools/elf_abi.py)
@@ -27,17 +27,18 @@ ABI = elf_abi
 
 
 def loader(suffix=''):
-    """build/elfloader<suffix>, checked against the manifest of its build."""
-    path = BUILD / f'elfloader{suffix}'
-    manifest = json.loads((BUILD / f'elfloader{suffix}.json').read_text())
+    """build/svbox, checked against the manifest of its build."""
+    (void_suffix := suffix)
+    path = BUILD / 'svbox'
+    manifest = json.loads((BUILD / 'svbox.json').read_text())
     assert hashlib.sha256(path.read_bytes()).hexdigest() == manifest['sha256'], \
         f'{path.name} is not the binary of its last build'
     return path
 
 
 def loaders():
-    """(suffix, loader) for the plain and the guarded build."""
-    return [(suffix, loader(suffix)) for suffix in SUFFIXES]
+    """(suffix, loader) for plain and guarded-policy test matrix."""
+    return [(suffix, loader()) for suffix in SUFFIXES]
 
 
 def require(path, what='rootfs'):

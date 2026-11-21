@@ -88,7 +88,6 @@ static int host_map(void *opaque, const char *guest, char *host)
     return rc;
 }
 
-#ifdef GUARDED
 /* Lexical decision for a canonical guest path, before any host lookup. */
 static int path_visibility(Bridge *b, const char *guest)
 {
@@ -130,7 +129,6 @@ static int watch_hides_child(Bridge *b, const char *guest)
     }
     return 0;
 }
-#endif
 
 /* PRoot "glue": a guest directory that does not exist on the host but leads
  * to a bind destination (component-wise strict ancestor of one). */
@@ -381,13 +379,11 @@ static int host_lookup(void *opaque, Finality finality, unsigned int depth,
                        const char *guest, char *host)
 {
     (void)depth;
-#ifdef GUARDED
     /* Every component, base and symlink referee is checked before the host
      * sees it: a hidden name yields EACCES whether or not it exists. */
     int visibility = path_visibility(opaque, guest);
     if (visibility < 0) return visibility;
     if (visibility == FS_HIDDEN) return -EACCES;
-#endif
     int rc = host_map(opaque, guest, host);
     if (rc < 0)
         return rc;
@@ -457,9 +453,7 @@ int pb_host_readlink(void *opaque, const char *path, char *out, size_t size)
 
 static int visible_guest_path(Bridge *b, const char *host, char *guest);
 static int preferred_guest_path(Bridge *b, const char *host, char *guest);
-#ifdef GUARDED
 static int path_visibility(Bridge *b, const char *guest);
-#endif
 
 /* Kernel /proc links name host objects. An absolute target is reported in
  * guest terms; like PRoot, one outside the view is left unchanged, except
@@ -469,16 +463,12 @@ int pb_guest_link_target(Bridge *b, char *target)
 {
     if (target[0] != '/') return 0;
     int guarded = 0;
-#ifdef GUARDED
     guarded = g_payload_config.guard == GUARD_READS;
-#endif
     int rc = preferred_guest_path(b, target, b->proc_guest);
     if (rc < 0) return guarded ? -EACCES : 0;
-#ifdef GUARDED
     rc = path_visibility(b, b->proc_guest);
     if (rc < 0) return rc;
     if (rc == FS_HIDDEN) return -EACCES;
-#endif
     strcpy(target, b->proc_guest);
     return 0;
 }
@@ -570,9 +560,7 @@ static int preferred_guest_path(Bridge *b, const char *host, char *guest)
         if (found && length <= best) continue;
         b->anchor = (struct proot_open_origin){id, true};
         if (observed_guest_path(b, host, b->proc_candidate)) continue;
-#ifdef GUARDED
         if (path_visibility(b, b->proc_candidate) == FS_HIDDEN) continue;
-#endif
         strcpy(guest, b->proc_candidate);
         best = length;
         found = 1;
@@ -637,7 +625,6 @@ static long guest_cwd(Bridge *b)
 
 static int resolve_once(Bridge *b, int dirfd, const char *path, bool follow);
 
-#ifdef GUARDED
 #define RACED 1 /* secure_host: a component changed into a non-directory. */
 /* Replaces b->host by "/proc/self/fd/N/<last>" where N is the parent
  * directory, opened from the mount's configured host root one component at
@@ -779,7 +766,6 @@ static int secure_host(Bridge *b)
     b->walk_fd[b->walk_count++] = (int)dir;
     return 0;
 }
-#endif
 
 /* A deferred final lookup does not know where a final symlink points, and
  * policy decisions may depend on its target: any failure is resolved again
@@ -897,7 +883,6 @@ int pb_resolve(Bridge *b, int dirfd, const char *path, bool follow)
         rc = resolve_once(b, dirfd, path, follow);
     }
     b->final_match = rc >= 0 && b->final_valid && !strcmp(b->final_host, b->host);
-#ifdef GUARDED
     /* A race seen by the secure walk is resolved once more, then refused. */
     for (int attempt = 0; rc >= 0 && attempt < 2; attempt++) {
         int s = secure_host(b);
@@ -906,7 +891,6 @@ int pb_resolve(Bridge *b, int dirfd, const char *path, bool follow)
         rc = resolve_once(b, dirfd, path, follow);
         b->final_match = rc >= 0 && b->final_valid && !strcmp(b->final_host, b->host);
     }
-#endif
     return rc;
 }
 
@@ -950,7 +934,6 @@ static int resolve_once(Bridge *b, int dirfd, const char *path, bool follow)
                 return -EACCES;
         }
     }
-#ifdef GUARDED
     if (rc >= 0 && b->reads) {
         /* ".." skips lookup, so the final name is classified again. */
         int visibility = path_visibility(b, b->guest);
@@ -974,7 +957,6 @@ static int resolve_once(Bridge *b, int dirfd, const char *path, bool follow)
                          AT_SYMLINK_NOFOLLOW, 0, 0))
             rc = -EEXIST;
     }
-#endif
     /* Last: a refused change must not copy anything up. */
     if (rc >= 0 && b->union_on) {
         int u = union_prepare(b);
@@ -1415,13 +1397,11 @@ static long dispatch(Bridge *b, long number, long a[6], struct proot_open_origin
     if (number == __NR_bind || number == __NR_connect ||
         number == __NR_sendto || number == __NR_sendmsg)
         return socket_address(b, number, a);
-#ifdef GUARDED
     /* Socket names keep their spelling (bind records it); exec resolves
      * through proot_resolve_exec_path. Everything dispatched here is safe
      * to issue through the walked parent directory. */
     /* In isolation mode the broker walks every path itself. */
     b->secure = g_payload_config.guard >= GUARD_PATHS && !g_payload_config.isolate;
-#endif
     long ret;
     switch (number) {
     case __NR_setxattr: case __NR_getxattr:
@@ -1441,10 +1421,8 @@ static long dispatch(Bridge *b, long number, long a[6], struct proot_open_origin
         if (!a[1]) return -EFAULT;
         ret = pb_resolve(b, AT_FDCWD, (const char *)a[1], !(a[2] & IN_DONT_FOLLOW));
         if (ret < 0) return ret;
-#ifdef GUARDED
         ret = watch_hides_child(b, b->guest);
         if (ret < 0) return ret;
-#endif
         return raw_syscall(number, a[0], (long)b->host, a[2], 0, 0, 0);
     }
     /* R6: a descriptor of a lower object: chmod is recorded with an owner
@@ -1558,11 +1536,9 @@ static long dispatch(Bridge *b, long number, long a[6], struct proot_open_origin
         ret = host_fd(b, (int)a[0], b->guest);
         if (ret < 0)
             return ret;
-#ifdef GUARDED
         ret = path_visibility(b, b->guest);
         if (ret < 0) return ret;
         if (ret == FS_HIDDEN) return -EACCES;
-#endif
         ret = raw_syscall(__NR_fchdir, a[0], 0, 0, 0, 0, 0);
         if (ret >= 0 && origin) *origin = b->anchor;
         return ret;
@@ -1727,9 +1703,8 @@ static Bridge *bridge_pool[BRIDGE_POOL];
 static int bridge_used[BRIDGE_POOL];
 static long bridge_acquire(void)
 {
-#ifdef GUARDED
-    if (!fd_runtime_shared_scratch()) return proot_scratch_alloc(sizeof(Bridge));
-#endif
+    if (g_payload_config.guard != GUARD_NONE && !fd_runtime_shared_scratch())
+        return proot_scratch_alloc(sizeof(Bridge));
     for (int i = 0; i < BRIDGE_POOL; i++) {
         int free_slot = 0;
         if (!__atomic_compare_exchange_n(&bridge_used[i], &free_slot, 1, 0,
@@ -1812,7 +1787,6 @@ static long bridge_create(Bridge **out)
     b->root_union = b->union_on && cfg->lower_count > 0 && cfg->root[0];
     b->map_view = b->final_view = NULL;
     long ret = binding_table_validate(&b->table);
-#ifdef GUARDED
     b->reads = false;
     if (ret >= 0 && cfg->guard == GUARD_READS) {
         size_t count;
@@ -1828,7 +1802,6 @@ static long bridge_create(Bridge **out)
         }
         b->reads = ret >= 0;
     }
-#endif
     if (ret < 0) {
         bridge_release(b);
         return ret;
@@ -1845,21 +1818,17 @@ static int unique_mount(Bridge *b, const char *host, size_t *selected)
     size_t matches=0;
     /* The glue tree belongs to the root mount alone. */
     if(glue_guest(host,b->guest)) {
-#ifdef GUARDED
         int visibility=path_visibility(b,b->guest);
         if(visibility<0)return visibility;
         if(visibility==FS_HIDDEN)return -EXDEV;
-#endif
         *selected=0;return 0;
     }
     for(size_t id=0;id<=b->table.count;id++) {
         b->anchor=(struct proot_open_origin){id,true};
         if(observed_guest_path(b,host,b->guest))continue;
-#ifdef GUARDED
         int visibility=path_visibility(b,b->guest);
         if(visibility<0)return visibility;
         if(visibility==FS_HIDDEN)continue;
-#endif
         *selected=id;matches++;
     }
     return matches==1 ? 0 : -EXDEV;
@@ -1925,13 +1894,11 @@ void proot_socket_name(long number, long fd, void *address, unsigned *length,
         memcpy(b->proc_host, b->address.sun_path, size);
         b->proc_host[size] = 0;
         int rc = preferred_guest_path(b, b->proc_host, b->proc_guest);
-#ifdef GUARDED
         if (rc < 0 && g_payload_config.guard == GUARD_READS) {
             *length = (unsigned)sizeof(b->address.sun_family);
             bridge_release(b);
             return;
         }
-#endif
         size_t guest = strlen(b->proc_guest);
         if (!rc && guest < sizeof(b->address.sun_path)) {
             memset(b->address.sun_path, 0, sizeof(b->address.sun_path));
@@ -2001,7 +1968,6 @@ int proot_revalidate_regular_fd(int fd, struct proot_open_origin *origin)
     bridge_release(b);return ret;
 }
 
-#ifdef GUARDED
 /* Kernel getdents64 record: ino, next offset, reclen, type, NUL-terminated name. */
 #define DIRENT_OFFSET 8
 #define DIRENT_RECLEN 16
@@ -2133,7 +2099,6 @@ done:
     bridge_release(b);
     return ret;
 }
-#endif
 
 /* A link target spliced in optimistically may only climb ("../" first):
  * those components were walked by the broker; a later ".." would undo an
@@ -2216,13 +2181,12 @@ static long bridge_run(long number, long args[6], const struct proot_open_origin
          * opened by, for the listing filter. What the broker hands out
          * need not name it on the host (a denied root's traversable
          * directories are synthesized, see broker.c). */
-#ifdef GUARDED
-        if (number == __NR_openat && ret >= 0 && g_payload_config.isolate && b->guest[0] == '/') {
+        if (g_payload_config.guard == GUARD_READS && number == __NR_openat && ret >= 0 &&
+            g_payload_config.isolate && b->guest[0] == '/') {
             struct stat dir;
             if (!raw_syscall(__NR_fstat, ret, (long)&dir, 0, 0, 0, 0) && (dir.st_mode & S_IFMT) == S_IFDIR)
                 cached_dir_name((int)ret, b->guest, &dir, true);
         }
-#endif
         bool again = optimism_retry(b, &o, ret);
         bridge_release(b);
         if (!again) {

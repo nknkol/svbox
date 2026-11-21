@@ -11,12 +11,14 @@
 #include "net_view.h"
 #include "fake_ids.h"
 #include "host_syscall.h"
-#ifdef GUARDED
 #include "fd_runtime.h"
-#define DISPATCH(n, args) fd_runtime_dispatch(n, args)
-#else
-#define DISPATCH(n, args) dispatch_syscall(n, args)
-#endif
+static inline long dispatch_call(long n, long args[6])
+{
+    return g_payload_config.guard != GUARD_NONE
+        ? fd_runtime_dispatch(n, args)
+        : dispatch_syscall(n, args);
+}
+#define DISPATCH(n, args) dispatch_call(n, args)
 
 typedef struct {
     unsigned long regs[30]; // x0 - x29

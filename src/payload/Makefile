@@ -1,20 +1,17 @@
 # Payload: position-independent, no libc; every intercepted syscall runs
-# here. GUARDED=1 adds the guarded runtime.
+# here. Includes both fast-path and guarded FD runtime (selected at runtime).
 TARGET := payload.bin
 ARCH_DIR := arch/aarch64
 PATH_SRC := ../path
 
 SRC := $(addprefix logic/, config.c dispatch.c async_io.c integrity.c platform.c libc_shim.c broker_client.c hook_runtime.c fake_ids.c \
 	container_state.c union_view.c lazy_layer.c net_view.c \
-	clone_notify.c proot_bridge.c proot_mounts.c proot_procfs.c proot_exec.c proot_auxv.c) \
+	clone_notify.c proot_bridge.c proot_mounts.c proot_procfs.c proot_exec.c proot_auxv.c \
+	vm_write_guard.c fs_policy.c fd_runtime.c fd_snapshot.c \
+	fd_handoff.c fd_receive.c fd_table.c fd_clone.c fd_registry.c fd_guard.c \
+	fd_close_queue.c fd_close_exec.c) \
 	$(addprefix $(ARCH_DIR)/, entry.S raw_syscall.S syscall_disp.c mini_libc.c \
 	reentry_guard.c payload_stack.c stub.c clone_entry.S)
-ifeq ($(GUARDED),1)
-SRC += $(addprefix logic/, vm_write_guard.c fs_policy.c fd_runtime.c fd_snapshot.c \
-	fd_handoff.c fd_receive.c fd_table.c fd_clone.c fd_registry.c fd_guard.c \
-	fd_close_queue.c fd_close_exec.c)
-CPPFLAGS += -DGUARDED
-endif
 OBJ := $(patsubst %.S,%.o,$(SRC:.c=.o)) \
 	$(addprefix path-build/, path_helpers.o canon_core.o resolve_core.o binding_core.o)
 

@@ -49,12 +49,12 @@ HELPER = '.elf-exec'
 
 
 def verified_backend(loader):
-    """Use only a loader/helper pair recorded by the same build manifest."""
-    manifest = json.loads((loader.parent / 'elfloader-guarded.json').read_text())
-    helper = loader.parent / 'elf-exec-helper'
+    """Use only a svbox/helper pair recorded by the same build manifest."""
+    manifest = json.loads((loader.parent / 'svbox.json').read_text())
+    helper = loader.parent / 'svbox-exec'
     for path, key in ((loader, 'sha256'), (helper, 'exec_helper_sha256')):
         if hashlib.sha256(path.read_bytes()).hexdigest() != manifest.get(key):
-            raise ProfileError(f'{path} does not match the FD experiment build manifest')
+            raise ProfileError(f'{path} does not match the svbox build manifest')
     return helper
 
 
@@ -182,7 +182,7 @@ def main():
     parser.add_argument('--brew-prefix', required=True)
     parser.add_argument('--workspace', required=True)
     parser.add_argument('--state', required=True, help='Private backing directory, outside exposed trees')
-    parser.add_argument('--loader', type=Path, default=BUILD / 'elfloader-guarded')
+    parser.add_argument('--loader', type=Path, default=BUILD / 'svbox')
     parser.add_argument('--cwd', help='Guest working directory (default: /workspace target)')
     parser.add_argument('--env', action='append', default=[], metavar='KEY=VALUE')
     parser.add_argument('--pass-fd', type=int, action='append', default=[], metavar='N',

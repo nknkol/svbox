@@ -33,7 +33,7 @@ with tempfile.TemporaryDirectory(prefix='runspec-', dir=lib.BUILD) as tmp:
     bindir.mkdir()
     (bindir / 'py').symlink_to(python)
     helper = Path(tmp, 'helper')
-    shutil.copy2(lib.BUILD / 'elf-exec-helper', helper)
+    shutil.copy2(lib.BUILD / 'svbox-exec', helper)
     # More volumes than the old limit of 16; the last ones matter.
     extra = []
     for i in range(30):
