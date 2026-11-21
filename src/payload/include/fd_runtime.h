@@ -1,0 +1,30 @@
+/* SPDX-License-Identifier: MIT */
+#ifndef ELF_GUARDED_H
+#define ELF_GUARDED_H
+/* FD numbers one guarded process can hold: below its hard RLIMIT_NOFILE
+ * at start (the most it can raise its own limit to), at most this (Linux's
+ * default nr_open). The records are indexed by FD number and mapped on
+ * demand; beyond, a creation is ENOSPC. */
+#define FD_RUNTIME_CAPACITY (1u << 20)
+/* Private fork/bounded vfork FD experiment with optional path/FD mutation guards
+ * and read/visibility guard; NOT a complete filesystem isolation mode. */
+#include <stddef.h>
+#include <stdbool.h>
+#include "config.h"
+#include "fs_policy.h"
+/* Partial path mutation guard only; disabled in observation/legacy mode. */
+int fd_runtime_check_path_mutation(size_t mount, bool known);
+/* Validated root+bind access vector; ENODATA without a configured policy. */
+/* Root, binds, then the emulated mount slots (R4: a slot's access was
+ * fixed when it was mounted; a free slot is denied). */
+int fd_runtime_mount_access(enum fs_access access[CONFIG_MOUNT_IDS], size_t *count);
+long fd_runtime_scratch_alloc(size_t);
+/* False in the vfork child, which must keep its reserved scratch. */
+bool fd_runtime_shared_scratch(void);
+void fd_runtime_scratch_free(void *,size_t);
+/* Query selector 6: observed policy decision for mount=a[2], operation=a[3].
+ * ENODATA without observation config. Does not authorize or intercept IO. */
+#include "elf_abi.h"
+long fd_runtime_export(void);
+long fd_runtime_dispatch(long number,long args[6]);
+#endif

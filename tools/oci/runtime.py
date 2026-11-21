@@ -1,0 +1,1033 @@
+"""Containers: create, start (foreground or supervised), stop, exec, cp, logs.
+
+There is no daemon: a foreground `run`/`start -a` waits for its container
+itself; `run -d`/`start` hand it to a small per-container monitor process
+(`docker __monitor <id>`) that writes the log, records the exit code and
+applies the restart policy (docs/OCI.md, R2). The container's processes are
+one process group; its id and start time are recorded in run.json."""
+import io
+import os
+import posixpath
+import shutil
+import signal
+import subprocess
+import sys
+import tarfile
+import time
+from pathlib import Path, PurePosixPath
+
+import guestfs
+import layer_images
+import network
+import owners as owners_mod
+import union
+import runspec
+import store as store_mod
+from store import StoreError
+
+TOOL = Path(__file__).resolve().parent / 'docker'
+
+
+def proc_start_time(pid):
+    try:
+        data = Path(f'/proc/{pid}/stat').read_text()
+    except OSError:
+        return None
+    return int(data.rsplit(')', 1)[1].split()[19])
+
+
+def group_alive(pgid, start):
+    """Whether the process group an exec started (its leader pgid, with
+    that start time) still has processes. The leader may be gone while its
+    children remain; a pid is not given out again while a group of that id
+    exists, so a leader pid now held by another process means the group
+    emptied."""
+    now = proc_start_time(pgid)
+    if now is not None:
+        return now == start
+    for entry in os.listdir('/proc'):
+        if not entry.isdigit():
+            continue
+        try:
+            fields = Path(f'/proc/{entry}/stat').read_text().rsplit(')', 1)[1].split()
+        except OSError:
+            continue
+        if int(fields[2]) == pgid:
+            return True
+    return False
+
+
+def alive(state):
+    pid = state.get('Pid') or 0
+    return pid > 0 and proc_start_time(pid) == state.get('PidStart')
+
+
+def refresh(st, record):
+    """A record whose 'running' state outlived its process (the waiting
+    docker or monitor process was killed) becomes 'exited'."""
+    state = record['State']
+    if state.get('Paused') and not pause_owner_alive(state.get('PauseOwner')):
+        with st.lock():
+            record = st.load_container(record['Id'])
+            resume_orphaned_pause(st, record)
+            state = record['State']
+    if state['Status'] in ('running', 'restarting') and not alive(state):
+        monitor = state.get('MonitorPid') or 0
+        if monitor and proc_start_time(monitor) == state.get('MonitorStart'):
+            return record   # The monitor is restarting it.
+        with st.lock():
+            record = st.load_container(record['Id'])
+            state = record['State']
+            if state['Status'] in ('running', 'restarting') and not alive(state):
+                # The entry process is gone with nobody left to wait for it:
+                # what it left in its process group goes now, as when its
+                # PID namespace's init exits (not a group that took its pid
+                # number since: group_alive).
+                pgid = state.get('Pid') or 0
+                if pgid > 0 and group_alive(pgid, state.get('PidStart')):
+                    try:
+                        os.killpg(pgid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                state.update(Status='exited', Running=False, Pid=0,
+                             FinishedAt=state.get('FinishedAt') or store_mod.now())
+                if state.get('ExitCode') is None:
+                    state['ExitCode'] = 255
+                st.save_container(record)
+                end_execs_locked(st, record['Id'])
+    return record
+
+
+def exec_spawn(st, cid, launch):
+    """Starts an exec process (launch() -> Popen, the process heading a
+    process group of its own) while the container runs, registered in
+    execs.json so that it ends with the container (end_execs). Under the
+    store lock: a container that is stopping takes no new exec."""
+    with st.lock():
+        record = st.load_container(cid)
+        state = record['State']
+        if state['Status'] != 'running' or not alive(state) or state.get('ExecsClosed'):
+            raise StoreError(f'Container {cid[:12]} is not running')
+        if state.get('Paused'):
+            raise StoreError(f'Container {cid[:12]} is paused, unpause the container before exec')
+        proc = launch()
+        path = st.container_dir(cid) / 'execs.json'
+        execs = [e for e in store_mod.read_json(path, []) if group_alive(e[0], e[1])]
+        execs.append([proc.pid, proc_start_time(proc.pid)])
+        store_mod.write_json(path, execs)
+    return proc
+
+
+def exec_done(st, cid, pid):
+    """The exec's first process ended: its group stays registered while
+    processes it left (background jobs) remain."""
+    with st.lock():
+        path = st.container_dir(cid) / 'execs.json'
+        if path.exists():
+            store_mod.write_json(path, [e for e in store_mod.read_json(path, [])
+                                        if e[0] != pid or group_alive(e[0], e[1])])
+
+
+def container_groups(st, record):
+    """Process groups of a running container: its main one and its execs'."""
+    state = record['State']
+    groups = [state['Pid']] if alive(state) else []
+    path = st.container_dir(record['Id']) / 'execs.json'
+    groups += [pid for pid, start in store_mod.read_json(path, []) if group_alive(pid, start)]
+    return groups
+
+
+def container_processes(cid, table=None):
+    """Every process of the container, wherever it went. Each holds the
+    container's mount table as FD 901 (the loader's --mount-table, which the
+    guest can neither close nor replace), also after setsid and after its
+    parent exited: a daemon (nginx, redis --daemonize) leaves every process
+    group the container knows and is reparented to init, where only a PID
+    namespace would still hold it. Matched by the table's last two parts:
+    remove renames the container directory (tmp/rm-<id>) on its way out and
+    a new start unlinks the previous run's table. table: the full path of
+    another table (a build's RUN step) instead of a container's."""
+    tail = os.path.realpath(table) if table else f'{cid}/mounts.table'
+    found = []
+    for entry in os.listdir('/proc'):
+        if not entry.isdigit():
+            continue
+        try:
+            target = os.readlink(f'/proc/{entry}/fd/901')
+        except OSError:
+            continue
+        if target.endswith(' (deleted)'):
+            target = target[:-len(' (deleted)')]
+        if target.endswith(tail):
+            found.append(int(entry))
+    return found
+
+
+def strays(cid, groups):
+    """The container's processes outside its known process groups."""
+    found = []
+    for pid in container_processes(cid):
+        try:
+            if os.getpgid(pid) not in groups:
+                found.append(pid)
+        except ProcessLookupError:
+            pass
+    return found
+
+
+def kill_container_processes(cid, timeout=5.0, table=None):
+    """SIGKILL to every process of the container (container_processes) until
+    none is left: one that forks meanwhile shows its child in the next round.
+    Returns those still there at the timeout."""
+    deadline = time.time() + timeout
+    while True:
+        pids = container_processes(cid, table)
+        if not pids or time.time() >= deadline:
+            return pids
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        time.sleep(0.01)
+
+
+class PauseError(StoreError):
+    pass
+
+
+def pause_owner_alive(owner):
+    return isinstance(owner, list) and len(owner) == 2 and owner[0] > 0 and \
+        proc_start_time(owner[0]) == owner[1]
+
+
+def pause(st, cid, timeout=5.0):
+    """Stops a running container's processes (SIGSTOP to its process
+    groups) until the returned function is called, which continues them;
+    no exec starts meanwhile. A container that is not running: nothing.
+
+    The pause has one owner (State.PauseOwner: [pid, start] of this process):
+    another pause of the same container is refused while its owner lives,
+    and only the owner's resume continues the container. Every group must
+    be signalled and every process found stopped within timeout, or the
+    groups are continued, the state cleared and PauseError raised: the
+    caller reads nothing of a container that may still be writing."""
+    me = [os.getpid(), proc_start_time(os.getpid())]
+    with st.lock():
+        record = st.load_container(cid)
+        state = record['State']
+        if state['Status'] != 'running' or not alive(state):
+            return lambda: None
+        if state.get('Paused') and pause_owner_alive(state.get('PauseOwner')):
+            raise PauseError(f'Container {cid[:12]} is already paused')
+        groups = container_groups(st, record)
+        loose = strays(cid, groups)
+        state.update(Paused=True, PauseOwner=me)
+        st.save_container(record)
+
+    def resume():
+        # Every group (one stopped before an interruption is not yet in
+        # any list); SIGCONT to a running process changes nothing.
+        for pgid in groups:
+            try:
+                os.killpg(pgid, signal.SIGCONT)
+            except (ProcessLookupError, PermissionError):
+                pass
+        for pid in loose:
+            try:
+                os.kill(pid, signal.SIGCONT)
+            except (ProcessLookupError, PermissionError):
+                pass
+        with st.lock():
+            if st.container_dir(cid).exists():
+                record = st.load_container(cid)
+                if record['State'].get('PauseOwner') == me:
+                    record['State'].update(Paused=False, PauseOwner=None)
+                    st.save_container(record)
+
+    # From here until resume is handed back, any failure (an error of any
+    # kind, an interruption) continues the groups and clears the state.
+    try:
+        failure = acquire_stop(groups, timeout, loose)
+    except BaseException as e:
+        resume()
+        if isinstance(e, Exception):
+            raise PauseError(f'cannot pause container {cid[:12]}: {e}') from None
+        raise
+    if failure is not None:
+        resume()
+        raise PauseError(f'cannot pause container {cid[:12]}: {failure}')
+    return resume
+
+
+def acquire_stop(groups, timeout, pids=()):
+    """SIGSTOP to every group and to each of pids (processes of the
+    container outside them), then waits until every thread is seen
+    stopped: None, or why the pause cannot be had."""
+    for pgid in groups:
+        try:
+            os.killpg(pgid, signal.SIGSTOP)
+        except ProcessLookupError:
+            pass      # (gone since: nothing left to write)
+        except OSError as e:
+            return f'cannot stop process group {pgid}: {e}'
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGSTOP)
+        except ProcessLookupError:
+            pass
+        except OSError as e:
+            return f'cannot stop process {pid}: {e}'
+    deadline = time.time() + timeout
+    while True:
+        try:
+            if all(stopped(pgid) for pgid in groups) and all(process_stopped(pid) for pid in pids):
+                return None
+        except StopUnknown as e:
+            return f'cannot tell whether its processes stopped ({e})'
+        if time.time() >= deadline:
+            return f'its processes did not stop within {timeout:g}s'
+        time.sleep(0.01)
+
+
+def resume_orphaned_pause(st, record):
+    """A pause whose owner died (killed mid-commit): its groups continue
+    and the state clears. Under the store lock."""
+    state = record['State']
+    if not state.get('Paused') or pause_owner_alive(state.get('PauseOwner')):
+        return
+    groups = container_groups(st, record)
+    for pgid in groups:
+        try:
+            os.killpg(pgid, signal.SIGCONT)
+        except (ProcessLookupError, PermissionError):
+            pass
+    for pid in strays(record['Id'], groups):
+        try:
+            os.kill(pid, signal.SIGCONT)
+        except (ProcessLookupError, PermissionError):
+            pass
+    state.update(Paused=False, PauseOwner=None)
+    st.save_container(record)
+
+
+# HongMeng shows a stopped task as 'S' in /proc; its wchan then names the
+# signal-delivery stop (a task sleeping anywhere else, pause() included,
+# shows its own wait).
+STOP_WCHAN = 'thread_precheck_deliver_signal'
+
+
+class StopUnknown(Exception):
+    """A task's state could not be read: it is neither known stopped nor
+    known gone."""
+
+
+def read_proc(path):
+    """Text of a /proc file (one place, so tests can make it fail)."""
+    with open(path) as f:
+        return f.read()
+
+
+def list_proc(path):
+    return os.listdir(path)
+
+
+def _gone(e):
+    return isinstance(e, (FileNotFoundError, ProcessLookupError))
+
+
+def task_stopped(task):
+    """Whether the task (/proc/PID/task/TID) is stopped or gone; a state
+    that cannot be read or makes no sense raises StopUnknown."""
+    try:
+        text = read_proc(f'{task}/stat')
+    except OSError as e:
+        if _gone(e):
+            return True
+        raise StopUnknown(f'{task}/stat: {e}') from None
+    try:
+        state = text.rsplit(')', 1)[1].split()[0]
+    except IndexError:
+        if not text:
+            return True   # (an exited task reads empty)
+        raise StopUnknown(f'{task}/stat: unreadable state') from None
+    if state in ('T', 't', 'Z', 'X'):
+        return True
+    try:
+        return read_proc(f'{task}/wchan').strip() == STOP_WCHAN
+    except OSError as e:
+        if _gone(e):
+            return True
+        raise StopUnknown(f'{task}/wchan: {e}') from None
+
+
+def stopped(pgid):
+    """Whether every thread of every process of the group is stopped (or
+    gone); StopUnknown when that cannot be told. A process whose /proc
+    entry cannot be looked at all is another user's (HarmonyOS hides
+    those): it cannot be in a container's group, which runs as this uid,
+    nor could it be signalled."""
+    me = os.getuid()
+    try:
+        entries = list_proc('/proc')
+    except OSError as e:
+        raise StopUnknown(f'/proc: {e}') from None
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            text = read_proc(f'/proc/{entry}/stat')
+        except OSError as e:
+            if _gone(e):
+                continue
+            try:
+                if os.stat(f'/proc/{entry}').st_uid != me:
+                    continue
+            except OSError as e2:
+                if _gone(e2) or isinstance(e2, PermissionError):
+                    continue
+            raise StopUnknown(f'/proc/{entry}/stat: {e}') from None
+        try:
+            group = int(text.rsplit(')', 1)[1].split()[2])
+        except (IndexError, ValueError):
+            if not text:
+                continue
+            raise StopUnknown(f'/proc/{entry}/stat: unreadable') from None
+        if group != pgid:
+            continue
+        try:
+            tasks = list_proc(f'/proc/{entry}/task')
+        except OSError as e:
+            if _gone(e):
+                continue
+            raise StopUnknown(f'/proc/{entry}/task: {e}') from None
+        if not all(task_stopped(f'/proc/{entry}/task/{t}') for t in tasks):
+            return False
+    return True
+
+
+def process_stopped(pid):
+    """Whether every thread of process pid is stopped (or it is gone);
+    StopUnknown when that cannot be told."""
+    try:
+        tasks = list_proc(f'/proc/{pid}/task')
+    except OSError as e:
+        if _gone(e):
+            return True
+        raise StopUnknown(f'/proc/{pid}/task: {e}') from None
+    return all(task_stopped(f'/proc/{pid}/task/{t}') for t in tasks)
+
+
+def end_execs(st, cid):
+    with st.lock():
+        end_execs_locked(st, cid)
+
+
+def end_execs_locked(st, cid):
+    """The container's exec processes go with it, as in its PID namespace:
+    no new one starts until it runs again (ExecsClosed)."""
+    cdir = st.container_dir(cid)
+    if not cdir.exists():
+        return
+    record = st.load_container(cid)
+    if not record['State'].get('ExecsClosed'):
+        record['State']['ExecsClosed'] = True
+        st.save_container(record)
+    path = cdir / 'execs.json'
+    for pid, start in store_mod.read_json(path, []):
+        if not group_alive(pid, start):
+            continue
+        for kill_ in (os.killpg, os.kill):   # (the group may not be made yet)
+            try:
+                kill_(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+    path.unlink(missing_ok=True)
+    # And whatever left those groups (daemons, setsid): the main process is
+    # gone, so is everything of the container, as with a PID namespace.
+    kill_container_processes(cid)
+
+
+def rootfs_of(st, record):
+    """The loader's --root: the image's rootfs (read-only, in place), the
+    container's copy, or with --cow its upper layer (R6)."""
+    if record['HostConfig'].get('ReadonlyRootfs') or record['HostConfig'].get('InPlace'):
+        return layer_images.rootfs(st, record['Image'])
+    if record['HostConfig'].get('Cow'):
+        return st.container_dir(record['Id']) / 'upper'
+    return st.container_dir(record['Id']) / 'rootfs'
+
+
+def lower_of(st, record):
+    """What lies under a --cow container's upper: the image rootfs, or the
+    image's layer images (a union.Stack, R6); else None."""
+    host = record['HostConfig']
+    if not host.get('Cow'):
+        return None
+    if host.get('LayerImages'):
+        return union.Stack(host['LayerImages'])
+    return layer_images.rootfs(st, record['Image'])
+
+
+def view_of(st, record):
+    """What guest paths resolve against: a rootfs, or (upper, lower)."""
+    lower = lower_of(st, record)
+    root = rootfs_of(st, record)
+    return (root, lower) if lower else root
+
+
+def create(st, record, quiet=False):
+    """Makes containers/<id>: rootfs copy (or none), etc files, run.json."""
+    cid = record['Id']
+    work = st.tmpdir('container')
+    try:
+        host = record['HostConfig']
+        lower = None
+        if host.get('Cow'):
+            # R6: a converted image's layer images, else its rootfs.
+            entries = layer_images.stack_entries(st, record['Image'])
+            if entries:
+                host['LayerImages'] = union.Stack(entries).to_json()
+                lower = union.Stack(entries)
+        image_root = None if lower else layer_images.rootfs(st, record['Image'])
+        lower = lower or image_root
+        if host.get('ReadonlyRootfs'):
+            for name in ('tmp', 'run', 'var-tmp', 'workdir'):
+                (work / 'writable' / name).mkdir(parents=True)
+                (work / 'writable' / name).chmod(0o1777)
+        elif host.get('InPlace'):
+            with st.lock():
+                info = store_mod.read_json(st.image_dir(record['Image']) / 'info.json', {})
+                info['dirty'] = True
+                store_mod.write_json(st.image_dir(record['Image']) / 'info.json', info)
+        elif host.get('Cow'):
+            # R6: nothing is copied; the image rootfs is the lower layer.
+            (work / 'upper').mkdir()
+        else:
+            runspec.copy_rootfs(image_root, work / 'rootfs')
+        runspec.write_etc(work, record['Config']['Hostname'], host.get('ExtraHosts') or [],
+                          host.get('Dns') or [])
+        for tmpfs in host.get('Tmpfs') or []:
+            (work / 'tmpfs' / tmpfs.strip('/').replace('/', '_')).mkdir(parents=True, exist_ok=True)
+        rootfs = image_root if host.get('ReadonlyRootfs') or host.get('InPlace') else \
+            work / 'upper' if host.get('Cow') else work / 'rootfs'
+        if host.get('Owners'):
+            # R5: owners and modes of the image, by inode of this rootfs
+            # (with --cow, of the shared image rootfs: copy-up carries them).
+            meta = store_mod.read_json(st.image_dir(record['Image']) / 'meta.json', {})
+            if host.get('Cow'):
+                union.from_meta(rootfs, lower, meta, work / 'owners.db')
+            else:
+                owners_mod.from_meta(rootfs, meta, work / 'owners.db')
+        runspec.install_helper(rootfs)
+        # The container's etc files are binds: as Docker, a missing mount
+        # point is made in the rootfs (the upper with --cow), so listings
+        # inside and docker cp both show it.
+        if not host.get('ReadonlyRootfs') and not host.get('InPlace'):
+            view = guestfs.View((rootfs, lower) if host.get('Cow') else rootfs, [])
+            for name in ('hosts', 'hostname', 'resolv.conf'):
+                if not view.exists(['etc', name]) and view.is_dir(['etc']):
+                    sink = guestfs.GuestSink(view, ['etc'])
+                    sink.put(guestfs.Entry([name], 'f', 0o644, time.time(), 0, None,
+                                           lambda: io.BytesIO(b'')))
+                    sink.finish()
+        # Docker creates a missing working directory (not in a read-only root).
+        cwd = record['Config'].get('WorkingDir')
+        binds = [(b[0], b[1]) for b in all_binds(st, record, work)]
+        if cwd and host.get('Cow'):
+            found = runspec.guest_resolve((rootfs, lower), binds, cwd)
+            if not found.is_dir():
+                if any(cwd == d or cwd.startswith(d.rstrip('/') + '/') for _, d in binds):
+                    found.mkdir(parents=True, exist_ok=True)
+                else:
+                    union.mkdirs(rootfs, lower, cwd)
+        elif cwd and not host.get('ReadonlyRootfs'):
+            runspec.make_guest_dirs(rootfs, binds, cwd)
+        with st.lock():
+            others = st.containers()
+            if any(c['Name'] == record['Name'] for c in others):
+                raise StoreError(f'Conflict. The container name "/{record["Name"]}" is already in use')
+            network.allocate(st, record, others)
+            store_mod.write_json(work / 'run.json', record)
+            work.rename(st.container_dir(cid))
+    finally:
+        if work.exists():
+            store_mod.remove(work)
+    network.refresh(st)
+    return cid
+
+
+def all_binds(st, record, cdir=None):
+    """User binds plus the ones the record implies (read-only root's
+    writable dirs, tmpfs dirs), as (host, guest, mode)."""
+    cdir = cdir or st.container_dir(record['Id'])
+    host = record['HostConfig']
+    binds = []
+    if host.get('ReadonlyRootfs'):
+        binds += [(str(cdir / 'writable' / 'tmp'), '/tmp', 'rw'),
+                  (str(cdir / 'writable' / 'run'), '/run', 'rw'),
+                  (str(cdir / 'writable' / 'var-tmp'), '/var/tmp', 'rw')]
+        # Docker creates a missing working directory; the root cannot
+        # change, so an empty private directory stands in for it.
+        cwd = record['Config'].get('WorkingDir')
+        image_root = layer_images.rootfs(st, record['Image'])
+        if cwd and cwd not in ('/tmp', '/run', '/var/tmp') and \
+                not runspec.guest_resolve(image_root, [], cwd).is_dir():
+            binds.append((str(cdir / 'writable' / 'workdir'), cwd, 'rw'))
+    for tmpfs in host.get('Tmpfs') or []:
+        binds.append((str(cdir / 'tmpfs' / tmpfs.strip('/').replace('/', '_')), tmpfs, 'rw'))
+    for b in host['Binds']:
+        src = b[0]
+        if not src.startswith('/'):
+            src = str(st.create_volume(src))
+        binds.append((src, b[1], b[2]))
+    return binds
+
+
+def command_line(st, record, **kwargs):
+    cdir = st.container_dir(record['Id'])
+    resolved = dict(record, HostConfig=dict(record['HostConfig'], Binds=all_binds(st, record)))
+    return runspec.build(resolved, rootfs_of(st, record), cdir,
+                         isolate=record['HostConfig'].get('Isolate'), lower=lower_of(st, record),
+                         loader_extra=network.loader_options(st, record, cdir), **kwargs)
+
+
+def set_state(st, cid, **fields):
+    with st.lock():
+        record = st.load_container(cid)
+        record['State'].update(fields)
+        st.save_container(record)
+        return record
+
+
+def set_ports(st, cid, ports):
+    with st.lock():
+        record = st.load_container(cid)
+        network.settings(record)['Ports'] = ports
+        st.save_container(record)
+
+
+class Forwarder:
+    """Signals for the docker process go to the container's main process
+    (as Docker's sig-proxy); SIGTERM becomes the image's StopSignal."""
+
+    def __init__(self, stop_signal):
+        self.pgid = None
+        self.stop_signal = stop_signal
+        self.saved = {}
+
+    def install(self):
+        for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT,
+                    signal.SIGUSR1, signal.SIGUSR2, signal.SIGWINCH):
+            self.saved[sig] = signal.signal(sig, self.forward)
+
+    def forward(self, sig, frame):
+        if self.pgid:
+            try:
+                os.kill(self.pgid, self.stop_signal if sig == signal.SIGTERM else sig)
+            except ProcessLookupError:
+                pass
+
+    def restore(self):
+        for sig, handler in self.saved.items():
+            signal.signal(sig, handler)
+
+
+def parse_signal(name):
+    if not name:
+        return signal.SIGTERM
+    name = str(name).upper()
+    if name.isdigit():
+        return signal.Signals(int(name))
+    if not name.startswith('SIG'):
+        name = 'SIG' + name
+    try:
+        return signal.Signals[name]
+    except KeyError:
+        raise StoreError(f'invalid signal: {name}') from None
+
+
+def spawn(argv, env_path, stdin, stdout, stderr, cwd, foreground_tty):
+    """Starts the loader in a new process group (the container's)."""
+    def child():
+        os.setpgid(0, 0)
+        if foreground_tty is not None:
+            signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+            os.tcsetpgrp(foreground_tty, os.getpgrp())
+            signal.signal(signal.SIGTTOU, signal.SIG_DFL)
+    return subprocess.Popen(argv, stdin=stdin, stdout=stdout, stderr=stderr, cwd=cwd,
+                            env={'PATH': env_path}, preexec_fn=child, close_fds=True)
+
+
+def reset_mounts(cdir):
+    """A new start has no mounts of its own yet (R4): the table and the
+    tmpfs directories of the previous run go."""
+    (cdir / 'mounts.table').unlink(missing_ok=True)
+    if (cdir / 'mounts').exists():
+        store_mod.remove(cdir / 'mounts')
+
+
+def run_once(st, record, stdio, interactive, tty):
+    """One run of the container in this process; returns its exit code."""
+    cid = record['Id']
+    reset_mounts(st.container_dir(cid))
+    argv, _ = command_line(st, record)
+    rootfs = rootfs_of(st, record)
+    runspec.install_helper(rootfs)
+    stdin, stdout, stderr = stdio
+    terminal = None
+    if (interactive or tty) and os.isatty(0) and stdin is None:
+        terminal = 0
+    # Published ports: forwarders to the container's address (network.py).
+    publisher = None
+    target = network.address(st, record)
+    if target and record['HostConfig'].get('PortBindings'):
+        publisher = network.Publisher(target, record['HostConfig']['PortBindings'])
+        set_ports(st, cid, publisher.start())
+    forwarder = Forwarder(parse_signal(record['Config'].get('StopSignal')))
+    forwarder.install()
+    try:
+        proc = spawn(argv, os.environ.get('PATH', '/usr/bin:/bin'), stdin, stdout, stderr,
+                     str(rootfs), terminal)
+    except BaseException:
+        forwarder.restore()
+        if publisher:
+            publisher.stop()
+            set_ports(st, cid, {})
+        raise
+    forwarder.pgid = proc.pid
+    set_state(st, cid, Status='running', Running=True, Pid=proc.pid,
+              PidStart=proc_start_time(proc.pid), StartedAt=store_mod.now(), ExitCode=None,
+              FinishedAt=None, ExecsClosed=False)
+    try:
+        while True:
+            try:
+                code = proc.wait()
+                break
+            except InterruptedError:
+                continue
+    finally:
+        forwarder.restore()
+        if publisher:
+            publisher.stop()
+            set_ports(st, cid, {})
+        # The main process is gone: the rest of the container goes too, as
+        # when a PID namespace's init exits.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        end_execs(st, cid)
+        if terminal is not None:
+            old = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+            try:
+                os.tcsetpgrp(terminal, os.getpgrp())
+            except OSError:
+                pass
+            signal.signal(signal.SIGTTOU, old)
+    if code < 0:
+        code = 128 - code
+    return code
+
+
+def finish(st, cid, code):
+    with st.lock():
+        record = st.load_container(cid)
+        record['State'].update(Status='exited', Running=False, Pid=0, ExitCode=code,
+                               FinishedAt=store_mod.now())
+        st.save_container(record)
+    return record
+
+
+def start_foreground(st, record, interactive, tty):
+    stdin = None if interactive else subprocess.DEVNULL
+    code = run_once(st, record, (stdin, None, None), interactive, tty)
+    record = finish(st, record['Id'], code)
+    if record['HostConfig'].get('AutoRemove'):
+        remove(st, record, force=True)
+    return code
+
+
+def start_detached(st, record):
+    """Hands the container to its monitor; returns once it runs."""
+    cid = record['Id']
+    set_state(st, cid, Status='restarting', Running=False, ManualStop=False, ExitCode=None)
+    proc = subprocess.Popen([sys.executable, '-B', str(TOOL), '__monitor', cid],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True,
+                            env=dict(os.environ, ELF_OCI_HOME=str(st.home)))
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        record = st.load_container(cid)
+        if record['State']['Status'] != 'restarting' or record['State'].get('Pid'):
+            break
+        if proc.poll() is not None:
+            break
+        time.sleep(0.02)
+    return record
+
+
+def monitor(st, cid):
+    """`__monitor`: the supervising process of a detached container."""
+    record = st.load_container(cid)
+    set_state(st, cid, MonitorPid=os.getpid(), MonitorStart=proc_start_time(os.getpid()))
+    policy = record['HostConfig'].get('RestartPolicy') or {'Name': 'no'}
+    restarts = 0
+    delay = 0.1
+    log = open(st.container_dir(cid) / 'log', 'ab', buffering=0)
+    while True:
+        began = time.time()
+        try:
+            code = run_once(st, st.load_container(cid), (subprocess.DEVNULL, log, log), False, False)
+        except Exception as e:   # A start failure is the container's exit.
+            log.write(f'docker: {e}\n'.encode())
+            code = 125
+        record = finish(st, cid, code)
+        name = policy.get('Name', 'no')
+        manual = record['State'].get('ManualStop')
+        again = not manual and (name in ('always', 'unless-stopped') or
+                                (name == 'on-failure' and code != 0 and
+                                 (not policy.get('MaximumRetryCount') or
+                                  restarts < policy['MaximumRetryCount'])))
+        if not again:
+            break
+        restarts += 1
+        delay = 0.1 if time.time() - began > 10 else min(delay * 2, 60)
+        set_state(st, cid, Status='restarting', RestartCount=restarts)
+        time.sleep(delay)
+        if st.load_container(cid)['State'].get('ManualStop'):
+            finish(st, cid, code)
+            break
+    set_state(st, cid, MonitorPid=0)
+    if record['HostConfig'].get('AutoRemove'):
+        remove(st, st.load_container(cid), force=True)
+
+
+def stop(st, record, timeout=None, sig=None):
+    """Stop signal, then SIGKILL after the timeout; no restart afterwards."""
+    cid = record['Id']
+    record = set_state(st, cid, ManualStop=True)
+    state = record['State']
+    if not alive(state):
+        record = refresh(st, record)
+        end_execs(st, cid)
+        return record
+    pgid = state['Pid']
+    sig = sig or parse_signal(record['Config'].get('StopSignal'))
+    if timeout is None:
+        timeout = record['Config'].get('StopTimeout') or 10
+    try:
+        os.kill(pgid, sig)   # The main process, as Docker.
+    except ProcessLookupError:
+        pass
+    deadline = time.time() + timeout
+    while time.time() < deadline and alive(state):
+        time.sleep(0.05)
+    if alive(state):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    # The waiting process (foreground run or monitor) records the exit.
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        record = st.load_container(cid)
+        if record['State']['Status'] == 'exited':
+            return record
+        if not alive(record['State']) and not (record['State'].get('MonitorPid') and proc_start_time(
+                record['State']['MonitorPid']) == record['State'].get('MonitorStart')):
+            break
+        time.sleep(0.05)
+    record = refresh(st, st.load_container(cid))
+    end_execs(st, cid)
+    return record
+
+
+def kill(st, record, sig):
+    state = refresh(st, record)['State']
+    if not alive(state):
+        raise StoreError(f'Container {record["Id"][:12]} is not running')
+    if sig in (signal.SIGKILL, signal.SIGTERM, signal.SIGINT):
+        set_state(st, record['Id'], ManualStop=True)
+    os.kill(state['Pid'], sig)
+
+
+def wait(st, record):
+    cid = record['Id']
+    while True:
+        record = refresh(st, st.load_container(cid))
+        if record['State']['Status'] in ('exited', 'created'):
+            return record['State'].get('ExitCode') or 0
+        time.sleep(0.1)
+
+
+def remove(st, record, force=False, volumes=False):
+    record = refresh(st, record)
+    if record['State']['Status'] in ('running', 'restarting'):
+        if not force:
+            raise StoreError(f'cannot remove container "/{record["Name"]}": container is running: '
+                             'stop the container before removing or force remove')
+        stop(st, record, timeout=0, sig=signal.SIGKILL)
+    end_execs(st, record['Id'])
+    cdir = st.container_dir(record['Id'])
+    if cdir.exists():
+        trash = st.home / 'tmp' / f'rm-{record["Id"]}'
+        with st.lock():
+            cdir.rename(trash)
+        store_mod.remove(trash)
+        network.refresh(st)
+
+
+def exec_in(st, record, command, interactive, tty, detach, env, workdir, user):
+    record = refresh(st, record)
+    if record['State']['Status'] != 'running':
+        raise StoreError(f'Container {record["Id"][:12]} is not running')
+    argv, _ = command_line(st, record, extra_env=env, workdir=workdir, user=user, command=command)
+    rootfs = rootfs_of(st, record)
+    cid = record['Id']
+    if detach:
+        exec_spawn(st, cid, lambda: subprocess.Popen(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            cwd=str(rootfs), start_new_session=True))
+        return 0
+    terminal = 0 if (interactive or tty) and os.isatty(0) else None
+    forwarder = Forwarder(signal.SIGTERM)
+    forwarder.install()
+    proc = None
+    try:
+        proc = exec_spawn(st, cid, lambda: spawn(argv, os.environ.get('PATH', '/usr/bin:/bin'),
+                                                 None if interactive else subprocess.DEVNULL, None, None,
+                                                 str(rootfs), terminal))
+        forwarder.pgid = proc.pid
+        code = proc.wait()
+    finally:
+        forwarder.restore()
+        if proc is not None:
+            exec_done(st, cid, proc.pid)
+        if terminal is not None:
+            old = signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+            try:
+                os.tcsetpgrp(terminal, os.getpgrp())
+            except OSError:
+                pass
+            signal.signal(signal.SIGTTOU, old)
+    return 128 - code if code < 0 else code
+
+
+def container_path(st, record, path, follow=True):
+    binds = [(b[0], b[1]) for b in all_binds(st, record)]
+    return runspec.guest_resolve(view_of(st, record), binds, path, follow)
+
+
+def guest_view(st, record):
+    """The container's files as its processes see them (guestfs.View)."""
+    etc = st.container_dir(record['Id']) / 'etc'
+    # The container's own etc files are binds as in runspec.build, before
+    # the user's (a user bind of the same file covers them there and here;
+    # host /proc, /sys and devices are left out: not the container's files).
+    own = [(str(etc / name), f'/etc/{name}', 'rw') for name in ('hosts', 'hostname', 'resolv.conf')]
+    return guestfs.View(view_of(st, record), own + all_binds(st, record),
+                        readonly_root=bool(record['HostConfig'].get('ReadonlyRootfs')))
+
+
+def host_target(dest, is_dir, name, contents):
+    """Docker's cp rules on the host side: (directory, top) to write the
+    copy under: into an existing directory under the source's name (its
+    contents for "src/." or the root), else as dest."""
+    dest = Path(dest)
+    if dest.is_dir():
+        return dest, [] if is_dir and (contents or not name) else [name]
+    if is_dir and os.path.lexists(dest):
+        raise StoreError('cannot copy a directory to a file')
+    if not dest.parent.is_dir():
+        raise StoreError(f'no such directory: {dest.parent}')
+    return dest.parent, [dest.name]
+
+
+def guest_target(view, dest_path, is_dir, name, contents):
+    """The same rules in the container: (canonical directory parts, top)."""
+    parts = view.resolve(dest_path, follow=True)
+    if view.is_dir(parts):
+        return parts, [] if is_dir and contents else [name]
+    if is_dir and view.exists(parts):
+        raise StoreError('cannot copy a directory to a file')
+    if not parts or not view.is_dir(parts[:-1]):
+        raise StoreError(f'no such directory: {posixpath.dirname(dest_path.rstrip("/")) or "/"}')
+    return parts[:-1], [parts[-1]]
+
+
+def cp(st, src, dest, archive_mode=False):
+    """docker cp: exactly one side is CONTAINER:PATH; '-' is a tar stream.
+    The container side is read through its merged view and written only
+    through FDs that never follow its links (guestfs)."""
+    def split(spec):
+        if spec == '-' or spec.startswith(('/', '.')) or ':' not in spec:
+            return None, spec
+        name, _, path = spec.partition(':')
+        return st.resolve_container(name), path
+
+    (src_c, src_path), (dest_c, dest_path) = split(src), split(dest)
+    if bool(src_c) == bool(dest_c):
+        raise StoreError('copying between containers or between local paths is not supported')
+    contents = src_path.endswith('/.')
+    if src_c:
+        view = guest_view(st, src_c)
+        parts = view.resolve(src_path, follow=True)
+        if not view.exists(parts):
+            raise StoreError(f'Could not find the file {src_path} in container {src_c["Name"]}')
+        name = parts[-1] if parts else ''
+        if dest_path == '-':
+            with tarfile.open(fileobj=sys.stdout.buffer, mode='w|') as tar:
+                guestfs.copy(view.walk(parts, [PurePosixPath(src_path.rstrip('/')).name or '.']),
+                             guestfs.TarSink(tar))
+            return
+        is_dir = view.is_dir(parts)
+        if src_path.endswith('/') and not is_dir:
+            raise StoreError(f'{src_path} is not a directory')
+        directory, top = host_target(dest_path, is_dir, name, contents)
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        guestfs.copy(view.walk(parts, top), guestfs.DirSink(fd))
+        return
+    view = guest_view(st, dest_c)
+    if src_path == '-':
+        parts = view.resolve(dest_path, follow=True)
+        if not view.is_dir(parts):
+            raise StoreError(f'destination "{dest_path}" must be a directory')
+        with tarfile.open(fileobj=sys.stdin.buffer, mode='r|*') as tar:
+            guestfs.copy(guestfs.tar_walk(tar), guestfs.GuestSink(view, parts))
+        return
+    src_host = Path(src_path)
+    if not os.path.lexists(src_host):
+        raise StoreError(f'no such file or directory: {src_path}')
+    is_dir = src_host.is_dir() and not src_host.is_symlink()
+    if src_path.endswith('/') and not is_dir:
+        raise StoreError(f'{src_path} is not a directory')
+    name = Path(os.path.abspath(src_host)).name
+    directory, top = guest_target(view, dest_path, is_dir, name, contents)
+    guestfs.copy(guestfs.host_walk(src_host, top), guestfs.GuestSink(view, directory))
+
+
+def logs(st, record, follow=False, tail=None):
+    path = st.container_dir(record['Id']) / 'log'
+    if not path.exists():
+        return
+    with open(path, 'rb') as f:
+        if tail is not None:
+            lines = f.read().splitlines(keepends=True)
+            sys.stdout.buffer.write(b''.join(lines[-tail:] if tail else []))
+        else:
+            shutil.copyfileobj(f, sys.stdout.buffer)
+        sys.stdout.flush()
+        while follow:
+            chunk = f.read(65536)
+            if chunk:
+                sys.stdout.buffer.write(chunk)
+                sys.stdout.flush()
+                continue
+            record = refresh(st, st.load_container(record['Id']))
+            if record['State']['Status'] not in ('running', 'restarting'):
+                rest = f.read()
+                sys.stdout.buffer.write(rest)
+                sys.stdout.flush()
+                return
+            time.sleep(0.2)

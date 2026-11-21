@@ -1,0 +1,190 @@
+#define _GNU_SOURCE
+#include <assert.h>
+#include <errno.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include "reentry_guard.h"
+/* reentry_guard.c GUARD_SLOTS: the table holds this many owners at once.
+ * Simulated TIDs of the full-table cases start far above the fixed ones. */
+#define SLOTS 1024
+static _Thread_local long simulated_tid;
+static int fail_mapping, nested_init;
+static int live_mappings;
+static long dead_tid; /* The one simulated owner reported as gone. */
+static long foreign_low, foreign_high; /* Simulated TIDs of another process. */
+long raw_syscall(long n,long a,long b,long c,long d,long e,long f) {
+    if(n == SYS_gettid)return simulated_tid ? simulated_tid : syscall(n);
+    if(n == SYS_getpid)return syscall(n);
+    if(n == SYS_tgkill)return b==dead_tid || (b>=foreign_low && b<foreign_high) ? -ESRCH : 0;
+    assert(n == SYS_mmap || n == SYS_munmap);
+    if(n==SYS_mmap && fail_mapping){fail_mapping=0;return -ENOMEM;}
+    if(n==SYS_mmap && nested_init) {
+        nested_init=0;
+        struct reentry_slot *s=reentry_try_enter();
+        assert((intptr_t)s>0);reentry_leave(s);
+    }
+    long result=syscall(n,a,b,c,d,e,f);
+    if(result!=-1)__atomic_add_fetch(&live_mappings,n==SYS_mmap?1:-1,__ATOMIC_RELAXED);
+    return result==-1 ? -errno : result;
+}
+static volatile sig_atomic_t signals_seen;
+static void handler(int sig) {
+    (void)sig;
+    struct reentry_slot *slot = reentry_try_enter();
+    assert((intptr_t)slot >= 0);
+    if (slot) reentry_leave(slot);
+    signals_seen++;
+}
+static void *worker(void *arg) {
+    (void)arg;
+    for (int i=0;i<10000;i++) {
+        struct reentry_slot *s=reentry_try_enter();
+        assert((intptr_t)s>0);
+        assert(reentry_try_enter()==NULL);
+        reentry_leave(s);
+    }
+    return NULL;
+}
+static void *sender(void *arg) {
+    pthread_t target=*(pthread_t*)arg;
+    for(int i=0;i<20000;i++) assert(pthread_kill(target,SIGUSR1)==0);
+    return NULL;
+}
+static int fork_ownership(void) {
+    static struct reentry_slot *held[SLOTS];
+    for(int i=0;i<SLOTS;i++) {
+        simulated_tid=400000+i;
+        held[i]=reentry_try_enter();assert((intptr_t)held[i]>0);
+    }
+    simulated_tid=0;
+    int ready[2], proceed[2];assert(!pipe(ready));assert(!pipe(proceed));
+    pid_t pid=fork();assert(pid>=0);
+    if(!pid) {
+        close(ready[0]);close(proceed[1]);
+        /* The copied table names the parent's threads: never recursion, and
+         * a full copy reclaims them because they are not this process's. */
+        foreign_low=400000;foreign_high=400000+SLOTS;
+        struct reentry_slot *s=reentry_try_enter();
+        if((intptr_t)s<=0)_exit(13);
+        if(reentry_try_enter()!=NULL)_exit(14);
+        reentry_leave(s);
+        char byte='x';if(write(ready[1],&byte,1)!=1)_exit(11);
+        if(read(proceed[0],&byte,1)!=1)_exit(12);
+        _exit(0);
+    }
+    close(ready[1]);close(proceed[0]);char byte;
+    assert(read(ready[0],&byte,1)==1);
+    for(int i=0;i<SLOTS;i++)reentry_leave(held[i]);
+    assert(write(proceed[1],"x",1)==1);
+    int status;assert(waitpid(pid,&status,0)==pid);
+    close(ready[0]);close(proceed[1]);
+    if(!WIFEXITED(status)||WEXITSTATUS(status)) {
+        fprintf(stderr,"FAIL: fork copied stale owners, child status=%d\n",status);
+        return 1;
+    }
+    return 0;
+}
+static void private_fork_ownership(void) {
+    reentry_private_fork(syscall(SYS_gettid));
+    struct reentry_slot *parent=reentry_try_enter();assert((intptr_t)parent>0);
+    assert(reentry_try_enter()==NULL);
+    pid_t pid=fork();assert(pid>=0);
+    if(!pid) {
+        reentry_private_fork(syscall(SYS_gettid));
+        struct reentry_slot *child=reentry_try_enter();
+        if((intptr_t)child<=0 || reentry_try_enter()!=NULL)_exit(20);
+        /* Leave an active private lease behind on death. */
+        _exit(0);
+    }
+    int status;assert(waitpid(pid,&status,0)==pid && status==0);
+    assert(reentry_try_enter()==NULL); /* Child reset did not release parent. */
+    reentry_leave(parent);
+    parent=reentry_try_enter();assert((intptr_t)parent>0);reentry_leave(parent);
+}
+int main(int argc,char **argv) {
+    (void)argv;
+    fail_mapping=1;
+    assert((intptr_t)reentry_try_enter()==-ENOMEM);
+    assert(live_mappings==0);
+    if(argc>1) {
+        nested_init=1;
+        struct reentry_slot *s=reentry_try_enter();assert((intptr_t)s>0);
+        reentry_leave(s);assert(live_mappings==1);
+        puts("PASS: failed mapping retry and nested initialization loser cleanup");
+        return 0;
+    }
+    /* Multiple threads race to initialize before any table has been published. */
+    pthread_t starters[8];
+    for(int i=0;i<8;i++)assert(!pthread_create(&starters[i],NULL,worker,NULL));
+    for(int i=0;i<8;i++)assert(!pthread_join(starters[i],NULL));
+    assert(live_mappings==1);
+    static struct reentry_slot *held[SLOTS];
+    for(int i=0;i<1024;i++) {
+        simulated_tid=1000+i;
+        struct reentry_slot *s=reentry_try_enter();assert((intptr_t)s>0);
+        assert(reentry_try_enter()==NULL);reentry_leave(s);
+    }
+    for(int i=0;i<SLOTS;i++) {simulated_tid=100000+i;held[i]=reentry_try_enter();assert((intptr_t)held[i]>0);}
+    simulated_tid=999;assert((intptr_t)reentry_try_enter()==-EAGAIN);
+    /* A vfork child never borrows a pool slot, even at full capacity. Its
+     * abandoned acquisition can be retired without clearing any pool owner. */
+    reentry_vfork_begin(999);
+    struct reentry_slot *child=reentry_try_enter();assert((intptr_t)child>0);
+    assert(reentry_try_enter()==NULL);
+    reentry_leave(child);
+    child=reentry_try_enter();assert((intptr_t)child>0);
+    reentry_vfork_end(999); /* Simulate terminal child: no normal leave. */
+    assert((intptr_t)reentry_try_enter()==-EAGAIN);
+    /* Two vfork children at once (two threads of the parent vforked): each
+     * its own lease; ending one leaves the other's. */
+    reentry_vfork_begin(991);reentry_vfork_begin(992);
+    simulated_tid=991;struct reentry_slot *first=reentry_try_enter();assert((intptr_t)first>0);
+    simulated_tid=992;struct reentry_slot *second=reentry_try_enter();assert((intptr_t)second>0 && second!=first);
+    assert(reentry_try_enter()==NULL);
+    reentry_vfork_end(991);
+    simulated_tid=992;assert(reentry_try_enter()==NULL);
+    reentry_leave(second);reentry_vfork_end(992);
+    simulated_tid=999;assert((intptr_t)reentry_try_enter()==-EAGAIN);
+    for(int i=0;i<SLOTS;i++) {
+        simulated_tid=100000+i;assert(reentry_try_enter()==NULL);
+    }
+    reentry_leave(held[0]);simulated_tid=100000+SLOTS-1;
+    assert(reentry_try_enter()==NULL); /* Existing owner after a free hole. */
+    simulated_tid=999;held[0]=reentry_try_enter();assert((intptr_t)held[0]>0);
+    for(int i=0;i<SLOTS;i++)reentry_leave(held[i]);
+    simulated_tid=0;
+    pthread_t workers[8];
+    for(int i=0;i<8;i++)assert(!pthread_create(&workers[i],NULL,worker,NULL));
+    for(int i=0;i<8;i++)assert(!pthread_join(workers[i],NULL));
+    struct sigaction act={0};act.sa_handler=handler;sigemptyset(&act.sa_mask);
+    assert(!sigaction(SIGUSR1,&act,NULL));
+    pthread_t main_thread=pthread_self(), thread;
+    assert(!pthread_create(&thread,NULL,sender,&main_thread));
+    worker(NULL);
+    assert(!pthread_join(thread,NULL));assert(signals_seen>0);
+    /* A full table reclaims a dead owner's lease; that owner's late,
+     * owner-checked leave must not release the new holder. */
+    for(int i=0;i<SLOTS;i++) {simulated_tid=300000+i;held[i]=reentry_try_enter();assert((intptr_t)held[i]>0);}
+    dead_tid=300005;simulated_tid=998;
+    struct reentry_slot *taken=reentry_try_enter();assert(taken==held[5]);
+    reentry_leave_owned(held[5],300005);
+    assert(reentry_try_enter()==NULL);
+    reentry_leave_owned(taken,998);dead_tid=0;
+    for(int i=0;i<SLOTS;i++)if(i!=5)reentry_leave(held[i]);
+    /* exec gives the table lease up and takes it back on failure. */
+    simulated_tid=997;struct reentry_slot *execing=reentry_try_enter();assert((intptr_t)execing>0);
+    assert(reentry_exec_release()==execing);
+    simulated_tid=996;struct reentry_slot *other=reentry_try_enter();assert(other==execing);
+    simulated_tid=997;reentry_exec_restore(execing); /* Taken meanwhile: no steal. */
+    reentry_leave_owned(execing,997);
+    simulated_tid=996;assert(reentry_try_enter()==NULL);reentry_leave_owned(other,996);
+    simulated_tid=0;
+    if(fork_ownership())return 1;
+    private_fork_ownership();
+    puts("PASS: fork ownership, guard reuse, recursion, capacity, dead-owner reclaim, exec release, 8 threads and asynchronous signals");
+}

@@ -1,0 +1,19 @@
+/* Experimental FD routes; ordinary fast paths remain unchanged. */
+SLOW_SYSCALL(__NR_pipe2)
+SLOW_SYSCALL(__NR_socket)
+SLOW_SYSCALL(__NR_socketpair)
+SLOW_SYSCALL(__NR_recvmsg)
+SLOW_SYSCALL(__NR_recvmmsg)
+SLOW_SYSCALL(__NR_memfd_create)
+SLOW_SYSCALL(__NR_eventfd2)
+SLOW_SYSCALL(__NR_epoll_create1)
+SLOW_SYSCALL(__NR_inotify_init1)
+SLOW_SYSCALL(__NR_signalfd4)
+SLOW_SYSCALL(__NR_timerfd_create)
+SLOW_SYSCALL(__NR_pidfd_getfd)
+SLOW_SYSCALL(__NR_unshare)
+SLOW_SYSCALL(__NR_pkey_mprotect)
+
+#define FD_UNSUPPORTED(n) SLOW_SYSCALL(n)
+#include "fd_unsupported_syscalls.inc"
+#undef FD_UNSUPPORTED

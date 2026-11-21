@@ -1,0 +1,857 @@
+/* SPDX-License-Identifier: MIT */
+/* Isolation acceptance probe (docs/ISOLATION_TESTING.md). Models the guest
+ * of the capability assumptions: each operation runs either through the
+ * normal (hooked) path, "h", or as a kernel call issued from the payload's
+ * own `svc; ret`, "d", which skips every payload check. Prints one line per
+ * result: "<label> <value>" where value is the return value or -errno.
+ *
+ *   probe h|d open PATH FLAGS        open (octal flags); prints data= on success
+ *   probe h|d stat|lstat|readlink|list|chdir|statfs|getxattr PATH
+ *   probe h   rawlist PATH           open through the payload, getdents64 from its svc
+ *   probe h   rawlistwait PATH       the same, listing after a line on stdin
+ *   probe h   lazy IMAGE CACHE REL OP [N]  a forged BROKER_LAZY_MOUNT (OP 0 expand, 1 fill);
+ *                                    N: "ready", a line read from stdin, then sent N
+ *                                    times, "lazy-rc RC COUNT" per result
+ *   probe h   lazypath HOST OP [N]   a forged BROKER_LAZY_PATH: HOST inside a --lower cache
+ *   probe h|d fdcalls N              write, pread, getdents64 and fchmod on FD N
+ *   probe h   reopen PATH            O_PATH open, then reopen by /proc/self/fd/N and by a
+ *                                    forged magic-link request; each listed from the svc
+ *   probe h|d mkdir|unlink|rmdir|chmod|chown|utime|truncate|setxattr PATH
+ *   probe h|d rename|link|symlink A B
+ *   probe h|d exec PATH              execve (h) or execveat by path (d)
+ *   probe h   execfd PATH            open, then execveat(fd, "", AT_EMPTY_PATH)
+ *   probe h   fdops PATH             open read-only, then FD metadata calls
+ *   probe h|d bind|connect PATH      UNIX stream socket
+ *   probe d   filter                 every refused call number from the payload's svc
+ *   probe h   tamper HOSTPATH RWPATH ROPATH   rewrite the payload configuration
+ *   probe h   forge HOST_OUT HOST_RO HOST_RW HOST_SOCK  raw broker requests
+ *   probe h   killbroker PATH        kill the broker, then open PATH
+ *   probe h   procs                  other processes' memory and FDs */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <pthread.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/uio.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <sys/inotify.h>
+#include <time.h>
+#include <unistd.h>
+#include <asm/unistd.h>
+#include "config.h"
+#include "elf_abi.h"
+#include "broker_proto.h"
+
+static unsigned long gadget;
+static int direct;
+
+static long via(long n, long a, long b, long c, long d, long e, long f)
+{
+    register long x8 __asm__("x8") = n;
+    register long x0 __asm__("x0") = a, x1 __asm__("x1") = b, x2 __asm__("x2") = c;
+    register long x3 __asm__("x3") = d, x4 __asm__("x4") = e, x5 __asm__("x5") = f;
+    register unsigned long x16 __asm__("x16") = gadget;
+    __asm__ volatile("blr x16" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5),
+                     "r"(x16) : "memory", "cc", "x30");
+    return x0;
+}
+/* Hooked: the probe's own svc, patched by the loader into the payload. */
+static long hooked(long n, long a, long b, long c, long d, long e, long f)
+{
+    register long x8 __asm__("x8") = n;
+    register long x0 __asm__("x0") = a, x1 __asm__("x1") = b, x2 __asm__("x2") = c;
+    register long x3 __asm__("x3") = d, x4 __asm__("x4") = e, x5 __asm__("x5") = f;
+    __asm__ volatile("svc #0" : "+r"(x0) : "r"(x8), "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
+                     : "memory", "cc");
+    return x0;
+}
+static long sc(long n, long a, long b, long c, long d, long e, long f)
+{
+    return direct ? via(n, a, b, c, d, e, f) : hooked(n, a, b, c, d, e, f);
+}
+
+static void report(const char *label, long v) { printf("%s %ld\n", label, v); fflush(stdout); }
+
+static void find_gadget(void)
+{
+    for (unsigned *p = (unsigned *)PAYLOAD_FIXED_BASE; p < (unsigned *)(PAYLOAD_FIXED_BASE + 0x200000); p++)
+        if (p[0] == 0xd4000001 && p[1] == 0xd65f03c0) {
+            gadget = (unsigned long)p;
+            return;
+        }
+    printf("gadget missing\n");
+    exit(2);
+}
+
+static payload_config_t *payload_config(void)
+{
+    for (uint32_t *p = (uint32_t *)PAYLOAD_FIXED_BASE; p < (uint32_t *)(PAYLOAD_FIXED_BASE + 0x200000); p++)
+        if (p[0] == CONFIG_MAGIC && p[2] == PAYLOAD_ABI_VERSION && p[1])
+            return (payload_config_t *)((char *)(p - 1) + p[1]);
+    return 0;
+}
+
+static void open_read(const char *label, const char *path, int flags)
+{
+    long fd = sc(__NR_openat, AT_FDCWD, (long)path, flags, 0644, 0, 0);
+    report(label, fd < 0 ? fd : 0);
+    if (fd >= 0) {
+        char buf[65];
+        long n = sc(__NR_read, fd, (long)buf, 64, 0, 0, 0);
+        if (n > 0) {
+            buf[n] = 0;
+            for (long i = 0; i < n; i++)
+                if (buf[i] == '\n') buf[i] = ' ';
+            printf("data=%s\n", buf);
+        }
+        sc(__NR_close, fd, 0, 0, 0, 0, 0);
+    }
+}
+
+static long path_op(const char *op, const char *p, const char *q)
+{
+    char buf[4096];
+    struct timespec ts[2] = {{1, 0}, {1, 0}};
+    if (!strcmp(op, "stat")) return sc(__NR_newfstatat, AT_FDCWD, (long)p, (long)buf, 0, 0, 0);
+    if (!strcmp(op, "lstat")) return sc(__NR_newfstatat, AT_FDCWD, (long)p, (long)buf, AT_SYMLINK_NOFOLLOW, 0, 0);
+    if (!strcmp(op, "statx")) return sc(__NR_statx, AT_FDCWD, (long)p, 0, 0xfff, (long)buf, 0);
+    if (!strcmp(op, "readlink")) return sc(__NR_readlinkat, AT_FDCWD, (long)p, (long)buf, sizeof(buf), 0, 0);
+    if (!strcmp(op, "access")) return sc(__NR_faccessat, AT_FDCWD, (long)p, 4, 0, 0, 0);
+    if (!strcmp(op, "statfs")) return sc(__NR_statfs, (long)p, (long)buf, 0, 0, 0, 0);
+    if (!strcmp(op, "chdir")) return sc(__NR_chdir, (long)p, 0, 0, 0, 0, 0);
+    if (!strcmp(op, "getxattr")) return sc(__NR_getxattr, (long)p, (long)"user.x", (long)buf, 64, 0, 0);
+    if (!strcmp(op, "listxattr")) return sc(__NR_listxattr, (long)p, (long)buf, 64, 0, 0, 0);
+    if (!strcmp(op, "mkdir")) return sc(__NR_mkdirat, AT_FDCWD, (long)p, 0755, 0, 0, 0);
+    if (!strcmp(op, "mknod")) return sc(__NR_mknodat, AT_FDCWD, (long)p, S_IFIFO | 0644, 0, 0, 0);
+    if (!strcmp(op, "unlink")) return sc(__NR_unlinkat, AT_FDCWD, (long)p, 0, 0, 0, 0);
+    if (!strcmp(op, "rmdir")) return sc(__NR_unlinkat, AT_FDCWD, (long)p, AT_REMOVEDIR, 0, 0, 0);
+    if (!strcmp(op, "chmod")) return sc(__NR_fchmodat, AT_FDCWD, (long)p, 0777, 0, 0, 0);
+    if (!strcmp(op, "chown")) return sc(__NR_fchownat, AT_FDCWD, (long)p, getuid(), getgid(), 0, 0);
+    if (!strcmp(op, "utime")) return sc(__NR_utimensat, AT_FDCWD, (long)p, (long)ts, 0, 0, 0);
+    if (!strcmp(op, "truncate")) return sc(__NR_truncate, (long)p, 0, 0, 0, 0, 0);
+    if (!strcmp(op, "setxattr")) return sc(__NR_setxattr, (long)p, (long)"user.x", (long)"v", 1, 0, 0);
+    if (!strcmp(op, "removexattr")) return sc(__NR_removexattr, (long)p, (long)"user.x", 0, 0, 0, 0);
+    if (!strcmp(op, "inotify")) {
+        int in = inotify_init1(0);
+        return sc(__NR_inotify_add_watch, in, (long)p, 0xfff, 0, 0, 0);
+    }
+    if (!strcmp(op, "rename")) return sc(__NR_renameat, AT_FDCWD, (long)p, AT_FDCWD, (long)q, 0, 0);
+    if (!strcmp(op, "link")) return sc(__NR_linkat, AT_FDCWD, (long)p, AT_FDCWD, (long)q, 0, 0);
+    if (!strcmp(op, "symlink")) return sc(__NR_symlinkat, (long)p, AT_FDCWD, (long)q, 0, 0, 0);
+    return -9999;
+}
+
+static void list(const char *path)
+{
+    long fd = sc(__NR_openat, AT_FDCWD, (long)path, O_RDONLY | O_DIRECTORY, 0, 0, 0);
+    report("list", fd < 0 ? fd : 0);
+    if (fd < 0) return;
+    char buf[4096];
+    long n = sc(__NR_getdents64, fd, (long)buf, sizeof(buf), 0, 0, 0);
+    printf("names=");
+    for (long off = 0; off < n;) {
+        unsigned short reclen = *(unsigned short *)(buf + off + 16);
+        printf("%s,", buf + off + 19);
+        off += reclen;
+    }
+    printf("\n");
+}
+
+/* The FD the broker hands out, listed without the payload's filter. */
+static void rawlist(const char *path, int wait)
+{
+    long fd = hooked(__NR_openat, AT_FDCWD, (long)path, O_RDONLY | O_DIRECTORY, 0, 0, 0);
+    report("rawlist", fd < 0 ? fd : 0);
+    if (fd < 0) return;
+    if (wait) {   /* the harness changes the directory meanwhile */
+        char line[8];
+        if (!fgets(line, sizeof(line), stdin)) return;
+    }
+    char buf[4096];
+    long n = via(__NR_getdents64, fd, (long)buf, sizeof(buf), 0, 0, 0);
+    printf("names=");
+    for (long off = 0; off < n;) {
+        unsigned short reclen = *(unsigned short *)(buf + off + 16);
+        printf("%s,", buf + off + 19);
+        off += reclen;
+    }
+    printf("\n");
+}
+
+static long unix_socket(const char *op, const char *path)
+{
+    struct sockaddr_un a = {.sun_family = AF_UNIX};
+    strncpy(a.sun_path, path, sizeof(a.sun_path) - 1);
+    long s = sc(__NR_socket, AF_UNIX, SOCK_STREAM, 0, 0, 0, 0);
+    if (s < 0 && direct) s = socket(AF_UNIX, SOCK_STREAM, 0); /* the broker's, then name it directly */
+    if (s < 0) return s;
+    return sc(!strcmp(op, "bind") ? __NR_bind : __NR_connect, s, (long)&a, sizeof(a), 0, 0, 0);
+}
+
+static void fdops(const char *path)
+{
+    long fd = hooked(__NR_openat, AT_FDCWD, (long)path, O_RDONLY, 0, 0, 0);
+    report("open", fd);
+    if (fd < 0) return;
+    char magic[64];
+    snprintf(magic, sizeof(magic), "/proc/self/fd/%ld", fd);
+    long re = hooked(__NR_openat, AT_FDCWD, (long)magic, O_RDWR, 0, 0, 0);
+    report("reopen-rw", re < 0 ? re : 0);
+    re = hooked(__NR_openat, AT_FDCWD, (long)magic, O_RDONLY, 0, 0, 0);
+    report("reopen-ro", re < 0 ? re : 0);
+    struct timespec ts[2] = {{1, 0}, {1, 0}};
+    report("fchmod", hooked(__NR_fchmod, fd, 0777, 0, 0, 0, 0));
+    report("fchown", hooked(__NR_fchown, fd, getuid(), getgid(), 0, 0, 0));
+    report("futimens", hooked(__NR_utimensat, fd, 0, (long)ts, 0, 0, 0));
+    report("fsetxattr", hooked(__NR_fsetxattr, fd, (long)"user.x", (long)"v", 1, 0, 0));
+    report("ftruncate", hooked(__NR_ftruncate, fd, 0, 0, 0, 0, 0));
+    report("write", hooked(__NR_write, fd, (long)"x", 1, 0, 0, 0));
+    struct stat st;
+    report("fstat", hooked(__NR_fstat, fd, (long)&st, 0, 0, 0, 0));
+    char buf[256];
+    report("statx-fd", hooked(__NR_statx, fd, (long)"", AT_EMPTY_PATH, 0xfff, (long)buf, 0));
+    /* The same FD metadata changes straight from the payload's svc. */
+    report("d-fchmod", via(__NR_fchmod, fd, 0777, 0, 0, 0, 0));
+    report("d-futimens", via(__NR_utimensat, fd, 0, (long)ts, 0, 0, 0));
+    report("d-fsetxattr", via(__NR_fsetxattr, fd, (long)"user.x", (long)"v", 1, 0, 0));
+}
+
+/* Every call of the guest filter table, from the payload's svc, in a child
+ * (the host sandbox kills some calls with SIGSYS before ours answers). */
+static void filter(void)
+{
+    static const int nrs[] = {56, 437, 264, 265, 79, 291, 48, 439, 78, 34, 33, 35, 36, 37, 38, 276,
+        53, 452, 54, 88, 45, 43, 49, 51, 5, 6, 8, 9, 11, 12, 14, 15, 463, 464, 465, 466, 468, 469,
+        27, 263, 89, 224, 225, 60, 221, 52, 55, 7, 16, 200, 203, 425, 426, 427, 270, 271, 440, 438,
+        117, 272, 280, 241, 40, 39, 41, 428, 429, 430, 431, 432, 433, 442, 467};
+    static char path[] = "/nonexistent-iso";
+    for (unsigned i = 0; i < sizeof(nrs) / sizeof(nrs[0]); i++) {
+        int pipefd[2];
+        pipe(pipefd);
+        pid_t pid = fork();
+        if (!pid) {
+            /* Harmless arguments: a path that does not exist, bad FDs. */
+            long a0 = -1, a1 = (long)path;
+            if (nrs[i] == 200 || nrs[i] == 203) a0 = socket(AF_INET, SOCK_STREAM, 0);
+            if (nrs[i] == 117) a0 = 16 /* PTRACE_ATTACH */, a1 = getppid();
+            long rc = via(nrs[i], a0, a1, 0, 0, 0, 0);
+            write(pipefd[1], &rc, sizeof(rc));
+            _exit(0);
+        }
+        int status;
+        waitpid(pid, &status, 0);
+        long rc = -9999;
+        close(pipefd[1]);
+        if (read(pipefd[0], &rc, sizeof(rc)) != sizeof(rc))
+            rc = WIFSIGNALED(status) ? -1000 - WTERMSIG(status) : -9999;
+        close(pipefd[0]);
+        printf("nr%d %ld\n", nrs[i], rc);
+    }
+    /* Conditional rules. */
+    printf("execveat-path %ld\n", via(281, AT_FDCWD, (long)path, 0, 0, 0, 0));
+    printf("execveat-empty %ld\n", via(281, -1, (long)"", 0, 0, AT_EMPTY_PATH, 0));
+    printf("socket-unix %ld\n", via(__NR_socket, AF_UNIX, SOCK_STREAM, 0, 0, 0, 0));
+    printf("socket-inet %d\n", via(__NR_socket, AF_INET, SOCK_STREAM, 0, 0, 0, 0) >= 0);
+    int sv[2];
+    printf("socketpair-dgram %ld\n", via(__NR_socketpair, AF_UNIX, SOCK_DGRAM, 0, (long)sv, 0, 0));
+    printf("socketpair-stream %ld\n", via(__NR_socketpair, AF_UNIX, SOCK_STREAM, 0, (long)sv, 0, 0));
+    struct { unsigned long cur, max; } lim;
+    printf("prlimit-self %ld\n", via(__NR_prlimit64, 0, 7, 0, (long)&lim, 0, 0));
+    printf("prlimit-other %ld\n", via(__NR_prlimit64, getppid(), 7, 0, (long)&lim, 0, 0));
+    printf("ioctl-setflags %ld\n", via(__NR_ioctl, 0, 0x40086602, (long)&lim, 0, 0, 0));
+    printf("getpid-ok %d\n", via(__NR_getpid, 0, 0, 0, 0, 0, 0) == getpid());
+    printf("nr-high-bits %ld\n", via(0x100000000l | 56, AT_FDCWD, (long)path, 0, 0, 0, 0));
+    /* In a new thread and after exec the filter holds too: fork child above
+     * covers fork; exec is covered by running this probe from a shell. */
+}
+
+/* Rewrite the payload configuration: everything writable, root at the
+ * host root, then (separately) isolation off. */
+static void tamper(const char *host_out, const char *rw, const char *ro)
+{
+    payload_config_t *cfg = payload_config();
+    report("config-found", cfg != 0);
+    if (!cfg) return;
+    unsigned long page = (unsigned long)cfg & ~4095ul;
+    report("mprotect", via(__NR_mprotect, page, (sizeof(*cfg) + 8191) & ~4095ul, 3, 0, 0, 0));
+    for (int i = 0; cfg->mount_access_observe[i]; i++)
+        cfg->mount_access_observe[i] = 'w';
+    cfg->guard = 0;
+    strcpy(cfg->root, "/");
+    open_read("t-open-host", host_out, O_RDONLY);
+    open_read("t-write-ro", ro, O_WRONLY | O_TRUNC);
+    report("t-unlink-ro", hooked(__NR_unlinkat, AT_FDCWD, (long)ro, 0, 0, 0, 0));
+    (void)rw;
+    cfg->isolate = 0;
+    open_read("t-noisolate-host", host_out, O_RDONLY);
+    open_read("t-noisolate-ro", ro, O_WRONLY | O_TRUNC);
+}
+
+/* A channel of our own to the broker, and raw requests on it. */
+static long send_with_fds(int ch, const void *data, size_t size, int *fds, int nfds)
+{
+    char control[CMSG_SPACE(sizeof(int) * 4)];
+    struct iovec io = {(void *)data, size};
+    struct msghdr m = {.msg_iov = &io, .msg_iovlen = 1};
+    if (nfds) {
+        memset(control, 0, sizeof(control));
+        m.msg_control = control;
+        m.msg_controllen = CMSG_SPACE(sizeof(int) * nfds);
+        struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+        h->cmsg_level = SOL_SOCKET;
+        h->cmsg_type = SCM_RIGHTS;
+        h->cmsg_len = CMSG_LEN(sizeof(int) * nfds);
+        memcpy(CMSG_DATA(h), fds, sizeof(int) * nfds);
+    }
+    return via(__NR_sendmsg, ch, (long)&m, MSG_NOSIGNAL, 0, 0, 0);
+}
+
+/* One socket message: its length; an attached FD into *fd. */
+static long receive_fd(int ch, void *data, size_t size, int flags, int *fd)
+{
+    char control[CMSG_SPACE(sizeof(int))];
+    struct iovec io = {data, size};
+    struct msghdr m = {.msg_iov = &io, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof(control)};
+    long n = via(__NR_recvmsg, ch, (long)&m, flags, 0, 0, 0);
+    struct cmsghdr *h = n > 0 ? CMSG_FIRSTHDR(&m) : 0;
+    if (h && h->cmsg_type == SCM_RIGHTS)
+        memcpy(fd, CMSG_DATA(h), sizeof(int));
+    return n;
+}
+
+/* A forged channel speaks the payload's protocol (broker_proto.h): the
+ * broker's first message is the shared area. */
+static struct { int ch; struct broker_shared *s; uint32_t seq; } forged[4];
+static struct broker_shared *shared_of(int ch)
+{
+    for (int i = 0; i < 4; i++)
+        if (forged[i].s && forged[i].ch == ch)
+            return forged[i].s;
+    char m;
+    int fd = -1;
+    if (receive_fd(ch, &m, 1, 0, &fd) <= 0 || fd < 0)
+        return 0;
+    /* Straight from the payload's svc: the FD came past the payload. */
+    long p = via(__NR_mmap, 0, BROKER_SHARED_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    via(__NR_close, fd, 0, 0, 0, 0, 0);
+    if (p < 0 && p > -4096)
+        return 0;
+    struct broker_shared *s = (struct broker_shared *)p;
+    for (int i = 0; i < 4; i++)
+        if (!forged[i].s) {
+            forged[i].ch = ch;
+            forged[i].s = s;
+            forged[i].seq = 0;
+            break;
+        }
+    return s;
+}
+
+static long request(int ch, struct broker_request *r, size_t size, int *fds, int nfds, char *out, size_t cap)
+{
+    struct broker_shared *s = shared_of(ch);
+    uint32_t *seq = 0;
+    for (int i = 0; i < 4; i++)
+        if (forged[i].s == s)
+            seq = &forged[i].seq;
+    if (!s || !seq) return -7777;
+    if (nfds && send_with_fds(ch, "f", 1, fds, nfds) < 0) return -7777;
+    memcpy(s->request, r, size);
+    s->request_size = (uint32_t)size;
+    __atomic_store_n(&s->request_seq, ++*seq, __ATOMIC_RELEASE);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&s->broker_sleeping, __ATOMIC_RELAXED))
+        send_with_fds(ch, "w", 1, 0, 0);
+    int fd = -1;
+    uint64_t deadline = broker_deadline(BROKER_ANSWER_SPIN_US);
+    while (__atomic_load_n(&s->answer_seq, __ATOMIC_ACQUIRE) != *seq) {
+        if (broker_ticks() < deadline) continue;
+        __atomic_store_n(&s->payload_sleeping, 1, __ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
+        char b;
+        long n = __atomic_load_n(&s->answer_seq, __ATOMIC_ACQUIRE) == *seq ? 1 : receive_fd(ch, &b, 1, 0, &fd);
+        __atomic_store_n(&s->payload_sleeping, 0, __ATOMIC_RELAXED);
+        if (n <= 0) return -7777;
+    }
+    char b;
+    while (s->answer_fd && fd < 0)
+        if (receive_fd(ch, &b, 1, MSG_DONTWAIT, &fd) <= 0) return -7777;
+    struct broker_answer *a = (struct broker_answer *)s->answer;
+    if (fd >= 0) {
+        if (out) {
+            long k = read(fd, out, cap - 1);
+            out[k > 0 ? k : 0] = 0;
+        }
+        return 1000 + fd; /* an FD came back */
+    }
+    return a->result;
+}
+
+static size_t with_paths(struct broker_request *r, int nr, const char *p0, int i0, const char *p1, int i1)
+{
+    memset(r, 0, sizeof(*r));
+    r->nr = nr;
+    char *data = (char *)(r + 1);
+    size_t used = 0;
+    if (p0) { strcpy(data, p0); r->len[i0] = strlen(p0) + 1; used += r->len[i0]; }
+    if (p1) { strcpy(data + used, p1); r->len[i1] = strlen(p1) + 1; used += r->len[i1]; }
+    return sizeof(*r) + used;
+}
+
+static void forge(const char *out, const char *ro, const char *rw, const char *sock)
+{
+    payload_config_t *cfg = payload_config();
+    if (!cfg || !cfg->isolate) { report("isolated", 0); return; }
+    int pair[2];
+    via(__NR_socketpair, AF_UNIX, SOCK_SEQPACKET, 0, (long)pair, 0, 0);
+    char hello = 'c';
+    struct broker_request *r = calloc(1, BROKER_MESSAGE_MAX);
+    {
+        char control[CMSG_SPACE(sizeof(int))];
+        struct iovec io = {&hello, 1};
+        struct msghdr m = {.msg_iov = &io, .msg_iovlen = 1, .msg_control = control,
+                           .msg_controllen = sizeof(control)};
+        struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+        h->cmsg_level = SOL_SOCKET; h->cmsg_type = SCM_RIGHTS; h->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(h), &pair[1], sizeof(int));
+        report("channel", via(__NR_sendmsg, cfg->isolate_fd, (long)&m, 0, 0, 0, 0) < 0);
+        close(pair[1]);
+    }
+    int ch = pair[0];
+    char data[256];
+    size_t n;
+    /* A host path outside every tree, as if the payload had resolved it. */
+    n = with_paths(r, __NR_openat, out, 1, 0, 0);
+    r->args[0] = AT_FDCWD;
+    data[0] = 0;
+    report("f-open-outside", request(ch, r, n, 0, 0, data, sizeof(data)));
+    if (data[0]) printf("data=%s\n", data);
+    n = with_paths(r, __NR_openat, ro, 1, 0, 0);
+    r->args[0] = AT_FDCWD; r->args[2] = O_RDWR;
+    report("f-open-ro-rw", request(ch, r, n, 0, 0, 0, 0));
+    n = with_paths(r, __NR_openat, "/../../../../../../etc/passwd", 1, 0, 0);
+    r->args[0] = AT_FDCWD;
+    report("f-open-dotdot", request(ch, r, n, 0, 0, 0, 0));
+    char rwlink[512];
+    snprintf(rwlink, sizeof(rwlink), "%s.hardlink", rw);
+    n = with_paths(r, __NR_linkat, ro, 1, rwlink, 3);
+    r->args[0] = r->args[2] = AT_FDCWD;
+    report("f-link-ro-to-rw", request(ch, r, n, 0, 0, 0, 0));
+    /* /proc/self/fd flag with no FD attached; with a directory FD it does not name. */
+    n = with_paths(r, __NR_openat, "", 1, 0, 0);
+    r->args[0] = AT_FDCWD; r->flags = BROKER_MAGIC(1);
+    report("f-magic-nofd", request(ch, r, n, 0, 0, 0, 0));
+    /* Lengths beyond the message, unknown call numbers, truncated messages. */
+    n = with_paths(r, __NR_openat, rw, 1, 0, 0);
+    r->args[0] = AT_FDCWD; r->len[1] = 60000;
+    report("f-bad-length", request(ch, r, n, 0, 0, 0, 0));
+    n = with_paths(r, __NR_openat, rw, 1, 0, 0);
+    r->args[0] = AT_FDCWD; r->len[1] -= 1; /* not NUL-terminated */
+    report("f-unterminated", request(ch, r, n, 0, 0, 0, 0));
+    n = with_paths(r, __NR_execve, rw, 0, 0, 0);
+    report("f-unknown-nr", request(ch, r, n, 0, 0, 0, 0));
+    report("f-truncated", request(ch, r, 7, 0, 0, 0, 0));
+    n = with_paths(r, __NR_openat, rw, 1, 0, 0);
+    r->args[0] = AT_FDCWD; r->fds = 2; /* claims FDs it does not attach */
+    report("f-fd-count", request(ch, r, n, 0, 0, 0, 0));
+    /* A socket outside every tree. */
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    n = with_paths(r, BROKER_CONNECT_PATH, sock, 1, 0, 0);
+    report("f-connect-outside", request(ch, r, n, &s, 1, 0, 0));
+    /* A raw UNIX path address through the "any address" form. */
+    struct sockaddr_un a = {.sun_family = AF_UNIX};
+    strncpy(a.sun_path, sock, sizeof(a.sun_path) - 1);
+    memset(r, 0, sizeof(*r));
+    r->nr = __NR_connect; r->args[2] = sizeof(a); r->len[1] = sizeof(a); r->fds = 1;
+    memcpy(r + 1, &a, sizeof(a));
+    report("f-connect-raw-path", request(ch, r, sizeof(*r) + sizeof(a), &s, 1, 0, 0));
+    /* After all that the broker still serves a valid request. */
+    n = with_paths(r, __NR_openat, rw, 1, 0, 0);
+    r->args[0] = AT_FDCWD;
+    report("f-valid-after", request(ch, r, n, 0, 0, 0, 0) >= 1000);
+    open_read("f-hooked-after", "/rw/file", O_RDONLY);
+}
+
+/* The harness kills the broker processes between "ready" and the line it
+ * then writes to stdin. */
+static void list_fd(const char *label, long fd)
+{
+    report(label, fd < 0 ? fd : 0);
+    if (fd < 0) return;
+    char buf[4096];
+    long n = via(__NR_getdents64, fd, (long)buf, sizeof(buf), 0, 0, 0);
+    printf("%s-names=", label);
+    for (long off = 0; off < n;) {
+        unsigned short reclen = *(unsigned short *)(buf + off + 16);
+        printf("%s,", buf + off + 19);
+        off += reclen;
+    }
+    printf("\n");
+}
+
+/* A real directory held as O_PATH, opened again for reading. */
+static void reopen(const char *path)
+{
+    long held = hooked(__NR_openat, AT_FDCWD, (long)path, O_PATH | O_DIRECTORY, 0, 0, 0);
+    report("held", held < 0 ? held : 0);
+    if (held < 0) return;
+    char magic[64];
+    snprintf(magic, sizeof(magic), "/proc/self/fd/%ld", held);
+    list_fd("reopen-proc", hooked(__NR_openat, AT_FDCWD, (long)magic, O_RDONLY | O_DIRECTORY, 0, 0, 0));
+    payload_config_t *cfg = payload_config();
+    if (!cfg || !cfg->isolate) return;
+    int pair[2];
+    via(__NR_socketpair, AF_UNIX, SOCK_SEQPACKET, 0, (long)pair, 0, 0);
+    char hello = 'c', control[CMSG_SPACE(sizeof(int))];
+    struct iovec io = {&hello, 1};
+    struct msghdr m = {.msg_iov = &io, .msg_iovlen = 1, .msg_control = control,
+                       .msg_controllen = sizeof(control)};
+    struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+    h->cmsg_level = SOL_SOCKET; h->cmsg_type = SCM_RIGHTS; h->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(h), &pair[1], sizeof(int));
+    via(__NR_sendmsg, cfg->isolate_fd, (long)&m, 0, 0, 0, 0);
+    close(pair[1]);
+    struct broker_request *r = calloc(1, BROKER_MESSAGE_MAX);
+    size_t n = with_paths(r, __NR_openat, "", 1, 0, 0);
+    r->args[0] = AT_FDCWD; r->args[2] = O_RDONLY | O_DIRECTORY; r->flags = BROKER_MAGIC(1); r->fds = 1;
+    int fds[1] = {(int)held};
+    long rc = request(pair[0], r, n, fds, 1, 0, 0);
+    list_fd("reopen-forged", rc >= 1000 ? rc - 1000 : rc);
+}
+
+/* nr BROKER_LAZY_MOUNT: rel inside cache, of image; BROKER_LAZY_PATH:
+ * rel is a host path inside a --lower-image cache (image, cache unused). */
+static void lazy_forged(long nr, const char *image, const char *cache, const char *rel, long op, long times)
+{
+    payload_config_t *cfg = payload_config();
+    if (!cfg || !cfg->isolate) { report("isolated", 0); return; }
+    int pair[2];
+    via(__NR_socketpair, AF_UNIX, SOCK_SEQPACKET, 0, (long)pair, 0, 0);
+    char hello = 'c', control[CMSG_SPACE(sizeof(int))];
+    struct iovec io = {&hello, 1};
+    struct msghdr m = {.msg_iov = &io, .msg_iovlen = 1, .msg_control = control,
+                       .msg_controllen = sizeof(control)};
+    struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+    h->cmsg_level = SOL_SOCKET; h->cmsg_type = SCM_RIGHTS; h->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(h), &pair[1], sizeof(int));
+    via(__NR_sendmsg, cfg->isolate_fd, (long)&m, 0, 0, 0, 0);
+    close(pair[1]);
+    struct broker_request *r = calloc(1, BROKER_MESSAGE_MAX);
+    r->nr = nr;
+    r->args[1] = op;
+    char *data = (char *)(r + 1);
+    size_t used = 0;
+    const char *parts[4] = {rel, 0, nr == BROKER_LAZY_MOUNT ? image : 0, nr == BROKER_LAZY_MOUNT ? cache : 0};
+    for (int i = 0; i < 4; i++) {
+        if (!parts[i]) continue;
+        strcpy(data + used, parts[i]);
+        r->len[i] = strlen(parts[i]) + 1;
+        used += r->len[i];
+    }
+    if (times <= 0) {
+        report("lazy", request(pair[0], r, sizeof(*r) + used, 0, 0, 0, 0));
+        return;
+    }
+    printf("ready\n");
+    fflush(stdout);
+    char line[8];
+    if (!fgets(line, sizeof(line), stdin)) return;   /* the harness starts moving */
+    long rcs[8] = {0}, counts[8] = {0};
+    int kinds = 0;
+    for (long t = 0; t < times; t++) {
+        long rc = request(pair[0], r, sizeof(*r) + used, 0, 0, 0, 0);
+        int k = 0;
+        while (k < kinds && rcs[k] != rc) k++;
+        if (k == kinds && kinds < 8) rcs[kinds++] = rc;
+        if (k < 8) counts[k]++;
+    }
+    for (int k = 0; k < kinds; k++) printf("lazy-rc %ld %ld\n", rcs[k], counts[k]);
+}
+
+/* Calls on an FD the probe was given (--pass-fd or just inherited): a
+ * one-byte write, a read, a listing and a chmod to its own mode, each
+ * reported. */
+static void fd_ops(int fd)
+{
+    char buf[4096];
+    report("fd-write", sc(__NR_write, fd, (long)"x", 1, 0, 0, 0));
+    report("fd-read", sc(__NR_pread64, fd, (long)buf, 64, 0, 0, 0));
+    via(__NR_lseek, fd, 0, 0 /* SEEK_SET */, 0, 0, 0);   /* (the description is shared across runs) */
+    report("fd-list", sc(__NR_getdents64, fd, (long)buf, sizeof(buf), 0, 0, 0) > 0);
+    struct stat st;   /* (the mode it has: allowed or not, nothing changes) */
+    long rc = via(__NR_fstat, fd, (long)&st, 0, 0, 0, 0);
+    report("fd-chmod", rc < 0 ? rc : sc(__NR_fchmod, fd, st.st_mode & 07777, 0, 0, 0, 0));
+}
+
+static void after_broker_gone(const char *path)
+{
+    struct stat st;
+    open_read("after", path, O_RDONLY);
+    report("after-stat", hooked(__NR_newfstatat, AT_FDCWD, (long)path, (long)&st, 0, 0, 0));
+    pid_t pid = fork();
+    if (!pid) { open_read("after-child", path, O_RDONLY); _exit(0); }
+    waitpid(pid, 0, 0);
+}
+
+static long now_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1000000000l + t.tv_nsec;
+}
+
+/* Round-trip costs (ns/op): an empty request the broker refuses at once,
+ * an lstat of PATH (a host path) through the broker, the same lstat issued
+ * natively from the broker's point of view is not measurable here. */
+static void rtt(const char *path, const char *guest)
+{
+    payload_config_t *cfg = payload_config();
+    enum { N = 2000 };
+    long t0;
+    if (!cfg || !cfg->isolate)
+        goto guest;
+    int pair[2];
+    via(__NR_socketpair, AF_UNIX, SOCK_SEQPACKET, 0, (long)pair, 0, 0);
+    char hello = 'c', control[CMSG_SPACE(sizeof(int))];
+    struct iovec io = {&hello, 1};
+    struct msghdr m = {.msg_iov = &io, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof(control)};
+    struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+    h->cmsg_level = SOL_SOCKET; h->cmsg_type = SCM_RIGHTS; h->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(h), &pair[1], sizeof(int));
+    via(__NR_sendmsg, cfg->isolate_fd, (long)&m, 0, 0, 0, 0);
+    struct broker_request *r = calloc(1, BROKER_MESSAGE_MAX);
+    t0 = now_ns();
+    for (int i = 0; i < N; i++) { r->nr = 99999; request(pair[0], r, sizeof(*r), 0, 0, 0, 0); }
+    printf("empty %ld\n", (now_ns() - t0) / N);
+    size_t n = with_paths(r, __NR_newfstatat, path, 1, 0, 0);
+    r->args[0] = AT_FDCWD; r->args[3] = AT_SYMLINK_NOFOLLOW; r->len[2] = 128;
+    t0 = now_ns();
+    for (int i = 0; i < N; i++) request(pair[0], r, n, 0, 0, 0, 0);
+    printf("lstat %ld\n", (now_ns() - t0) / N);
+    n = with_paths(r, __NR_openat, path, 1, 0, 0);
+    r->args[0] = AT_FDCWD;
+    t0 = now_ns();
+    for (int i = 0; i < N; i++) { long fd = request(pair[0], r, n, 0, 0, 0, 0); if (fd >= 1000) close((int)fd - 1000); }
+    printf("open %ld\n", (now_ns() - t0) / N);
+guest:;
+    struct stat st;
+    t0 = now_ns();
+    for (int i = 0; i < N; i++) hooked(__NR_newfstatat, AT_FDCWD, (long)guest, (long)&st, 0, 0, 0);
+    printf("guest-stat %ld\n", (now_ns() - t0) / N);
+    t0 = now_ns();
+    for (int i = 0; i < N; i++) hooked(__NR_getppid, 0, 0, 0, 0, 0, 0);
+    printf("getppid %ld\n", (now_ns() - t0) / N);
+    int sp[2];
+    socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sp);
+    if (!fork()) { char b[64]; close(sp[0]); while (read(sp[1], b, 64) > 0) write(sp[1], b, 1); _exit(0); }
+    t0 = now_ns();
+    for (int i = 0; i < N; i++) { char b[64]; write(sp[0], b, 64); read(sp[0], b, 64); }
+    printf("pingpong %ld\n", (now_ns() - t0) / N);
+    /* The same with an FD back each time (SCM_RIGHTS), no broker involved. */
+    int fp[2];
+    socketpair(AF_UNIX, SOCK_SEQPACKET, 0, fp);
+    if (!fork()) {
+        close(fp[0]);
+        int file = open("/dev/null", O_RDONLY);
+        char b[64], control[CMSG_SPACE(sizeof(int))];
+        while (read(fp[1], b, 64) > 0) {
+            struct iovec io = {b, 1};
+            struct msghdr m = {.msg_iov = &io, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof(control)};
+            struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+            h->cmsg_level = SOL_SOCKET; h->cmsg_type = SCM_RIGHTS; h->cmsg_len = CMSG_LEN(sizeof(int));
+            memcpy(CMSG_DATA(h), &file, sizeof(int));
+            sendmsg(fp[1], &m, 0);
+        }
+        _exit(0);
+    }
+    t0 = now_ns();
+    for (int i = 0; i < N; i++) {
+        char b[64], control[CMSG_SPACE(sizeof(int))];
+        write(fp[0], b, 64);
+        struct iovec io = {b, 64};
+        struct msghdr m = {.msg_iov = &io, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof(control)};
+        recvmsg(fp[0], &m, 0);
+        int got; memcpy(&got, CMSG_DATA(CMSG_FIRSTHDR(&m)), sizeof(int));
+        close(got);
+    }
+    printf("pingpong-fd %ld\n", (now_ns() - t0) / N);
+    close(sp[0]); close(fp[0]);
+}
+
+static void killbroker(const char *path)
+{
+    char line[8];
+    open_read("before", path, O_RDONLY);
+    printf("ready\n");
+    fflush(stdout);
+    read(0, line, sizeof(line));
+    after_broker_gone(path);
+}
+
+/* The payload's own FDs closed from its svc (past the payload's guard):
+ * file access must fail, not fall back to direct calls. */
+static void cutoff(const char *path)
+{
+    payload_config_t *cfg = payload_config();
+    if (!cfg) { report("config-found", 0); return; }
+    open_read("before", path, O_RDONLY);
+    for (int fd = 900; fd < 964; fd++)
+        via(__NR_close, fd, 0, 0, 0, 0, 0);
+    report("close-control", via(__NR_close, cfg->isolate_fd, 0, 0, 0, 0, 0));
+    after_broker_gone(path);
+}
+
+/* closefrom as glibc does it first: close_range succeeds, ordinary FDs
+ * close, the payload's own stay (a path call still works). */
+static void closerange(const char *path)
+{
+    long a = hooked(__NR_openat, AT_FDCWD, (long)path, O_RDONLY, 0, 0, 0);
+    long b = hooked(__NR_dup, a, 0, 0, 0, 0, 0);
+    report("close_range", hooked(__NR_close_range, 3, ~0u, 0, 0, 0, 0));
+    report("closed", a >= 3 && b >= 3 && hooked(__NR_fcntl, a, F_GETFD, 0, 0, 0, 0) == -EBADF &&
+                     hooked(__NR_fcntl, b, F_GETFD, 0, 0, 0, 0) == -EBADF);
+    long c = hooked(__NR_openat, AT_FDCWD, (long)path, O_RDONLY, 0, 0, 0);
+    report("after-open", c < 0 ? c : 0);
+}
+
+/* Threads that come and go, each with its own channel: far more of them
+ * than there are channel slots. */
+static void *thread_stat(void *path)
+{
+    struct stat st;
+    return (void *)hooked(__NR_newfstatat, AT_FDCWD, (long)path, (long)&st, 0, 0, 0);
+}
+
+static void channels(const char *path)
+{
+    long errors = 0;
+    for (int i = 0; i < 200; i++) {
+        pthread_t t;
+        void *rc = (void *)-1;
+        if (pthread_create(&t, 0, thread_stat, (void *)path) || pthread_join(t, &rc) || rc)
+            errors++;
+    }
+    report("thread-errors", errors);
+    /* A vfork child's channel leaves the parent's alone. */
+    pid_t pid = vfork();
+    if (!pid) {
+        struct stat st;
+        hooked(__NR_newfstatat, AT_FDCWD, (long)path, (long)&st, 0, 0, 0);
+        _exit(0);
+    }
+    waitpid(pid, 0, 0);
+    struct stat st;
+    report("after-vfork", hooked(__NR_newfstatat, AT_FDCWD, (long)path, (long)&st, 0, 0, 0));
+    /* The listing holds the guest's FDs only. */
+    long dir = hooked(__NR_openat, AT_FDCWD, (long)"/proc/self/fd", O_RDONLY | O_DIRECTORY, 0, 0, 0);
+    long payload = 0, total = 0;
+    char buf[512];
+    long n;
+    while (dir >= 0 && (n = hooked(__NR_getdents64, dir, (long)buf, sizeof(buf), 0, 0, 0)) > 0)
+        for (long at = 0; at < n; at += *(unsigned short *)(buf + at + 16)) {
+            const char *name = buf + at + 19;
+            if (*name == '.')
+                continue;
+            total++;
+            payload += atoi(name) >= 898;
+        }
+    report("listed-fds", dir < 0 ? dir : total);
+    report("listed-payload-fds", payload);
+}
+
+/* This process's exe is the guest program, never the loader. */
+static void selfexe(void)
+{
+    char buf[256];
+    const char *links[] = {"/proc/self/exe", "/proc/thread-self/exe"};
+    for (int i = 0; i < 2; i++) {
+        long n = hooked(__NR_readlinkat, AT_FDCWD, (long)links[i], (long)buf, sizeof(buf) - 1, 0, 0);
+        buf[n > 0 ? n : 0] = 0;
+        report(i ? "thread-self-is-probe" : "self-is-probe", !strcmp(buf, "/iso-probe"));
+    }
+    struct stat a, b;
+    long fd = hooked(__NR_openat, AT_FDCWD, (long)"/proc/self/exe", O_RDONLY, 0, 0, 0);
+    report("same-file", fd >= 0 && !hooked(__NR_fstat, fd, (long)&a, 0, 0, 0, 0) &&
+                        !hooked(__NR_newfstatat, AT_FDCWD, (long)"/iso-probe", (long)&b, 0, 0, 0) &&
+                        a.st_ino == b.st_ino && a.st_dev == b.st_dev);
+}
+
+static void procs(void)
+{
+    pid_t parent = getppid();
+    char path[64], buf[64];
+    snprintf(path, sizeof(path), "/proc/%d/status", parent);
+    open_read("proc-other-status", path, O_RDONLY);
+    snprintf(path, sizeof(path), "/proc/%d/mem", parent);
+    open_read("proc-other-mem", path, O_RDONLY);
+    snprintf(path, sizeof(path), "/proc/%d/status", getpid());
+    open_read("proc-self-status", path, O_RDONLY);
+    open_read("proc-1-environ", "/proc/1/environ", O_RDONLY);
+    struct iovec local = {buf, sizeof(buf)}, remote = {(void *)PAYLOAD_FIXED_BASE, sizeof(buf)};
+    report("vm-readv", via(__NR_process_vm_readv, parent, (long)&local, 1, (long)&remote, 1, 0));
+    report("vm-writev", via(__NR_process_vm_writev, parent, (long)&local, 1, (long)&remote, 1, 0));
+    report("vm-readv-hooked", hooked(__NR_process_vm_readv, parent, (long)&local, 1, (long)&remote, 1, 0));
+    report("ptrace", via(__NR_ptrace, 16, parent, 0, 0, 0, 0));
+    long pidfd = via(434 /* pidfd_open */, parent, 0, 0, 0, 0, 0);
+    report("pidfd-getfd", pidfd < 0 ? pidfd : via(__NR_pidfd_getfd, pidfd, 0, 0, 0, 0, 0));
+    /* Seccomp field of this process (needs the /proc bind). */
+    int fd = open("/proc/self/status", O_RDONLY);
+    char st[4096];
+    long k = fd < 0 ? 0 : read(fd, st, sizeof(st) - 1);
+    st[k > 0 ? k : 0] = 0;
+    char *line = strstr(st, "Seccomp:");
+    if (line) printf("seccomp %ld\n", strtol(line + 8, 0, 10));
+}
+
+int main(int argc, char **argv)
+{
+    if (argc < 3) return 2;
+    find_gadget();
+    direct = argv[1][0] == 'd';
+    const char *op = argv[2], *p = argc > 3 ? argv[3] : 0, *q = argc > 4 ? argv[4] : 0;
+    if (!strcmp(op, "open")) open_read("open", p, (int)strtol(q, 0, 8));
+    else if (!strcmp(op, "list")) list(p);
+    else if (!strcmp(op, "rawlist")) rawlist(p, 0);
+    else if (!strcmp(op, "rawlistwait")) rawlist(p, 1);
+    else if (!strcmp(op, "reopen")) reopen(p);
+    else if (!strcmp(op, "lazy") && argc > 6)
+        lazy_forged(BROKER_LAZY_MOUNT, p, q, argv[5], atol(argv[6]), argc > 7 ? atol(argv[7]) : 0);
+    else if (!strcmp(op, "fdcalls") && p) fd_ops(atoi(p));
+    else if (!strcmp(op, "lazypath") && argc > 4)
+        lazy_forged(BROKER_LAZY_PATH, 0, 0, p, atol(q), argc > 5 ? atol(argv[5]) : 0);
+    else if (!strcmp(op, "exec")) {
+        char *args[] = {(char *)p, 0}, *env[] = {0};
+        long rc = direct ? via(281, AT_FDCWD, (long)p, (long)args, (long)env, 0, 0)
+                         : hooked(__NR_execve, (long)p, (long)args, (long)env, 0, 0, 0);
+        report("exec", rc);
+    } else if (!strcmp(op, "execfd")) {
+        long fd = hooked(__NR_openat, AT_FDCWD, (long)p, O_RDONLY, 0, 0, 0);
+        report("open", fd < 0 ? fd : 0);
+        char *args[] = {(char *)p, 0}, *env[] = {0};
+        if (fd >= 0) report("execfd", hooked(281, fd, (long)"", (long)args, (long)env, AT_EMPTY_PATH, 0));
+    } else if (!strcmp(op, "fdops")) fdops(p);
+    else if (!strcmp(op, "bind") || !strcmp(op, "connect")) report(op, unix_socket(op, p));
+    else if (!strcmp(op, "filter")) filter();
+    else if (!strcmp(op, "tamper")) tamper(p, q, argv[5]);
+    else if (!strcmp(op, "forge")) forge(p, q, argv[5], argv[6]);
+    else if (!strcmp(op, "killbroker")) killbroker(p);
+    else if (!strcmp(op, "cutoff")) cutoff(p);
+    else if (!strcmp(op, "rtt")) rtt(p, q);
+    else if (!strcmp(op, "procs")) procs();
+    else if (!strcmp(op, "closerange")) closerange(p);
+    else if (!strcmp(op, "channels")) channels(p);
+    else if (!strcmp(op, "selfexe")) selfexe();
+    else {
+        long rc = path_op(op, p, q);
+        if (rc == -9999) return 2;
+        report(op, rc);
+    }
+    return 0;
+}

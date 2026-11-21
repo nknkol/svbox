@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "default": "deny",
+  "mounts": [
+    {"source": "${BREW_PREFIX}", "access": "ro"},
+    {"source": "${WORKSPACE}", "target": "/workspace", "access": "rw"},
+    {"source": "/dev/null", "access": "rw"}
+  ],
+  "private": [
+    {"name": "home", "target": "/home/agent"},
+    {"name": "tmp", "target": "/tmp"},
+    {"name": "cache", "target": "/home/agent/.cache"}
+  ]
+}

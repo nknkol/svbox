@@ -1,0 +1,94 @@
+/* SPDX-License-Identifier: MIT */
+#ifndef ELF_FD_TABLE_H
+#define ELF_FD_TABLE_H
+#include <stddef.h>
+#include <stdint.h>
+
+/* Metadata only, not a syscall interceptor or a permission enforcement layer.
+ * Caller supplies exclusive access, storage and successful kernel events.
+ * Reserve capacity before publishing a new kernel FD in a future adapter.
+ * Unknown provenance must never be interpreted as read/write permission. */
+enum fd_access { FD_ACCESS_UNKNOWN, FD_ACCESS_RO, FD_ACCESS_RW };
+struct fd_origin {
+    uint64_t mount_id;
+    enum fd_access access;
+};
+struct fd_record {
+    int fd;                    /* -1 is unused */
+    int cloexec;               /* descriptor flag, not open-file status */
+    uint64_t generation;       /* changes on assignment, not F_SETFD */
+    uint64_t description;      /* duplicates share it; 0 means unknown */
+    struct fd_origin origin;
+    int pipe_writer;           /* Local capability; never exported in snapshots. */
+    int stream_reader;         /* Locally created non-file object; same lifetime. */
+    int local_writer;          /* Local socket/eventfd/memfd output grant; same lifetime. */
+    int passed;                /* --pass-fd object (fd_runtime admits it each start); same lifetime. */
+};
+/* Slots at and beyond `used` were never assigned and are not read: the
+ * storage of a large capacity is touched only as far as needed.
+ *
+ * Compact tables (fd_table_init) hold up to `capacity` records of any FD
+ * numbers, found by scanning the slots in use. Direct tables
+ * (fd_table_direct) hold FD n in slot n for n < capacity: every lookup is
+ * one index, and storage is touched up to the highest FD held. */
+struct fd_table {
+    struct fd_record *slots;
+    size_t capacity;
+    uint64_t serial;
+    size_t used;
+    size_t live;
+    size_t limit;   /* records held at most: capacity unless fd_table_limit */
+    int direct;
+};
+int fd_table_init(struct fd_table *, struct fd_record *, size_t);
+/* Make an empty table direct (it stays so across fd_table_reset). */
+int fd_table_direct(struct fd_table *);
+/* Hold at most limit records (<= capacity), whatever their FD numbers. */
+int fd_table_limit(struct fd_table *, size_t limit);
+/* Empty again: same storage, capacity, limit and mode; the serial restarts. */
+void fd_table_reset(struct fd_table *);
+/* Records in use, and the room left (the limit minus those). */
+size_t fd_table_live(const struct fd_table *);
+size_t fd_table_free(const struct fd_table *);
+const struct fd_record *fd_table_get(const struct fd_table *, int fd);
+/* Successful open/adoption. Distinct opens have distinct descriptions even
+ * when host inode and mount match. All errors leave the table unchanged. */
+int fd_table_open(struct fd_table *, int fd, struct fd_origin, int cloexec);
+/* Caller has just obtained a pipe2 write end from the kernel. Does not grant
+ * file mount provenance; copies through dup/fork and is cleared on exec. */
+int fd_table_open_pipe_writer(struct fd_table *, int fd, int cloexec);
+/* Caller has just created a non-file kernel object (pipe, socket, eventfd...).
+ * Reading it exposes no mount content. Copies through dup/fork, cleared on exec. */
+int fd_table_grant_stream(struct fd_table *, int fd);
+/* Output to a locally created socket, eventfd or memfd changes no mount
+ * content. Caller decides admission; same lifetime as the stream grant. */
+int fd_table_grant_local_writer(struct fd_table *, int fd);
+/* An FD the caller handed over with --pass-fd: its own capability (the
+ * kernel's access mode), outside the path policy. Same lifetime. */
+int fd_table_grant_passed(struct fd_table *, int fd);
+/* Imported FD with unknown provenance AND unknown open-description identity. */
+int fd_table_import_unknown(struct fd_table *, int fd, int cloexec);
+/* Successful dup/dup3/F_DUPFD. same-FD success is dup2's no-op. Unknown source
+ * replaces destination provenance with unknown rather than keeping old rights. */
+int fd_table_dup(struct fd_table *, int source, int target, int cloexec);
+int fd_table_set_cloexec(struct fd_table *, int fd, int cloexec);
+void fd_table_close(struct fd_table *, int fd);
+/* Delayed removal after a separately established close/reconciliation outcome.
+ * Capture the generation under exclusion before kernel entry (0 if untracked),
+ * then reenter exclusion to commit. Matching records are removed; absent records
+ * are already reconciled; a newer record returns ESTALE and is left unchanged.
+ * This is metadata ordering protection, NOT an atomic check-and-close: callers
+ * must separately prevent/reconcile reuse BEFORE the kernel close, retain the
+ * same table incarnation, and classify kernel errors. Never retry kernel close
+ * merely because metadata commit was delayed. ESTALE is bookkeeping status,
+ * not a replacement for the kernel return value. Unknown provenance is no grant. */
+int fd_table_close_generation(struct fd_table *, int fd, uint64_t generation);
+/* Call only for a successfully applied range; UNSHARE is adapter-owned. */
+int fd_table_range(struct fd_table *, unsigned first, unsigned last, int cloexec);
+void fd_table_exec(struct fd_table *);
+/* Snapshot into an initialized, empty table with disjoint storage. Used for
+ * copied kernel FD tables; actual shared kernel tables require the SAME table.
+ * Do not infer sharing solely from clone flags on this host. IDs are local
+ * to a table lineage, not globally unique between independent fork branches. */
+int fd_table_copy(struct fd_table *destination, const struct fd_table *source);
+#endif

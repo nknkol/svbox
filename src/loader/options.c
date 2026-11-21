@@ -1,0 +1,452 @@
+/* SPDX-License-Identifier: MIT */
+/* Command line: options end at "--" or at the first non-option, which is
+ * the program to run. Every invalid option is fatal. */
+#include <asm/unistd.h>
+#include "loader.h"
+
+static int is(const char *arg, const char *name)
+{
+	size_t n = z_strlen(name);
+	return z_strncmp(arg, name, n + 1) == 0;
+}
+
+static const char *value(int argc, char **argv, int *i)
+{
+	if (*i + 1 >= argc || !argv[*i + 1][0])
+		z_errx(1, "missing value for %s", argv[*i]);
+	return argv[++*i];
+}
+
+static unsigned long number(const char *s, unsigned long max, const char *what)
+{
+	unsigned long v = 0;
+	if (!*s)
+		z_errx(1, "invalid %s", what);
+	for (; *s; s++) {
+		if (*s < '0' || *s > '9' || v > (max - (unsigned long)(*s - '0')) / 10)
+			z_errx(1, "invalid %s", what);
+		v = v * 10 + (unsigned long)(*s - '0');
+	}
+	return v;
+}
+
+/* "u:u:...": exactly count unsigned 32-bit values separated by sep. */
+static int numbers(const char *s, char sep, uint32_t *out, int max, int exact)
+{
+	int count = 0;
+	for (;;) {
+		unsigned long long v = 0;
+		const char *start = s;
+		while (*s >= '0' && *s <= '9' && v <= 0xffffffffull)
+			v = v * 10 + (unsigned)(*s++ - '0');
+		if (s == start || v > 0xffffffffull || count == max || (*s && *s != sep))
+			return -1;
+		out[count++] = (uint32_t)v;
+		if (!*s)
+			break;
+		s++;
+	}
+	return exact && count != exact ? -1 : count;
+}
+
+static void add_bind(payload_config_t *cfg, const char *spec)
+{
+	const char *colon = z_strchr(spec, ':');
+	if (!colon || colon == spec || !colon[1])
+		z_errx(1, "volume needs host:guest");
+	if (cfg->bind_count >= CONFIG_MAX_BINDS)
+		z_errx(1, "too many volumes");
+	struct bind_entry *b = &cfg->binds[cfg->bind_count++];
+	copy_substr(b->dst, CONFIG_MAX_PATH, spec, (size_t)(colon - spec));
+	copy_cstr(b->src, CONFIG_MAX_PATH, colon + 1);
+}
+
+#ifdef GUARDED
+static int pass_fd_given, passed_fds_given;
+
+/* --pass-fd N: the object open at N now (refused when N is not open or a
+ * number the runtime holds); repeats of a number count once. */
+static void pass_fd(payload_config_t *cfg, const char *v)
+{
+	unsigned long n = number(v, 2147483647ul, "--pass-fd value (an open FD number)");
+	if (n >= CONFIG_RESERVED_FD_MIN)
+		z_errx(1, "--pass-fd %s: FDs from %d up are the runtime's own", v, CONFIG_RESERVED_FD_MIN);
+	for (int k = 0; k < cfg->passed_count; k++)
+		if (cfg->passed[k].fd == (int32_t)n)
+			return;
+	struct stat st;
+	long flags = z_syscall(__NR_fcntl, (long)n, 3 /* F_GETFL */, 0, 0, 0, 0);
+	if (flags < 0 || z_syscall(__NR_fstat, (long)n, (long)&st, 0, 0, 0, 0) < 0)
+		z_errx(1, "--pass-fd %s: not an open FD", v);
+	if (cfg->passed_count >= CONFIG_MAX_PASSED_FDS)
+		z_errx(1, "too many --pass-fd (at most %d)", CONFIG_MAX_PASSED_FDS);
+	struct passed_fd *p = &cfg->passed[cfg->passed_count++];
+	p->fd = (int32_t)n;
+	p->flags = (uint32_t)flags & (3u /* O_ACCMODE */ | 02000u /* O_APPEND */);
+	p->dev = st.st_dev;
+	p->ino = st.st_ino;
+}
+
+static const char *u64_field(const char *s, char end, uint64_t *out)
+{
+	uint64_t v = 0;
+	const char *start = s;
+	while (*s >= '0' && *s <= '9') {
+		if (v > (~0ull - (uint64_t)(*s - '0')) / 10)
+			return 0;
+		v = v * 10 + (uint64_t)(*s++ - '0');
+	}
+	if (s == start || *s != end)
+		return 0;
+	*out = v;
+	return s;
+}
+
+/* --passed-fds FD:FLAGS:DEV:INO,...: the initial loader's records. */
+static void passed_fds(payload_config_t *cfg, const char *s)
+{
+	for (;;) {
+		uint64_t f[4];
+		const char *p = s;
+		for (int k = 0; k < 4 && p; k++) {
+			char end = k < 3 ? ':' : (z_strchr(p, ',') ? ',' : 0);
+			p = u64_field(p, end, &f[k]);
+			if (p && k < 3)
+				p++;
+		}
+		if (!p || f[0] >= CONFIG_RESERVED_FD_MIN || cfg->passed_count >= CONFIG_MAX_PASSED_FDS)
+			z_errx(1, "invalid passed fds");
+		cfg->passed[cfg->passed_count++] = (struct passed_fd){(int32_t)f[0], (uint32_t)f[1], f[2], f[3]};
+		if (!*p)
+			return;
+		s = p + 1;
+	}
+}
+
+static int guarded_option(const char *arg, payload_config_t *cfg, int argc, char **argv, int *i)
+{
+	if (is(arg, "--pass-fd")) {
+		pass_fd_given = 1;
+		pass_fd(cfg, value(argc, argv, i));
+		return 1;
+	}
+	if (is(arg, CONFIG_CHILD_PASSED_FDS)) {
+		if (passed_fds_given)
+			z_errx(1, "duplicate passed fds");
+		passed_fds_given = 1;
+		passed_fds(cfg, value(argc, argv, i));
+		return 1;
+	}
+	if (is(arg, "--observe-mount-access") || is(arg, "--guard-path-mutations") ||
+	    is(arg, "--guard-file-mutations") || is(arg, "--guard-file-access")) {
+		if (cfg->mount_access_observe[0])
+			z_errx(1, "duplicate mount access observation");
+		if (*i + 1 >= argc)
+			z_errx(1, "missing mount access observation");
+		const char *v = argv[++*i];
+		size_t count = z_strlen(v);
+		if (!count || count > CONFIG_MAX_BINDS + 1)
+			z_errx(1, "invalid mount access observation length");
+		for (size_t j = 0; j < count; j++)
+			if (v[j] != 'd' && v[j] != 'r' && v[j] != 'w')
+				z_errx(1, "invalid mount access observation value");
+		copy_cstr(cfg->mount_access_observe, sizeof(cfg->mount_access_observe), v);
+		cfg->guard = is(arg, "--guard-file-access") ? GUARD_READS :
+			is(arg, "--guard-file-mutations") ? GUARD_FILES :
+			is(arg, "--guard-path-mutations") ? GUARD_PATHS : GUARD_OBSERVE;
+		return 1;
+	}
+	static const struct { const char *name, *what; size_t offset; } flags[] = {
+		{"--allow-stream-input", "stream input", offsetof(payload_config_t, allow_stream_input)},
+		{"--revalidate-file-fds", "file FD revalidation",
+		 offsetof(payload_config_t, revalidate_file_fds)},
+		{"--allow-local-output", "local output", offsetof(payload_config_t, allow_local_output)},
+		{"--allow-pipe-output", "pipe output", offsetof(payload_config_t, allow_pipe_output)},
+		{"--allow-stdio-output", "stdio output", offsetof(payload_config_t, allow_stdio_output)},
+	};
+	for (size_t k = 0; k < sizeof(flags) / sizeof(flags[0]); k++) {
+		if (!is(arg, flags[k].name))
+			continue;
+		int32_t *flag = (int32_t *)((char *)cfg + flags[k].offset);
+		if (*flag)
+			z_errx(1, "duplicate %s option", flags[k].what);
+		*flag = 1;
+		return 1;
+	}
+	if (is(arg, "--fd-state")) {
+		cfg->fd_state = (int32_t)number(value(argc, argv, i), 2147483647ul, "fd state");
+		return 1;
+	}
+	if (is(arg, "--fd-capacity")) {
+		cfg->fd_capacity = (int32_t)number(value(argc, argv, i), 1ul << 20, "fd capacity");
+		if (!cfg->fd_capacity)
+			z_errx(1, "fd capacity must be positive");
+		return 1;
+	}
+	return 0;
+}
+
+/* Guarded options only make sense together. */
+static void check_guarded(const payload_config_t *cfg, const struct loader_options *opt)
+{
+	if (cfg->mount_access_observe[0] &&
+	    z_strlen(cfg->mount_access_observe) != (size_t)cfg->bind_count + 1)
+		z_errx(1, "mount access observation requires root plus every bind");
+	if (cfg->revalidate_file_fds && cfg->guard < GUARD_FILES)
+		z_errx(1, "file FD revalidation requires file mutation guard");
+	if (cfg->allow_local_output && cfg->guard < GUARD_FILES)
+		z_errx(1, "local output requires file mutation guard");
+	if (cfg->allow_pipe_output && cfg->guard < GUARD_FILES)
+		z_errx(1, "pipe output requires file mutation guard");
+	if (cfg->allow_stdio_output && cfg->guard < GUARD_FILES)
+		z_errx(1, "stdio output requires file mutation guard");
+	if (cfg->allow_stream_input && cfg->guard != GUARD_READS)
+		z_errx(1, "stream input requires file access guard");
+	if (cfg->fd_state >= 0 && !opt->child)
+		z_errx(1, "fd state requires child loader");
+	if (pass_fd_given && opt->child)
+		z_errx(1, "--pass-fd is for the initial loader (child loaders get passed fds)");
+	if (passed_fds_given && !opt->child)
+		z_errx(1, "passed fds require child loader");
+	if (cfg->passed_count && cfg->guard < GUARD_FILES)
+		z_errx(1, "--pass-fd requires file mutation guard");
+	if (opt->exec_interp && (!opt->child || cfg->guard != GUARD_READS))
+		z_errx(1, "exec interpreter requires file access child loader");
+}
+#endif
+
+void options_parse(int argc, char **argv, payload_config_t *cfg, struct loader_options *opt)
+{
+	int mode_explicit = 0;
+	z_memset(opt, 0, sizeof(*opt));
+	opt->exec_fd = -1;
+	opt->exec_interp_fd = -1;
+	opt->target = argc;
+	z_memset(cfg, 0, sizeof(*cfg));
+	cfg->mode = CONFIG_MODE_COMPAT;
+	cfg->fake_group_count = -1;
+	cfg->fd_state = -1;
+	cfg->loader_fd = -1;
+	cfg->mount_table_fd = -1;
+	cfg->owner_db_fd = -1;
+
+	for (int i = 1; i < argc; i++) {
+		const char *arg = argv[i];
+		if (arg[0] != '-' || !arg[1]) {
+			opt->target = i;
+			break;
+		}
+		if (is(arg, "--")) {
+			opt->target = i + 1;
+			break;
+		}
+		if (is(arg, "--mode")) {
+			const char *v = value(argc, argv, &i);
+			if (is(v, "container"))
+				cfg->mode = CONFIG_MODE_CONTAINER;
+			else if (is(v, "compat"))
+				cfg->mode = CONFIG_MODE_COMPAT;
+			else
+				z_errx(1, "invalid mode %s (expect compat|container)", v);
+			mode_explicit = 1;
+		} else if (is(arg, "--root")) {
+			copy_cstr(cfg->root, CONFIG_MAX_PATH, value(argc, argv, &i));
+			/* A root implies container mode unless a mode is given. */
+			if (!mode_explicit)
+				cfg->mode = CONFIG_MODE_CONTAINER;
+		} else if (is(arg, "--lower")) {
+			/* R6: a read-only layer under the root (topmost first). */
+			const char *v = value(argc, argv, &i);
+			if (v[0] != '/' || z_strlen(v) >= CONFIG_MAX_PATH)
+				z_errx(1, "--lower needs an absolute host directory");
+			if (cfg->lower_count >= CONFIG_MAX_LOWERS)
+				z_errx(1, "too many --lower layers (at most %d)", CONFIG_MAX_LOWERS);
+			copy_cstr(cfg->lower[cfg->lower_count++], CONFIG_MAX_PATH, v);
+		} else if (is(arg, "--lower-image")) {
+			/* R6: the preceding --lower is the cache of this layer image. */
+			const char *v = value(argc, argv, &i);
+			if (v[0] != '/' || z_strlen(v) >= CONFIG_MAX_PATH)
+				z_errx(1, "--lower-image needs an absolute host file");
+			if (!cfg->lower_count || cfg->lower_image[cfg->lower_count - 1][0])
+				z_errx(1, "--lower-image follows the --lower that is its cache");
+			copy_cstr(cfg->lower_image[cfg->lower_count - 1], CONFIG_MAX_PATH, v);
+		} else if (is(arg, "--net-addr")) {
+			/* Container networks: the container's address (net_view.h). */
+			const char *v = value(argc, argv, &i);
+			uint32_t ip = 0, part = 0;
+			int dots = 0, digits = 0;
+			for (const char *p = v; *p; p++) {
+				if (*p >= '0' && *p <= '9' && digits < 3) { part = part * 10 + (uint32_t)(*p - '0'); digits++; }
+				else if (*p == '.' && digits && dots < 3) { ip = ip << 8 | part; part = 0; digits = 0; dots++; }
+				else z_errx(1, "--net-addr needs a dotted IPv4 address");
+				if (part > 255) z_errx(1, "--net-addr needs a dotted IPv4 address");
+			}
+			if (dots != 3 || !digits || ((ip << 8 | part) & 0xff800000u) != 0x7f800000u)
+				z_errx(1, "--net-addr needs an address of 127.128.0.0/9");
+			cfg->net_addr = ip << 8 | part;
+		} else if (is(arg, "--net-peers")) {
+			const char *v = value(argc, argv, &i);
+			if (v[0] != '/' || z_strlen(v) >= CONFIG_MAX_PATH)
+				z_errx(1, "--net-peers needs an absolute host file");
+			copy_cstr(cfg->net_peers, CONFIG_MAX_PATH, v);
+		} else if (is(arg, "-v") || is(arg, "--volume")) {
+			add_bind(cfg, value(argc, argv, &i));
+		} else if (is(arg, "-e") || is(arg, "--env")) {
+			const char *kv = value(argc, argv, &i);
+			if (!z_strchr(kv, '='))
+				z_errx(1, "env needs KEY=VALUE");
+			if (opt->env_count >= LOADER_MAX_ENVS)
+				z_errx(1, "too many env entries");
+			opt->envs[opt->env_count++] = kv;
+		} else if (is(arg, "--log")) {
+			cfg->log_level = (int32_t)number(value(argc, argv, &i), LOG_LEVEL_DEBUG, "log level");
+		} else if (is(arg, "--payload")) {
+			opt->payload = value(argc, argv, &i);
+		} else if (is(arg, "--link-copy")) {
+			cfg->link_copy = 1;
+		} else if (is(arg, "--seccomp-backstop")) {
+			cfg->seccomp_backstop = 1;
+		} else if (is(arg, "--isolate")) {
+			opt->isolate = 1;
+		} else if (is(arg, "--isolate-device")) {
+			const char *v = value(argc, argv, &i);
+			int index = z_strlen(v) < ISOLATE_PATH_MAX ? isolate_device_index(v) : -1;
+			if (index < 0)
+				z_errx(1, "unsupported isolated device %s", v);
+			cfg->device_mask |= 1u << index;
+		} else if (is(arg, CONFIG_CHILD_ISOLATE_DEVICES)) {
+			unsigned long mask = number(value(argc, argv, &i), (1ul << ISOLATE_DEVICES) - 1,
+						    "isolated devices");
+			cfg->device_mask = (uint32_t)mask;
+		} else if (is(arg, "--guest-filter-dump")) {
+			opt->filter_dump = 1;
+		} else if (is(arg, CONFIG_CHILD_ISOLATE_FD)) {
+			cfg->isolate = 1;
+			cfg->isolate_fd = (int32_t)number(value(argc, argv, &i), 2147483647ul, "isolate fd");
+		} else if (is(arg, CONFIG_CHILD_LOADER_FD)) {
+			cfg->loader_fd = (int32_t)number(value(argc, argv, &i), 2147483647ul, "loader fd");
+		} else if (is(arg, CONFIG_CHILD_EXEC_INTERP_FD)) {
+			opt->exec_interp_fd = (int)number(value(argc, argv, &i), 2147483647ul, "interpreter fd");
+		} else if (is(arg, CONFIG_CHILD_LOADER_PATH)) {
+			const char *v = value(argc, argv, &i);
+			if (v[0] != '/' || z_strlen(v) >= CONFIG_MAX_PATH)
+				z_errx(1, "invalid value for %s", arg);
+			copy_cstr(cfg->loader_path, CONFIG_MAX_PATH, v);
+		} else if (is(arg, CONFIG_CHILD_OWNERS)) {
+			uint32_t ids[CONFIG_OWNERS * 2];
+			const char *v = value(argc, argv, &i);
+			char pairs[CONFIG_OWNERS * 24];
+			copy_cstr(pairs, sizeof(pairs), v);
+			for (char *c = pairs; *c; c++)
+				if (*c == ',')
+					*c = ':';
+			int n = numbers(pairs, ':', ids, CONFIG_OWNERS * 2, 0);
+			if (n < 2 || n % 2)
+				z_errx(1, "invalid value for %s", arg);
+			cfg->owner_count = n / 2;
+			for (int k = 0; k < n / 2; k++) {
+				cfg->owners[k][0] = ids[2 * k];
+				cfg->owners[k][1] = ids[2 * k + 1];
+			}
+		} else if (is(arg, CONFIG_CHILD_CASE_FOLDS)) {
+			opt->case_folds = value(argc, argv, &i);
+		} else if (is(arg, "--hostname")) {
+			const char *v = value(argc, argv, &i);
+			if (z_strlen(v) >= sizeof(cfg->hostname))
+				z_errx(1, "invalid value for %s", arg);
+			copy_cstr(cfg->hostname, sizeof(cfg->hostname), v);
+		} else if (is(arg, "--emulate-mounts")) {
+			opt->emulate_mounts = 1;
+		} else if (is(arg, "--mount-table")) {
+			opt->mount_table = value(argc, argv, &i);
+		} else if (is(arg, CONFIG_CHILD_MOUNT_SCRATCH)) {
+			const char *v = value(argc, argv, &i);
+			/* Room for the "/tmpfs-<pid>-<n>" names below it. */
+			if (v[0] != '/' || z_strlen(v) >= CONFIG_MAX_PATH - 48)
+				z_errx(1, "invalid value for %s", arg);
+			copy_cstr(cfg->mount_scratch, CONFIG_MAX_PATH, v);
+		} else if (is(arg, CONFIG_CHILD_MOUNT_TABLE_FD)) {
+			cfg->mount_table_fd = (int32_t)number(value(argc, argv, &i), 2147483647ul, "mount table fd");
+		} else if (is(arg, "--owner-db")) {
+			opt->owner_db = value(argc, argv, &i);
+		} else if (is(arg, CONFIG_CHILD_OWNER_DB_FD)) {
+			cfg->owner_db_fd = (int32_t)number(value(argc, argv, &i), 2147483647ul, "owner db fd");
+		} else if (is(arg, "--cwd")) {
+			const char *v = value(argc, argv, &i);
+			if (v[0] != '/' || z_strlen(v) >= CONFIG_MAX_PATH)
+				z_errx(1, "--cwd needs an absolute guest path");
+			opt->cwd = v;
+		} else if (is(arg, "--user")) {
+			/* UID[:GID]: real, effective, saved and fs ids; the group is
+			 * also the only supplementary group. */
+			uint32_t ids[2];
+			const char *v = value(argc, argv, &i);
+			int n = numbers(v, ':', ids, 2, 0);
+			if (n < 1)
+				z_errx(1, "--user needs UID[:GID]");
+			for (int k = 0; k < 4; k++) {
+				cfg->fake_ids[k] = ids[0];
+				cfg->fake_ids[4 + k] = n > 1 ? ids[1] : 0;
+			}
+			cfg->fake_group_count = 1;
+			cfg->fake_groups[0] = n > 1 ? ids[1] : 0;
+		} else if (is(arg, "--kernel-release") || is(arg, "--kernel-sysname")) {
+			char *field = arg[9] == 'r' ? cfg->kernel_release : cfg->kernel_sysname;
+			const char *v = value(argc, argv, &i);
+			if (z_strlen(v) >= sizeof(cfg->kernel_release))
+				z_errx(1, "invalid value for %s", arg);
+			copy_cstr(field, sizeof(cfg->kernel_release), v);
+		} else if (is(arg, CONFIG_CHILD_LOADER_ARG)) {
+			opt->child = 1;
+		} else if (is(arg, CONFIG_CHILD_EXEC_TARGET)) {
+			opt->exec_target = value(argc, argv, &i);
+		} else if (is(arg, CONFIG_CHILD_EXEC_PATH)) {
+			opt->exec_path = value(argc, argv, &i);
+		} else if (is(arg, CONFIG_CHILD_EXEC_FD)) {
+			opt->exec_fd = (int)number(value(argc, argv, &i), 2147483647ul, "exec fd");
+		} else if (is(arg, CONFIG_CHILD_EXEC_NAME)) {
+			opt->exec_name = value(argc, argv, &i);
+		} else if (is(arg, CONFIG_CHILD_EXEC_EXE) || is(arg, CONFIG_CHILD_EXEC_INTERP)) {
+			const char *v = value(argc, argv, &i);
+			if (v[0] != '/')
+				z_errx(1, "invalid value for %s", arg);
+			*(is(arg, CONFIG_CHILD_EXEC_EXE) ? &opt->exec_exe : &opt->exec_interp) = v;
+		} else if (is(arg, CONFIG_CHILD_GLUE_DIR)) {
+			const char *v = value(argc, argv, &i);
+			if (v[0] != '/' || z_strlen(v) >= CONFIG_MAX_PATH)
+				z_errx(1, "invalid value for %s", arg);
+			copy_cstr(cfg->glue_dir, CONFIG_MAX_PATH, v);
+		} else if (is(arg, CONFIG_CHILD_FAKE_IDS)) {
+			if (numbers(value(argc, argv, &i), ':', cfg->fake_ids, 8, 8) < 0)
+				z_errx(1, "invalid value for %s", arg);
+		} else if (is(arg, CONFIG_CHILD_FAKE_GROUPS)) {
+			const char *v = value(argc, argv, &i);
+			int count = is(v, "-") ? 0 : numbers(v, ',', cfg->fake_groups, 32, 0);
+			if (count < 0)
+				z_errx(1, "invalid value for %s", arg);
+			cfg->fake_group_count = count;
+		}
+#ifdef GUARDED
+		else if (guarded_option(arg, cfg, argc, argv, &i)) {
+		}
+#endif
+		else {
+			z_errx(1, "unknown option %s", arg);
+		}
+	}
+	if (((opt->emulate_mounts || opt->mount_table) && cfg->mount_table_fd >= 0) ||
+	    (opt->emulate_mounts && opt->mount_table) || (opt->owner_db && cfg->owner_db_fd >= 0))
+		z_errx(1, "container state given twice");
+	if (cfg->mount_scratch[0] && !opt->emulate_mounts && !opt->mount_table && cfg->mount_table_fd < 0)
+		z_errx(1, "--mount-scratch requires --emulate-mounts");
+	if (cfg->lower_count && !cfg->root[0])
+		z_errx(1, "--lower requires --root (the writable upper layer)");
+	if (cfg->device_mask && !opt->isolate && !cfg->isolate && !opt->filter_dump)
+		z_errx(1, "--isolate-device requires --isolate");
+#ifdef GUARDED
+	check_guarded(cfg, opt);
+#else
+	if (opt->exec_interp)
+		z_errx(1, "exec interpreter requires file access child loader");
+#endif
+}

@@ -1,0 +1,438 @@
+/* SPDX-License-Identifier: MIT */
+/* Loader entry: load the payload and the program (with its interpreter),
+ * hand the payload its configuration, rebuild the initial stack for the
+ * program and jump to it. The same binary runs every guest exec again
+ * (--child-loader, arguments from the payload). */
+#include <asm/unistd.h>
+#include "loader.h"
+#include "elf_abi.h"
+
+static void z_fini(void)
+{
+}
+
+/* The program's environment: the host's in compat mode and for every guest
+ * exec (the guest passed it), only -e entries for a fresh container; -e
+ * entries replace variables of the same name. */
+static char **environment(const payload_config_t *cfg, const struct loader_options *opt,
+			  char **host, int *count)
+{
+	int n = 0, keep = cfg->mode == CONFIG_MODE_COMPAT || opt->child;
+	while (keep && host[n])
+		n++;
+	size_t bytes = (size_t)(n + opt->env_count + 1) * sizeof(char *);
+	char **env = z_mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (env == (void *)-1)
+		z_errx(1, "out of memory");
+	for (int i = 0; i < n; i++)
+		env[i] = host[i];
+	for (int i = 0; i < opt->env_count; i++) {
+		const char *kv = opt->envs[i];
+		size_t key = (size_t)(z_strchr(kv, '=') - kv) + 1;
+		int j = 0;
+		while (j < n && z_strncmp(env[j], kv, key))
+			j++;
+		env[j] = (char *)kv;
+		if (j == n)
+			n++;
+	}
+	env[n] = NULL;
+	*count = n;
+	return env;
+}
+
+/* PRoot's glue lives in PROOT_TMP_DIR, else TMPDIR, else /tmp; the exec
+ * chain keeps the initial choice whatever the guest environment. */
+static void choose_glue_dir(payload_config_t *cfg, char **env)
+{
+	static const char *const keys[] = {"PROOT_TMP_DIR=", "TMPDIR="};
+	for (int k = 0; k < 2; k++) {
+		size_t len = z_strlen(keys[k]);
+		for (char **e = env; *e; e++)
+			if (!z_strncmp(*e, keys[k], len) && (*e)[len] == '/' &&
+			    z_strlen(*e + len) < CONFIG_MAX_PATH) {
+				copy_cstr(cfg->glue_dir, CONFIG_MAX_PATH, *e + len);
+				return;
+			}
+	}
+	copy_cstr(cfg->glue_dir, CONFIG_MAX_PATH, "/tmp");
+}
+
+/* /proc/self/exe in guest terms: named by the exec chain, else the initial
+ * target (relative to the root, or to the cwd without one). */
+static void choose_exec_exe(payload_config_t *cfg, const struct loader_options *opt,
+			    const char *file)
+{
+	const char *named = opt->exec_exe ? opt->exec_exe : opt->exec_path;
+	if (named) {
+		copy_cstr(cfg->exec_exe, CONFIG_MAX_PATH, named);
+		return;
+	}
+	while (file[0] == '.' && file[1] == '/')
+		for (file += 2; *file == '/'; file++)
+			;
+	if (file[0] == '/') {
+		copy_cstr(cfg->exec_exe, CONFIG_MAX_PATH, file);
+	} else if (cfg->root[0]) {
+		cfg->exec_exe[0] = '/';
+		copy_cstr(cfg->exec_exe + 1, CONFIG_MAX_PATH - 1, file);
+	} else if (z_getcwd(cfg->exec_exe, CONFIG_MAX_PATH)) {
+		join_paths(cfg->exec_exe, CONFIG_MAX_PATH, cfg->exec_exe,
+			   z_strlen(cfg->exec_exe), file);
+	}
+}
+
+/* Address of the program headers in the loaded image (AT_PHDR), computed
+ * as the kernel does: PT_PHDR, else relative to the first PT_LOAD. */
+static unsigned long phdr_address(const Elf_Ehdr *ehdr, const Elf_Phdr *phdr, unsigned long bias)
+{
+	for (int i = 0; i < ehdr->e_phnum; i++)
+		if (phdr[i].p_type == PT_PHDR)
+			return bias + phdr[i].p_vaddr;
+	for (int i = 0; i < ehdr->e_phnum; i++)
+		if (phdr[i].p_type == PT_LOAD)
+			return bias + phdr[i].p_vaddr - phdr[i].p_offset + ehdr->e_phoff;
+	return 0;
+}
+
+struct image {
+	Elf_Ehdr ehdr;
+	Elf_Phdr phdr[ELF_MAX_PHNUM];
+	unsigned long bias, entry;
+};
+
+/* From a path, or (fd >= 0) from a descriptor opened by the broker. */
+static void load(struct image *img, const char *path, int fd, unsigned long payload_entry)
+{
+	if (fd < 0)
+		fd = z_openat(AT_FDCWD, path, O_RDONLY);
+	if (fd < 0)
+		z_errx(1, "can't open %s", path);
+	elf_read_headers(fd, &img->ehdr, img->phdr, path);
+	img->bias = elf_load_image(fd, &img->ehdr, img->phdr, payload_entry, path);
+	img->entry = img->bias + img->ehdr.e_entry;
+	z_close(fd);
+}
+
+/* Isolation mode: the case-alias marks the initial loader computed. */
+static void set_case_folds(payload_config_t *cfg, const char *folds)
+{
+	for (int i = 0; i < cfg->bind_count && *folds; i++) {
+		unsigned long v = 0;
+		while (*folds >= '0' && *folds <= '9' && v < CONFIG_MAX_PATH)
+			v = v * 10 + (unsigned long)(*folds++ - '0');
+		if (*folds && *folds != ',')
+			z_errx(1, "invalid value for " CONFIG_CHILD_CASE_FOLDS);
+		if (*folds)
+			folds++;
+		cfg->binds[i].fold = (uint32_t)v;
+	}
+}
+
+/* PT_INTERP of the program, as a host path: the payload resolved it for a
+ * guarded child (read policy, guest symlinks); otherwise it is resolved
+ * through the root and binds here. NULL for a static program. */
+static const char *interpreter(const struct image *prog, const char *file,
+			       const payload_config_t *cfg, const struct loader_options *opt,
+			       char *out, size_t cap)
+{
+	for (int i = 0; i < prog->ehdr.e_phnum; i++) {
+		const Elf_Phdr *p = &prog->phdr[i];
+		if (p->p_type != PT_INTERP)
+			continue;
+		if (opt->exec_interp)
+			return opt->exec_interp;
+		/* Isolation mode: the payload sent it as an FD (no path calls here). */
+		if (opt->exec_interp_fd >= 0)
+			return "(interpreter)";
+		if (opt->child && cfg->isolate)
+			z_errx(1, "interpreter not opened by the payload");
+#ifdef GUARDED
+		/* A target swapped after the payload's check must not fall back to
+		 * lexical mapping and bypass the read policy. */
+		if (opt->child && cfg->guard == GUARD_READS)
+			z_errx(1, "interpreter not authorized by payload");
+#endif
+		char name[CONFIG_MAX_PATH + 1];
+		int fd = z_openat(AT_FDCWD, file, O_RDONLY);
+		if (fd < 0 || z_lseek(fd, (off_t)p->p_offset, SEEK_SET) < 0 ||
+		    z_read(fd, name, p->p_filesz) != (ssize_t)p->p_filesz ||
+		    name[p->p_filesz - 1] != '\0')
+			z_errx(1, "bogus interp segment %s", file);
+		z_close(fd);
+		const char *host = resolve_interp_path(cfg, name, out, cap);
+		z_printf("[loader] interp \"%s\" -> \"%s\"\n", name, host);
+		return host;
+	}
+	return NULL;
+}
+
+/* The program's auxv: its own headers, entry and interpreter base. */
+static void set_auxv(Elf_auxv_t *av, const struct image *prog, const struct image *interp,
+		     const char *execfn)
+{
+	for (; av->a_type != AT_NULL; av++) {
+		switch (av->a_type) {
+		case AT_PHDR: av->a_un.a_val = phdr_address(&prog->ehdr, prog->phdr, prog->bias); break;
+		case AT_PHNUM: av->a_un.a_val = prog->ehdr.e_phnum; break;
+		case AT_PHENT: av->a_un.a_val = prog->ehdr.e_phentsize; break;
+		case AT_ENTRY: av->a_un.a_val = prog->entry; break;
+		case AT_BASE: av->a_un.a_val = interp ? interp->bias : 0; break;
+		case AT_EXECFN: av->a_un.a_val = (unsigned long)execfn; break;
+		}
+	}
+}
+
+/* What the payload needs beyond the options: the guest auxv (for
+ * PR_GET_AUXV and /proc/self/auxv) and the ranges to protect. */
+static void configure_payload(unsigned long payload_entry, const payload_config_t *cfg,
+			      const Elf_auxv_t *auxv)
+{
+	extern char __ehdr_start[], _end[];
+	payload_config_t *dst = payload_config_of(payload_entry);
+	z_memcpy(dst, cfg, sizeof(*dst));
+	size_t pairs = 1;
+	while (auxv[pairs - 1].a_type != AT_NULL)
+		pairs++;
+	if (pairs > CONFIG_AUXV_PAIRS)
+		z_errx(1, "guest auxv exceeds payload capacity");
+	z_memcpy(dst->guest_auxv, auxv, pairs * sizeof(*auxv));
+	dst->guest_auxv_bytes = pairs * sizeof(*auxv);
+	unsigned n = 0;
+	dst->protected_ranges[n][0] = (uint64_t)__ehdr_start;
+	dst->protected_ranges[n++][1] = ROUND_PG((uint64_t)_end);
+	for (unsigned i = 0; i < g_loader_island_count && n < 64; i++, n++) {
+		dst->protected_ranges[n][0] = g_loader_islands[i][0];
+		dst->protected_ranges[n][1] = g_loader_islands[i][1];
+	}
+	dst->protected_count = n;
+	for (int i = 0; i < CONFIG_ISOLATE_DEVICES; i++)
+		dst->device_paths[i] = (uint64_t)g_isolate_page.table.path[i];
+	dst->empty_path = (uint64_t)g_isolate_page.table.empty;
+}
+
+/* argv, envp and auxv are rewritten in place: the program's arguments
+ * (argv[target..]) move down over the loader's own, so everything fits. */
+static void rebuild_stack(unsigned long *sp, char **argv, int argc, int target,
+			  char **env, int envc, const Elf_auxv_t *auxv)
+{
+	int new_argc = target < argc ? argc - target : 0;
+	char **dst = (char **)(sp + 1);
+	for (int i = 0; i < new_argc; i++)
+		dst[i] = argv[target + i];
+	dst[new_argc] = NULL;
+	char **dst_env = dst + new_argc + 1;
+	Elf_auxv_t *dst_aux = (Elf_auxv_t *)(dst_env + envc + 1);
+	if ((const void *)dst_aux > (const void *)auxv)
+		z_errx(1, "environment does not fit the initial stack");
+	for (int i = 0; i < envc; i++)
+		dst_env[i] = env[i];
+	dst_env[envc] = NULL;
+	int i = 0;
+	do
+		dst_aux[i] = auxv[i];
+	while (auxv[i++].a_type != AT_NULL);
+	*sp = (unsigned long)new_argc;
+}
+
+/* An FD at exactly the number every process of the view inherits. */
+static int fixed_fd(int fd, int number, const char *what)
+{
+	if (fd < 0)
+		z_errx(1, "cannot open the %s", what);
+	long high = z_syscall(__NR_fcntl, fd, 0 /* F_DUPFD */, number, 0, 0, 0);
+	z_close(fd);
+	if (high != number)
+		z_errx(1, "%s: FD %d is taken", what, number);
+	return number;
+}
+
+/* The container's shared state (docs/OCI.md R4, R5): a new mount table
+ * and the owner database, inherited by every guest process. */
+static void container_state_open(payload_config_t *cfg, const struct loader_options *opt)
+{
+	if (opt->emulate_mounts || opt->mount_table) {
+		/* A file joins the processes that use the same one (docker exec
+		 * into a running container); a new one is empty. */
+		long fd = opt->mount_table ?
+			z_syscall(__NR_openat, AT_FDCWD, (long)opt->mount_table, 02 /* O_RDWR */ | 0100 /* O_CREAT */,
+				  0600, 0, 0) :
+			z_syscall(__NR_memfd_create, (long)"elf-mounts", 0, 0, 0, 0, 0);
+		/* A file in use keeps its size; a new one (and the memfd, whose
+		 * fstat size HongMeng does not report as 0) gets the table's. */
+		struct stat st;
+		long size = -1;
+		if (fd >= 0 && opt->mount_table && z_syscall(__NR_fstat, fd, (long)&st, 0, 0, 0, 0) == 0)
+			size = st.st_size;
+		int ready = size == CONFIG_MOUNT_TABLE_BYTES ||
+			((size == 0 || !opt->mount_table) &&
+			 z_syscall(__NR_ftruncate, fd, CONFIG_MOUNT_TABLE_BYTES, 0, 0, 0, 0) == 0);
+		if (fd >= 0 && !ready) {
+			z_close((int)fd);
+			fd = -1;
+		}
+		cfg->mount_table_fd = fixed_fd((int)fd, CONFIG_MOUNT_TABLE_FD, "mount table");
+		if (cfg->mount_scratch[0]) {
+			long rc = z_syscall(__NR_mkdirat, AT_FDCWD, (long)cfg->mount_scratch, 0700, 0, 0, 0);
+			if (rc < 0 && rc != -17 /* EEXIST */)
+				z_errx(1, "cannot create the mount scratch %s", cfg->mount_scratch);
+		}
+	}
+	if (opt->owner_db) {
+		int fd = z_openat(AT_FDCWD, opt->owner_db, O_RDWR);
+		char magic[8];
+		if (fd >= 0 && (z_read(fd, magic, 8) != 8 || z_strncmp(magic, "ELFOWN1", 8))) {
+			z_close(fd);
+			z_errx(1, "not an owner database: %s", opt->owner_db);
+		}
+		cfg->owner_db_fd = fixed_fd(fd, CONFIG_OWNER_DB_FD, "owner database");
+	}
+}
+
+void z_entry(unsigned long *sp, void (*fini)(void))
+{
+	static payload_config_t cfg;
+	static struct image prog, interp;
+	static char interp_buf[CONFIG_MAX_PATH];
+	static char lower_file[CONFIG_MAX_PATH], lower_host[CONFIG_MAX_PATH];
+	struct loader_options opt;
+	(void)fini;
+
+	z_printf_enabled = 0;
+	int argc = (int)*sp;
+	char **argv = (char **)(sp + 1), **host_env = &argv[argc + 1], **p = host_env;
+	while (*p++)
+		;
+	Elf_auxv_t *auxv = (Elf_auxv_t *)p;
+
+	options_parse(argc, argv, &cfg, &opt);
+	if (opt.filter_dump) {
+		guest_filter_dump(cfg.device_mask);
+		z_exit(0);
+	}
+	z_printf_enabled = cfg.log_level != LOG_LEVEL_NONE;
+	hook_set_section_scan(cfg.seccomp_backstop);
+	normalize_host_path(cfg.root, CONFIG_MAX_PATH);
+	for (int i = 0; i < cfg.lower_count; i++)
+		normalize_host_path(cfg.lower[i], CONFIG_MAX_PATH);
+	for (int i = 0; i < cfg.bind_count; i++)
+		normalize_host_path(cfg.binds[i].dst, CONFIG_MAX_PATH);
+	/* An isolated child cannot name files: what the initial loader looked
+	 * up comes in its arguments. */
+	int isolated_child = opt.child && cfg.isolate;
+	if (isolated_child) {
+		if (cfg.loader_fd < 0 || !cfg.loader_path[0] || opt.exec_fd < 0)
+			z_errx(1, "isolated child loader needs its loader and program FDs");
+		if (opt.case_folds)
+			set_case_folds(&cfg, opt.case_folds);
+	} else {
+		mark_case_aliases(&cfg);
+		resolve_self_path(cfg.loader_path, CONFIG_MAX_PATH);
+	}
+
+	/* A guest exec names the program with --exec-target (its argv may be
+	 * empty); otherwise the program is the first argument. */
+	if (!opt.exec_target && opt.target >= argc)
+		z_errx(1, "no program to run");
+	const char *file = opt.exec_target ? opt.exec_target : argv[opt.target];
+	const char *named = file;
+	if (!opt.child) {
+		/* The initial program is named relative to the root. */
+		if (cfg.root[0] && file[0] == '/')
+			z_errx(1, "absolute path not allowed with --root; use a path relative to it");
+		if (cfg.root[0] && z_chdir(cfg.root) < 0)
+			z_errx(1, "chdir to root %s failed", cfg.root);
+		/* R6: the program may come from a lower layer. */
+		struct stat st;
+		if (cfg.lower_count && z_newfstatat(AT_FDCWD, file, &st, 0) < 0) {
+			lower_file[0] = '/';
+			copy_cstr(lower_file + 1, sizeof(lower_file) - 1, file);
+			file = resolve_interp_path(&cfg, lower_file, lower_host, sizeof(lower_host));
+		}
+		if (!cfg.glue_dir[0])
+			choose_glue_dir(&cfg, host_env);
+	} else if (!isolated_child && !is_elf_file_at(AT_FDCWD, file)) {
+		z_errx(1, "target is not ELF: %s", file);
+	}
+	choose_exec_exe(&cfg, &opt, named);
+	if (!opt.child)
+		container_state_open(&cfg, &opt);
+	/* The broker starts before anything of the guest is loaded. */
+	if (opt.isolate && !cfg.isolate) {
+		/* The loader file (the exec trust chain) and the devices the guest
+		 * opens itself: checked and protected before the broker starts. */
+		broker_guard_trust(cfg.device_mask, cfg.loader_path);
+		broker_start(&cfg);
+		/* Every guest exec re-executes this binary through an FD. */
+		int self = z_openat(AT_FDCWD, cfg.loader_path, O_RDONLY);
+		long high = self < 0 ? self : z_syscall(__NR_fcntl, self, 0 /* F_DUPFD */,
+							CONFIG_ISOLATE_LOADER_FD, 0, 0, 0);
+		if (high < 0)
+			z_errx(1, "isolate: cannot open the loader binary");
+		z_close(self);
+		/* The filter lets only this FD number run. */
+		if (high != CONFIG_ISOLATE_LOADER_FD)
+			z_errx(1, "isolate: FD %d is taken", CONFIG_ISOLATE_LOADER_FD);
+		broker_guard_loader_fd((int)high);
+		cfg.loader_fd = (int32_t)high;
+		/* The owners fake_id0 reports as root, for every guest process. */
+		int n = 0;
+		cfg.owners[n][0] = (uint32_t)z_syscall(__NR_getuid);
+		cfg.owners[n++][1] = (uint32_t)z_syscall(__NR_getgid);
+		for (int i = -1; i < cfg.bind_count && n < CONFIG_OWNERS; i++) {
+			const char *host = i < 0 ? cfg.root : cfg.binds[i].dst;
+			struct stat st;
+			if (host[0] && z_newfstatat(AT_FDCWD, host, &st, 0) == 0 && (st.st_mode & 0170000) == 0040000) {
+				cfg.owners[n][0] = st.st_uid;
+				cfg.owners[n++][1] = st.st_gid;
+			}
+		}
+		cfg.owner_count = n;
+	}
+	int envc;
+	char **env = environment(&cfg, &opt, host_env, &envc);
+
+	unsigned long payload_entry = payload_load(opt.payload);
+	/* An isolated child reads the program and interpreter from the FDs the
+	 * broker opened (and closes them); otherwise they are opened here. */
+	load(&prog, file, isolated_child ? opt.exec_fd : -1, payload_entry);
+	const char *interp_path = interpreter(&prog, file, &cfg, &opt, interp_buf, sizeof(interp_buf));
+	if (interp_path)
+		load(&interp, interp_path, isolated_child ? opt.exec_interp_fd : -1, payload_entry);
+	else if (opt.exec_interp_fd > 2)
+		z_close(opt.exec_interp_fd);
+	/* fexecve: the program is loaded; this descriptor copy is not the guest's. */
+	if (!isolated_child && opt.exec_fd > 2)
+		z_close(opt.exec_fd);
+
+	set_auxv(auxv, &prog, interp_path ? &interp : NULL,
+		 opt.exec_path ? opt.exec_path : opt.target < argc ? argv[opt.target] : file);
+	configure_payload(payload_entry, &cfg, auxv);
+	rebuild_stack(sp, argv, argc, opt.target, env, envc, auxv);
+
+	if (cfg.log_level != LOG_LEVEL_NONE)
+		debugger_install();
+	if (cfg.seccomp_backstop)
+		backstop_install(payload_entry, !opt.child);
+	/* --cwd: the guest directory, through the root and binds (the program
+	 * and its interpreter are loaded: they were named from the root). */
+	if (opt.cwd && !opt.child) {
+		char host[CONFIG_MAX_PATH];
+		const char *dir = resolve_interp_path(&cfg, opt.cwd, host, sizeof(host));
+		if (z_chdir(dir) < 0)
+			z_errx(1, "cannot enter working directory %s", opt.cwd);
+	}
+	/* Last of the initial loader's own work: from here on no guest process
+	 * names a file except through the broker. */
+	if (cfg.isolate && !opt.child)
+		guest_filter_install(cfg.device_mask);
+	/* /proc/<pid>/{comm,stat,status} name the guest program, not the loader. */
+	const char *name = opt.exec_name ? opt.exec_name : cfg.exec_exe;
+	for (const char *c = name; *c; c++)
+		if (*c == '/' && c[1])
+			name = c + 1;
+	if (*name)
+		z_prctl(15 /* PR_SET_NAME */, (unsigned long)name, 0);
+	z_trampo((void (*)(void))(interp_path ? interp.entry : prog.entry), sp, z_fini);
+	z_exit(0);
+}

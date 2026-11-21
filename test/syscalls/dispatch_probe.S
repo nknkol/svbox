@@ -1,0 +1,95 @@
+/* Real entry selector, deterministic C-dispatch test double. */
+#include "syscall_nums.h"
+.text
+.global _start
+_start:
+    adr x19, selected
+    adr x21, selected_end
+1:
+    cmp x19, x21
+    b.eq 2f
+    ldr w22, [x19], #4
+    mov x8, x22
+    mov x0, #71
+    bl hook_entry
+    add x20, x22, #1024
+    cmp x0, x20
+    b.ne fail
+    b 1b
+2:
+    adr x23, fail_guard
+    mov x0, #1
+    str x0, [x23]
+    mov x8, #__NR_openat
+    bl hook_entry
+    cmn x0, #11
+    b.ne fail
+    str xzr, [x23]
+    mov x8, #__NR_getpid
+    bl hook_entry
+    mov x20, x0
+    mov x8, #__NR_getpid
+    svc #0
+    cmp x0, x20
+    b.ne fail
+    mov x8, #1023
+    bl hook_entry
+    cmn x0, #38
+    b.ne fail
+    /* A slow-dispatched exit would return the sentinel instead of exiting. */
+    mov x0, #0
+    mov x8, #__NR_exit_group
+    bl hook_entry
+fail:
+    mov x0, #1
+    mov x8, #__NR_exit_group
+    svc #0
+.global syscall_dispatcher
+syscall_dispatcher:
+    add x0, x0, #1024
+    ret
+.global reentry_try_enter
+reentry_try_enter:
+    adr x0, fail_guard
+    ldr x0, [x0]
+    cbz x0, 3f
+    mov x0, #-11
+    ret
+3:
+    adr x0, dummy_slot
+    ret
+.global reentry_leave
+reentry_leave:
+    ret
+.global reentry_leave_owned
+reentry_leave_owned:
+    ret
+/* Not an id call: on to the dispatcher. */
+.global fake_ids_entry
+fake_ids_entry:
+    mov x0, #0
+    ret
+/* No payload stack: the dispatcher runs on the current one. */
+.global payload_stack_claim
+payload_stack_claim:
+    mov x0, #0
+    ret
+.global payload_stack_release
+payload_stack_release:
+    ret
+/* The clone gate (clone_entry.S) is not exercised here. */
+.global clone_entry
+clone_entry:
+    brk #0
+.data
+.global g_payload_config
+g_payload_config:
+    .quad 0
+fail_guard:
+    .quad 0
+dummy_slot:
+    .quad 1
+selected:
+#define SLOW_SYSCALL(n) .word n
+#include "slow_syscalls.inc"
+selected_end:
