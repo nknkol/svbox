@@ -2,6 +2,7 @@
 /* PRoot path backend: path translation, the syscall dispatch and the
  * per-call bridge (vfs_bridge_internal.h lists the other parts). */
 #include "vfs_bridge_internal.h"
+#include "vdev.h"
 
 /* The view holding a host path (union_find), NULL if none. */
 static const struct union_view *bridge_view(Bridge *b, const char *host, int *layer, const char **rel)
@@ -1609,6 +1610,11 @@ static long dispatch(Bridge *b, long number, long a[6], struct proot_open_origin
     b->defer_final = number == __NR_openat && follow && !(a[2] & O_PATH) &&
         length && length < PATH_MAX && path[length - 1] != '/';
     bool deferred = b->defer_final;
+    /* Generic userspace character-device proxies (--vdev GUEST:SOCK[:TYPE]). */
+    if (vdev_enabled() && path[0] == '/' && vdev_match_path(path) != -1) {
+        b->defer_final = false;
+        return vdev_path_call(number, a, vdev_match_path(path));
+    }
     /* R6: the emulated loop devices, spelled as such (no resolution: the
      * name has no host file, which a guarded final lookup refuses). */
     if (mounts_enabled() && path[0] == '/' && pb_loop_device(path) != -1) {
@@ -1619,6 +1625,10 @@ static long dispatch(Bridge *b, long number, long a[6], struct proot_open_origin
     b->defer_final = false;
     if (ret < 0)
         return ret;
+    if (vdev_enabled()) {
+        int vd = vdev_match_path(b->guest);
+        if (vd != -1) return vdev_path_call(number, a, vd);
+    }
     /* R6: the emulated loop devices. */
     if (mounts_enabled()) {
         int device = pb_loop_device(b->guest);

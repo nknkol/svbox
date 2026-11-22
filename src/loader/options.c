@@ -4,6 +4,7 @@
  * Every invalid option or malformed handoff is fatal. */
 #include <asm/unistd.h>
 #include "loader.h"
+#include "vdev_proto.h"
 
 static int is(const char *arg, const char *name)
 {
@@ -195,6 +196,7 @@ static void read_handoff(int fd, payload_config_t *cfg, struct loader_options *o
 	    hc->lower_count < 0 || hc->lower_count > CONFIG_MAX_LOWERS ||
 	    hc->owner_count < 0 || hc->owner_count > CONFIG_OWNERS ||
 	    hc->passed_count < 0 || hc->passed_count > CONFIG_MAX_PASSED_FDS ||
+	    hc->vdev_count < 0 || hc->vdev_count > CONFIG_MAX_VDEVS ||
 	    hc->fake_group_count < -1 || hc->fake_group_count > 32)
 		z_errx(1, "invalid child handoff bounds");
 
@@ -224,6 +226,11 @@ static void read_handoff(int fd, payload_config_t *cfg, struct loader_options *o
 		if (!has_nul(hc->lower[i], sizeof(hc->lower[i])) ||
 		    !has_nul(hc->lower_image[i], sizeof(hc->lower_image[i])))
 			z_errx(1, "unterminated lower in child handoff");
+	}
+	for (int i = 0; i < hc->vdev_count; i++) {
+		if (!has_nul(hc->vdevs[i].guest, sizeof(hc->vdevs[i].guest)) ||
+		    !has_nul(hc->vdevs[i].sock, sizeof(hc->vdevs[i].sock)))
+			z_errx(1, "unterminated vdev in child handoff");
 	}
 	if (hc->mount_access_observe[0]) {
 		size_t n = z_strlen(hc->mount_access_observe);
@@ -277,6 +284,7 @@ void options_print_help(int fd)
 		"  --mount-table PATH             Join/share an emulated mount table file\n"
 		"  --mount-scratch DIR            Host directory backing emulated tmpfs mounts\n"
 		"  --owner-db PATH                Virtual uid/gid/mode ownership database\n"
+		"  --vdev GUEST:SOCK[:TYPE]       Userspace virtual char device proxy (TYPE: chr|binder)\n"
 		"\n"
 		"Security & Policy:\n"
 		"  --guard LEVEL                  Guard level: none (default), track, observe, paths, files, access\n"
@@ -456,6 +464,33 @@ void options_parse(int argc, char **argv, payload_config_t *cfg, struct loader_o
 			copy_cstr(cfg->mount_scratch, CONFIG_MAX_PATH, v);
 		} else if (is(arg, "--owner-db")) {
 			opt->owner_db = value(argc, argv, &i);
+		} else if (is(arg, "--vdev")) {
+			const char *spec = value(argc, argv, &i);
+			const char *c1 = z_strchr(spec, ':');
+			if (!c1 || c1 == spec || !c1[1])
+				z_errx(1, "--vdev needs GUEST:SOCK[:chr|binder]");
+			const char *c2 = z_strchr(c1 + 1, ':');
+			size_t glen = (size_t)(c1 - spec);
+			size_t slen = c2 ? (size_t)(c2 - (c1 + 1)) : z_strlen(c1 + 1);
+			if (spec[0] != '/' || c1[1] != '/' || glen >= CONFIG_MAX_PATH || slen == 0 || slen >= CONFIG_MAX_PATH)
+				z_errx(1, "--vdev needs absolute GUEST and SOCK paths");
+			int32_t vtype = VDEV_TYPE_CHR;
+			if (c2) {
+				if (is(c2 + 1, "chr"))
+					vtype = VDEV_TYPE_CHR;
+				else if (is(c2 + 1, "binder"))
+					vtype = VDEV_TYPE_BINDER;
+				else
+					z_errx(1, "invalid --vdev type %s (expect chr|binder)", c2 + 1);
+			}
+			if (cfg->vdev_count >= CONFIG_MAX_VDEVS)
+				z_errx(1, "too many --vdev entries");
+			struct vdev_entry *ve = &cfg->vdevs[cfg->vdev_count++];
+			z_memcpy(ve->guest, spec, glen);
+			ve->guest[glen] = '\0';
+			z_memcpy(ve->sock, c1 + 1, slen);
+			ve->sock[slen] = '\0';
+			ve->type = vtype;
 		} else if (is(arg, "-w") || is(arg, "--workdir")) {
 			const char *v = value(argc, argv, &i);
 			if (v[0] != '/' || z_strlen(v) >= CONFIG_MAX_PATH)

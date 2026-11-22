@@ -12,6 +12,7 @@
 #include "fake_ids.h"
 #include "host_syscall.h"
 #include "fd_runtime.h"
+#include "vdev.h"
 static inline long dispatch_call(long n, long args[6])
 {
     return g_payload_config.guard != GUARD_NONE
@@ -53,6 +54,9 @@ long syscall_dispatcher(long sys_no, pt_regs *regs)
     int named = sys_no == __NR_accept || sys_no == __NR_accept4 ||
         sys_no == __NR_getsockname || sys_no == __NR_getpeername;
     unsigned capacity = named && a[1] && a[2] ? *(unsigned *)a[2] : 0;
+    /* Generic userspace character-device proxies (--vdev GUEST:SOCK[:TYPE]). */
+    if (vdev_enabled() && vdev_fd_call(sys_no, a, &ret))
+        return ret;
     /* R6: loop devices are the payload's (before the guarded ioctl policy). */
     if (sys_no == __NR_ioctl && mounts_enabled() && proot_loop_ioctl(a[0], (unsigned long)a[1], a[2], &ret))
         return ret;

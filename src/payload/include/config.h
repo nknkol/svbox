@@ -22,6 +22,13 @@
 #define CONFIG_MAX_PATH     256
 #define CONFIG_AUXV_PAIRS   64
 #define CONFIG_MAX_BINDS    64
+#define CONFIG_MAX_VDEVS    8
+
+struct vdev_entry {
+    char guest[CONFIG_MAX_PATH];
+    char sock[CONFIG_MAX_PATH];
+    int32_t type; /* VDEV_TYPE_CHR=0, VDEV_TYPE_BINDER=1 */
+};
 
 /* Internal child-loader exec handoff (not part of the public CLI).
  * --__handoff-fd carries a binary svbox_handoff_t in an unlinked memfd;
@@ -162,6 +169,9 @@ typedef struct payload_config {
     /* --pass-fd (guarded build). */
     int32_t passed_count;
     struct passed_fd passed[CONFIG_MAX_PASSED_FDS];
+    /* --vdev GUEST:SOCK[:chr|binder]: generic userspace character-device proxies. */
+    int32_t vdev_count;
+    struct vdev_entry vdevs[CONFIG_MAX_VDEVS];
     uint64_t guest_auxv_bytes;
     uint64_t guest_auxv[CONFIG_AUXV_PAIRS * 2];
 } payload_config_t;
