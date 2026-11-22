@@ -6,6 +6,7 @@
  * the same values), fork copies it and the exec chain passes it on. */
 #include <asm/unistd.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stddef.h>
 #include <stdint.h>
 #include "config.h"
@@ -46,6 +47,8 @@ static void caps_from_ids(void)
     keepcaps = 0;
 }
 
+static void publish_pid_ids(void);
+
 static uint32_t *set_of(int group)
 {
     if (!__atomic_load_n(&loaded, __ATOMIC_ACQUIRE)) {
@@ -56,6 +59,7 @@ static uint32_t *set_of(int group)
         for (int i = 0; i < group_count; i++) groups[i] = g_payload_config.fake_groups[i];
         caps_from_ids();
         __atomic_store_n(&loaded, 1, __ATOMIC_RELEASE);
+        publish_pid_ids();
     }
     return ids[group];
 }
@@ -253,6 +257,41 @@ static int cap_prctl(long a[6], long *result)
     return 0;
 }
 
+static void publish_pid_ids(void)
+{
+    const char *base = g_payload_config.mount_scratch;
+    if (!base[0]) return;
+    char dir[CONFIG_MAX_PATH + 16];
+    char path[CONFIG_MAX_PATH + 32];
+    size_t n = 0;
+    while (base[n] && n < CONFIG_MAX_PATH - 1) { dir[n] = base[n]; n++; }
+    const char *sub = "/.pid_ids";
+    for (size_t i = 0; sub[i]; i++) dir[n++] = sub[i];
+    dir[n] = '\0';
+    raw_syscall(__NR_mkdirat, AT_FDCWD, (long)dir, 0755, 0, 0, 0);
+    for (size_t i = 0; i < n; i++) path[i] = dir[i];
+    path[n++] = '/';
+    long pid = raw_syscall(__NR_getpid, 0, 0, 0, 0, 0, 0);
+    if (pid <= 0) return;
+    char digits[24];
+    int d = 0;
+    unsigned long v = (unsigned long)pid;
+    do { digits[d++] = (char)('0' + (v % 10)); v /= 10; } while (v);
+    while (d > 0) path[n++] = digits[--d];
+    path[n] = '\0';
+    long fd = raw_syscall(__NR_openat, AT_FDCWD, (long)path,
+                          O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644, 0, 0);
+    if (fd >= 0) {
+        uint32_t out[8];
+        for (int i = 0; i < 4; i++) {
+            out[i] = ids[0][i];
+            out[4 + i] = ids[1][i];
+        }
+        raw_syscall(__NR_write, fd, (long)out, sizeof(out), 0, 0, 0);
+        raw_syscall(__NR_close, fd, 0, 0, 0, 0, 0);
+    }
+}
+
 int fake_ids_syscall(long number, long a[6], long *result)
 {
     uint32_t x = (uint32_t)a[0], y = (uint32_t)a[1], z = (uint32_t)a[2];
@@ -267,6 +306,7 @@ int fake_ids_syscall(long number, long a[6], long *result)
         *result = number == __NR_setuid ? set_one(0, x) : number == __NR_setreuid ? set_re(0, x, y) :
                   number == __NR_setresuid ? set_res(0, x, y, z) : set_fs(0, x);
         caps_after_uids(old);
+        if (*result == 0) publish_pid_ids();
         return 1;
     }
     }
@@ -277,10 +317,10 @@ int fake_ids_syscall(long number, long a[6], long *result)
     case __NR_getegid: *result = set_of(1)[EFFECTIVE]; break;
     case __NR_getresuid: *result = get_res(0, a); break;
     case __NR_getresgid: *result = get_res(1, a); break;
-    case __NR_setgid: *result = set_one(1, x); break;
-    case __NR_setregid: *result = set_re(1, x, y); break;
-    case __NR_setresgid: *result = set_res(1, x, y, z); break;
-    case __NR_setfsgid: *result = set_fs(1, x); break;
+    case __NR_setgid: *result = set_one(1, x); if (*result == 0) publish_pid_ids(); break;
+    case __NR_setregid: *result = set_re(1, x, y); if (*result == 0) publish_pid_ids(); break;
+    case __NR_setresgid: *result = set_res(1, x, y, z); if (*result == 0) publish_pid_ids(); break;
+    case __NR_setfsgid: *result = set_fs(1, x); if (*result == 0) publish_pid_ids(); break;
     case __NR_setgroups: {
         size_t size = (size_t)(int)a[0];
         if (!privileged_for(1)) { *result = -EPERM; break; }

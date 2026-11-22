@@ -1667,6 +1667,8 @@ static long dispatch(Bridge *b, long number, long a[6], struct proot_open_origin
             ret = pb_proc_mounts(b, (int)a[2]);
         if (ret == -ENOENT && mounts_enabled())
             ret = pb_proc_filesystems(b, (int)a[2]);
+        if (ret == -ENOENT && g_payload_config.mode == CONFIG_MODE_CONTAINER)
+            ret = pb_proc_status(b, (int)a[2]);
     } else ret = -ENOENT;
     if (ret == -ENOENT && number == __NR_newfstatat && follow && b->final_match) {
         /* Copied by the kernel so a bad buffer is still EFAULT. */

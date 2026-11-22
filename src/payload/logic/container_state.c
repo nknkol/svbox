@@ -117,6 +117,43 @@ static struct mount_table *table(void)
 
 int mounts_enabled(void) { return g_payload_config.mount_table_fd >= 0; }
 
+int mounts_unshare(void)
+{
+    int old_fd = g_payload_config.mount_table_fd;
+    if (old_fd < 0)
+        return 0;
+    struct mount_table *old_t = table();
+    long mfd = raw_syscall(__NR_memfd_create, (long)"mounts-ns", 0, 0, 0, 0, 0);
+    if (mfd < 0)
+        return (int)mfd;
+    if (raw_syscall(__NR_ftruncate, mfd, (long)MOUNT_TABLE_SIZE, 0, 0, 0, 0) < 0) {
+        raw_syscall(__NR_close, mfd, 0, 0, 0, 0, 0);
+        return -ENOMEM;
+    }
+    long mapped = raw_syscall(__NR_mmap, 0, (long)MOUNT_TABLE_SIZE,
+                              PROT_READ_ | PROT_WRITE_, MAP_SHARED_, mfd, 0);
+    if (mapped < 0 && mapped > -4096) {
+        raw_syscall(__NR_close, mfd, 0, 0, 0, 0, 0);
+        return (int)mapped;
+    }
+    struct mount_table *new_t = (struct mount_table *)mapped;
+    if (old_t) {
+        memcpy(new_t, old_t, MOUNT_TABLE_SIZE);
+        new_t->lock = 0;
+    }
+    if (raw_syscall(__NR_dup3, mfd, old_fd, 0, 0, 0, 0) < 0) {
+        raw_syscall(__NR_munmap, mapped, (long)MOUNT_TABLE_SIZE, 0, 0, 0, 0);
+        raw_syscall(__NR_close, mfd, 0, 0, 0, 0, 0);
+        return -EIO;
+    }
+    raw_syscall(__NR_close, mfd, 0, 0, 0, 0, 0);
+    void *prev = __atomic_exchange_n(&table_slot, new_t, __ATOMIC_ACQ_REL);
+    __atomic_store_n(&table_state, 2, __ATOMIC_RELEASE);
+    if (prev)
+        raw_syscall(__NR_munmap, (long)prev, (long)MOUNT_TABLE_SIZE, 0, 0, 0, 0);
+    return 0;
+}
+
 int mounts_snapshot(struct mount_entry *out, int max)
 {
     struct mount_table *t = table();

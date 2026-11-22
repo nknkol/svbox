@@ -256,3 +256,145 @@ long pb_proc_mounts(Bridge *b, int flags)
     }
     return fd;
 }
+
+static size_t append_u32(char *dst, size_t cap, size_t pos, uint32_t v)
+{
+    char tmp[16];
+    int d = 0;
+    do { tmp[d++] = (char)('0' + (v % 10)); v /= 10; } while (v);
+    while (d > 0 && pos < cap) dst[pos++] = tmp[--d];
+    return pos;
+}
+
+static size_t format_id_line(char *dst, size_t cap, const char *label, const uint32_t ids[4])
+{
+    size_t p = 0;
+    for (size_t i = 0; label[i] && p < cap; i++) dst[p++] = label[i];
+    for (int k = 0; k < 4; k++) {
+        if (p < cap) dst[p++] = '\t';
+        p = append_u32(dst, cap, p, ids[k]);
+    }
+    if (p < cap) dst[p++] = '\n';
+    return p;
+}
+
+/* /proc/<pid>/status (and self / thread-self / task/<tid>): reflect fake_ids
+ * Uid:/Gid: lines consistently with getuid()/set*id(). -ENOENT: kernel file. */
+long pb_proc_status(Bridge *b, int flags)
+{
+    if (compare_paths("/proc", b->guest) != PATH1_IS_PREFIX)
+        return -ENOENT;
+    const char *cursor = b->guest + strlen("/proc/");
+    long self_pid = raw_syscall(__NR_getpid, 0, 0, 0, 0, 0, 0);
+    long pid = 0;
+    if (!strncmp(cursor, "self/", 5) || !strncmp(cursor, "thread-self/", 12)) {
+        pid = self_pid;
+        cursor = strchr(cursor, '/');
+    } else {
+        if (*cursor < '1' || *cursor > '9') return -ENOENT;
+        while (*cursor >= '0' && *cursor <= '9') pid = pid * 10 + (*cursor++ - '0');
+    }
+    if (!strncmp(cursor, "/task/", 6)) {
+        cursor += 6;
+        if (*cursor < '1' || *cursor > '9') return -ENOENT;
+        while (*cursor >= '0' && *cursor <= '9') cursor++;
+    }
+    if (strcmp(cursor, "/status") != 0)
+        return -ENOENT;
+
+    uint32_t ids[8];
+    if (pid == self_pid) {
+        fake_ids_current(ids);
+    } else {
+        int found = 0;
+        const char *base = g_payload_config.mount_scratch;
+        if (base[0]) {
+            char ppath[CONFIG_MAX_PATH + 32];
+            size_t n = 0;
+            while (base[n] && n < CONFIG_MAX_PATH - 1) { ppath[n] = base[n]; n++; }
+            const char *sub = "/.pid_ids/";
+            for (size_t i = 0; sub[i]; i++) ppath[n++] = sub[i];
+            n = append_u32(ppath, sizeof(ppath) - 1, n, (uint32_t)pid);
+            ppath[n] = '\0';
+            long pfd = raw_syscall(__NR_openat, AT_FDCWD, (long)ppath, O_RDONLY | O_CLOEXEC, 0, 0, 0);
+            if (pfd >= 0) {
+                long nr = raw_syscall(__NR_read, pfd, (long)ids, sizeof(ids), 0, 0, 0);
+                raw_syscall(__NR_close, pfd, 0, 0, 0, 0, 0);
+                if (nr == (long)sizeof(ids)) found = 1;
+            }
+        }
+        if (!found) {
+            size_t start;
+            const char *exe;
+            if (!loader_argv(b, pid, &start, &exe)) return -ENOENT;
+            for (int i = 0; i < 8; i++) ids[i] = g_payload_config.fake_ids[i];
+        }
+    }
+
+    long kfd = raw_syscall(__NR_openat, AT_FDCWD, (long)b->host, O_RDONLY | O_CLOEXEC, 0, 0, 0);
+    if (kfd < 0) return kfd;
+    size_t total = 0;
+    while (total < sizeof(b->proc_data)) {
+        long r = raw_syscall(__NR_read, kfd, (long)(b->proc_data + total),
+                             (long)(sizeof(b->proc_data) - total), 0, 0, 0);
+        if (r <= 0) break;
+        total += (size_t)r;
+    }
+    raw_syscall(__NR_close, kfd, 0, 0, 0, 0, 0);
+
+    long mfd = raw_syscall(__NR_memfd_create, (long)"status",
+                           (flags & O_CLOEXEC) ? 1 /* MFD_CLOEXEC */ : 0, 0, 0, 0, 0);
+    if (mfd < 0) return mfd;
+
+    long rc = 0;
+    size_t pos = 0;
+    size_t span_start = 0;
+    while (pos < total && rc >= 0) {
+        size_t nl = pos;
+        while (nl < total && b->proc_data[nl] != '\n') nl++;
+        size_t line_len = (nl < total) ? (nl - pos + 1) : (nl - pos);
+        int is_uid = (line_len >= 4 && !strncmp(b->proc_data + pos, "Uid:", 4));
+        int is_gid = (!is_uid && line_len >= 4 && !strncmp(b->proc_data + pos, "Gid:", 4));
+        if (is_uid || is_gid) {
+            if (pos > span_start) {
+                size_t wdone = 0, wlen = pos - span_start;
+                while (wdone < wlen) {
+                    long w = raw_syscall(__NR_write, mfd, (long)(b->proc_data + span_start + wdone),
+                                         (long)(wlen - wdone), 0, 0, 0);
+                    if (w <= 0) { rc = w ? w : -EIO; break; }
+                    wdone += (size_t)w;
+                }
+            }
+            if (rc >= 0) {
+                char line[128];
+                size_t llen = format_id_line(line, sizeof(line),
+                                             is_uid ? "Uid:" : "Gid:",
+                                             is_uid ? ids : (ids + 4));
+                size_t wdone = 0;
+                while (wdone < llen) {
+                    long w = raw_syscall(__NR_write, mfd, (long)(line + wdone),
+                                         (long)(llen - wdone), 0, 0, 0);
+                    if (w <= 0) { rc = w ? w : -EIO; break; }
+                    wdone += (size_t)w;
+                }
+            }
+            span_start = pos + line_len;
+        }
+        pos += line_len;
+    }
+    if (rc >= 0 && total > span_start) {
+        size_t wdone = 0, wlen = total - span_start;
+        while (wdone < wlen) {
+            long w = raw_syscall(__NR_write, mfd, (long)(b->proc_data + span_start + wdone),
+                                 (long)(wlen - wdone), 0, 0, 0);
+            if (w <= 0) { rc = w ? w : -EIO; break; }
+            wdone += (size_t)w;
+        }
+    }
+    if (rc >= 0) rc = raw_syscall(__NR_lseek, mfd, 0, 0, 0, 0, 0);
+    if (rc < 0) {
+        raw_syscall(__NR_close, mfd, 0, 0, 0, 0, 0);
+        return rc;
+    }
+    return mfd;
+}

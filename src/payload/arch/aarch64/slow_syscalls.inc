@@ -294,6 +294,9 @@ SLOW_SYSCALL(__NR_io_uring_setup)
 #ifdef __NR_io_uring_enter
 SLOW_SYSCALL(__NR_io_uring_enter)
 #endif
+#ifdef __NR_bpf
+SLOW_SYSCALL(__NR_bpf)
+#endif
 #ifdef __NR_io_uring_register
 SLOW_SYSCALL(__NR_io_uring_register)
 #endif

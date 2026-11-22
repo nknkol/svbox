@@ -26,15 +26,23 @@ int platform_is_harmonyos(void)
 }
 
 /* HarmonyOS lets mprotect make anonymous memory executable only inside its
- * JIT window. */
+ * JIT window. Concurrent processes/threads under the same app UID can race on
+ * closing that window, so retry briefly when mprotect fails inside the window. */
 int mprotect_exec(void *addr, size_t len, int prot)
 {
 	int jit = (prot & PROT_EXEC) && platform_is_harmonyos();
-	if (jit)
-		z_prctl(PR_HM_JIT, 0, 0);
-	int rc = z_mprotect(addr, len, prot);
-	if (jit)
-		z_prctl(PR_HM_JIT, 0, 1);
+	int rc = -1;
+	for (int attempt = 0; attempt < (jit ? 32 : 1); attempt++) {
+		if (jit)
+			z_prctl(PR_HM_JIT, 0, 0);
+		rc = z_mprotect(addr, len, prot);
+		if (jit)
+			z_prctl(PR_HM_JIT, 0, 1);
+		if (rc == 0)
+			break;
+		if (jit)
+			z_syscall(__NR_sched_yield, 0, 0, 0, 0, 0, 0);
+	}
 	return rc;
 }
 

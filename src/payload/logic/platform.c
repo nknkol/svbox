@@ -31,8 +31,13 @@ int platform_is_harmonyos(void)
 long platform_mprotect_exec(unsigned long addr, size_t len, int prot)
 {
     int jit = (prot & 4 /* PROT_EXEC */) && platform_is_harmonyos();
-    if (jit) raw_syscall(__NR_prctl, PR_HM_JIT, 0, 0, 0, 0, 0);
-    long rc = raw_syscall(__NR_mprotect, (long)addr, (long)len, prot, 0, 0, 0);
-    if (jit) raw_syscall(__NR_prctl, PR_HM_JIT, 0, 1, 0, 0, 0);
+    long rc = -1;
+    for (int attempt = 0; attempt < (jit ? 32 : 1); attempt++) {
+        if (jit) raw_syscall(__NR_prctl, PR_HM_JIT, 0, 0, 0, 0, 0);
+        rc = raw_syscall(__NR_mprotect, (long)addr, (long)len, prot, 0, 0, 0);
+        if (jit) raw_syscall(__NR_prctl, PR_HM_JIT, 0, 1, 0, 0, 0);
+        if (rc >= 0) break;
+        if (jit) raw_syscall(__NR_sched_yield, 0, 0, 0, 0, 0, 0);
+    }
     return rc;
 }
