@@ -1463,7 +1463,13 @@ static long dispatch(Bridge *b, long number, long a[6], struct proot_open_origin
                       number != __NR_llistxattr && number != __NR_lremovexattr;
         ret = pb_resolve(b, AT_FDCWD, (const char *)a[0], follow);
         if (ret < 0) return ret;
-        return raw_syscall(number, (long)b->host, a[1], a[2], a[3], a[4], a[5]);
+        ret = raw_syscall(number, (long)b->host, a[1], a[2], a[3], a[4], a[5]);
+        if ((number == __NR_setxattr || number == __NR_lsetxattr) &&
+            (ret == -EACCES || ret == -EPERM || ret == -EOPNOTSUPP) &&
+            g_payload_config.mode == CONFIG_MODE_CONTAINER && a[1] &&
+            !strncmp((const char *)a[1], "security.", 9))
+            return 0;
+        return ret;
     }
     }
     if (number == __NR_inotify_add_watch) {

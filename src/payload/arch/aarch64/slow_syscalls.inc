@@ -18,6 +18,9 @@ SLOW_SYSCALL(__NR_sched_setaffinity)
 #ifdef __NR_sched_getaffinity
 SLOW_SYSCALL(__NR_sched_getaffinity)
 #endif
+#ifdef __NR_sysinfo
+SLOW_SYSCALL(__NR_sysinfo)
+#endif
 #ifdef __NR_mknodat
 SLOW_SYSCALL(__NR_mknodat)
 #endif

@@ -758,6 +758,7 @@ static long generic_chr_ioctl(struct vdev_open_slot *slot, unsigned long cmd, un
             return -EFAULT;
         memcpy(buf + sizeof(*req), (const void *)arg, req->in_len);
     }
+    uint32_t out_len = req->out_len;
     long rc = send_msg(rpc_fd, VDEV_OP_IOCTL, slot->proc_id, 0, 0,
                        buf, (uint32_t)(sizeof(*req) + req->in_len), NULL, 0);
     struct vdev_hdr rep;
@@ -767,10 +768,10 @@ static long generic_chr_ioctl(struct vdev_open_slot *slot, unsigned long cmd, un
         return rc;
     if (rep.status < 0)
         return rep.status;
-    if (req->out_len > 0 && rep.payload_len > 0) {
+    if (out_len > 0 && rep.payload_len > 0) {
         if (!arg)
             return -EFAULT;
-        uint32_t copy_n = rep.payload_len < req->out_len ? rep.payload_len : req->out_len;
+        uint32_t copy_n = rep.payload_len < out_len ? rep.payload_len : out_len;
         memcpy((void *)arg, buf, copy_n);
     }
     return rep.status;

@@ -154,6 +154,31 @@ long dispatch_syscall(long number, long a[6])
             return rc;
         }
         return passthrough(number, a);
+    case __NR_sysinfo: {
+        long rc = passthrough(number, a);
+        if (rc == 0 && g_payload_config.mem_limit_mb > 0 && a[0]) {
+            /* Linux AArch64 struct sysinfo layout:
+             * 0: uptime(8), 8: loads[3](24), 32: totalram(8), 40: freeram(8),
+             * 48: sharedram(8), 56: bufferram(8), 64: totalswap(8), 72: freeswap(8),
+             * 80: procs(2), pad(6), 88: totalhigh(8), 96: freehigh(8), 104: mem_unit(4) */
+            unsigned char *si = (unsigned char *)a[0];
+            uint32_t unit = 1;
+            uint64_t totalram = 0, freeram = 0;
+            memcpy(&unit, si + 104, sizeof(unit));
+            if (unit == 0) unit = 1;
+            memcpy(&totalram, si + 32, sizeof(totalram));
+            memcpy(&freeram, si + 40, sizeof(freeram));
+            uint64_t cap_units = ((uint64_t)g_payload_config.mem_limit_mb * 1024ull * 1024ull) / (uint64_t)unit;
+            if (totalram > cap_units) {
+                totalram = cap_units;
+                if (freeram > cap_units)
+                    freeram = (cap_units * 3ull) / 4ull;
+                memcpy(si + 32, &totalram, sizeof(totalram));
+                memcpy(si + 40, &freeram, sizeof(freeram));
+            }
+        }
+        return rc;
+    }
     case __NR_mmap:
         /* On HarmonyOS, a large unhinted mmap(NULL, ...) (e.g. Android Bionic
          * Scudo's 8 GiB primary arena) is placed bottom-up from 0x10000,
