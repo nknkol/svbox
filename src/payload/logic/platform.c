@@ -10,12 +10,19 @@ int platform_is_harmonyos(void)
     static int cached = -1;
     if (cached < 0) {
         char u[6][65];
-        static const char name[] = "HarmonyOS";
+        static const char name1[] = "HarmonyOS";
+        static const char name2[] = "HongMeng";
         cached = 0;
         if (raw_syscall(__NR_uname, (long)u, 0, 0, 0, 0, 0) >= 0) {
             size_t i = 0;
-            while (i < sizeof(name) && u[0][i] == name[i]) i++;
-            cached = i == sizeof(name);
+            while (i < sizeof(name1) && u[0][i] == name1[i]) i++;
+            if (i == sizeof(name1)) {
+                cached = 1;
+            } else {
+                i = 0;
+                while (i < sizeof(name2) - 1 && u[0][i] == name2[i]) i++;
+                cached = (i == sizeof(name2) - 1);
+            }
         }
     }
     return cached;

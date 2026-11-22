@@ -15,7 +15,7 @@ long island_munmap(uintptr_t addr, size_t len)
 }
 long island_mprotect(uintptr_t addr, size_t len, int prot)
 {
-	return z_syscall(__NR_mprotect, addr, len, prot);
+	return mprotect_exec((void *)addr, len, prot);
 }
 long island_pread(int fd, void *buf, size_t len, long offset)
 {

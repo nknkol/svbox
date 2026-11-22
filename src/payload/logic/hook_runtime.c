@@ -3,6 +3,7 @@
 
 #include "hook_runtime.h"
 #include "config.h"
+#include "platform.h"
 #include "stub.h"
 #include "stub_island.h"
 #include "syscall_nums.h"
@@ -35,7 +36,7 @@ long island_munmap(uintptr_t addr, size_t len)
 }
 long island_mprotect(uintptr_t addr, size_t len, int prot)
 {
-    return raw_syscall(__NR_mprotect, (long)addr, (long)len, prot, 0, 0, 0);
+    return platform_mprotect_exec(addr, len, prot);
 }
 long island_pread(int fd, void *buf, size_t len, long offset)
 {

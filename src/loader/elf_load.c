@@ -19,7 +19,8 @@ int platform_is_harmonyos(void)
 	if (cached < 0) {
 		char u[6][65];
 		cached = z_syscall(__NR_uname, u) >= 0 &&
-			z_strncmp(u[0], "HarmonyOS", sizeof("HarmonyOS")) == 0;
+			(z_strncmp(u[0], "HarmonyOS", sizeof("HarmonyOS")) == 0 ||
+			 z_strncmp(u[0], "HongMeng", 8) == 0);
 	}
 	return cached;
 }
@@ -233,7 +234,8 @@ static void *map_payload(const unsigned char *blob, size_t blob_size, unsigned l
 		unsigned long off = phdr[i].p_vaddr & (PAGE_SIZE - 1);
 		void *p = base + TRUNC_PG(phdr[i].p_vaddr);
 		size_t size = ROUND_PG(phdr[i].p_memsz + off);
-		z_mprotect(p, size, PFLAGS(phdr[i].p_flags));
+		if (mprotect_exec(p, size, PFLAGS(phdr[i].p_flags)) < 0)
+			z_errx(1, "can't protect payload segment");
 		if (phdr[i].p_flags & PF_X)
 			arch_flush_cache(p, size);
 	}
