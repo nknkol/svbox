@@ -1135,7 +1135,49 @@ static long mutate(Bridge *b, long number, long a[6])
         if (ret < 0)
             return ret;
         ret = raw_syscall(number, a[0], AT_FDCWD, (long)b->host, 0, 0, 0);
-        if (!ret) owners_new_name(b);
+        if (!ret) {
+            owners_new_name(b);
+            return 0;
+        }
+        /* Generic fallback when host sandbox forbids symlink() with EACCES/EPERM
+         * (e.g. HarmonyOS HAP files/temp): if mounts are emulated and the target
+         * resolves to an existing directory or regular file inside the container,
+         * materialize a mountpoint and bind-mount it in this process's mount table. */
+        if ((ret == -EACCES || ret == -EPERM) && mounts_enabled() &&
+            strlen(b->guest) < CONFIG_MAX_PATH && strlen(b->host) < sizeof(b->first_host)) {
+            strcpy(b->first_guest, b->guest);
+            strcpy(b->first_host, b->host);
+            if (pb_resolve(b, (int)a[1], (const char *)a[0], true) == 0 &&
+                strlen(b->host) < CONFIG_MAX_PATH) {
+                struct stat tst;
+                if (raw_syscall(__NR_newfstatat, AT_FDCWD, (long)b->host, (long)&tst, 0, 0, 0) == 0) {
+                    int is_dir = (tst.st_mode & S_IFMT) == S_IFDIR;
+                    int is_reg = (tst.st_mode & S_IFMT) == S_IFREG;
+                    if (is_dir || is_reg) {
+                        long mk = is_dir
+                            ? raw_syscall(__NR_mkdirat, AT_FDCWD, (long)b->first_host, 0755, 0, 0, 0)
+                            : raw_syscall(__NR_openat, AT_FDCWD, (long)b->first_host,
+                                          O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644, 0, 0);
+                        if (!is_dir && mk >= 0) {
+                            raw_syscall(__NR_close, mk, 0, 0, 0, 0, 0);
+                            mk = 0;
+                        }
+                        if (mk == 0 || mk == -EEXIST) {
+                            struct mount_entry me;
+                            memset(&me, 0, sizeof(me));
+                            strcpy(me.host, b->host);
+                            strcpy(me.guest, b->first_guest);
+                            me.kind = MOUNT_BIND;
+                            me.access = 'w';
+                            strcpy(me.source, "/dev/root");
+                            strcpy(me.fstype, "bind");
+                            if (mounts_add(&me) == 0)
+                                return 0;
+                        }
+                    }
+                }
+            }
+        }
         return ret;
     }
     if (number == __NR_mkdirat || number == __NR_unlinkat) {
@@ -1627,6 +1669,25 @@ static long dispatch(Bridge *b, long number, long a[6], struct proot_open_origin
         b->defer_final = false;
         return pb_loop_path_call(number, a, pb_loop_device(path));
     }
+    /* Virtual /proc & /sys resource views (--cpuset / --mem-mb): serve directly
+     * before host resolution so sandboxed hosts that hide /sys still report the
+     * configured container CPU/memory limits cleanly. */
+    if (number == __NR_openat && !(a[2] & (O_ACCMODE | O_PATH | O_CREAT)) && path[0] == '/') {
+        if (g_payload_config.cpu_mask &&
+            (!strcmp(path, "/proc/cpuinfo") ||
+             !strcmp(path, "/sys/devices/system/cpu/online") ||
+             !strcmp(path, "/sys/devices/system/cpu/present") ||
+             !strcmp(path, "/sys/devices/system/cpu/possible"))) {
+            strcpy(b->guest, path);
+            b->defer_final = false;
+            return pb_proc_cpuinfo(b, (int)a[2]);
+        }
+        if (g_payload_config.mem_limit_mb && !strcmp(path, "/proc/meminfo")) {
+            strcpy(b->guest, path);
+            b->defer_final = false;
+            return pb_proc_meminfo(b, (int)a[2]);
+        }
+    }
     ret = pb_resolve(b, (int)a[0], path, follow);
     b->defer_final = false;
     if (ret < 0)
@@ -1675,6 +1736,10 @@ static long dispatch(Bridge *b, long number, long a[6], struct proot_open_origin
             ret = pb_proc_filesystems(b, (int)a[2]);
         if (ret == -ENOENT && g_payload_config.mode == CONFIG_MODE_CONTAINER)
             ret = pb_proc_status(b, (int)a[2]);
+        if (ret == -ENOENT && g_payload_config.cpu_mask)
+            ret = pb_proc_cpuinfo(b, (int)a[2]);
+        if (ret == -ENOENT && g_payload_config.mem_limit_mb)
+            ret = pb_proc_meminfo(b, (int)a[2]);
     } else ret = -ENOENT;
     if (ret == -ENOENT && number == __NR_newfstatat && follow && b->final_match) {
         /* Copied by the kernel so a bad buffer is still EFAULT. */

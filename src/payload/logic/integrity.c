@@ -72,9 +72,22 @@ int integrity_check(long number, const long a[6], long *result)
     }
     if (broker_fd_guard(number, a, result))
         return 1;
-    if (g_payload_config.seccomp_backstop && number == __NR_rt_sigaction && (int)a[0] == SIGSYS) {
+    if ((g_payload_config.seccomp_backstop || g_payload_config.trap_sigsys) &&
+        number == __NR_rt_sigaction && (int)a[0] == SIGSYS) {
         *result = sigsys_action(a);
         return 1;
+    }
+    if ((g_payload_config.seccomp_backstop || g_payload_config.trap_sigsys) &&
+        number == __NR_rt_sigprocmask && a[1] && a[3] == 8 &&
+        (a[0] == 0 /* SIG_BLOCK */ || a[0] == 2 /* SIG_SETMASK */)) {
+        unsigned long set = 0;
+        memcpy(&set, (const void *)a[1], sizeof(set));
+        unsigned long sigsys_bit = 1ul << (SIGSYS - 1);
+        if (set & sigsys_bit) {
+            set &= ~sigsys_bit;
+            *result = raw_syscall(__NR_rt_sigprocmask, a[0], (long)&set, a[2], a[3], 0, 0);
+            return 1;
+        }
     }
     return 0;
 }

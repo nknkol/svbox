@@ -110,6 +110,7 @@ typedef void (*signal_handler_t)(int, siginfo_t *, void *);
 int signal_install(int sig, signal_handler_t handler, unsigned long flags);
 void die_of_signal(int sig);
 void debugger_install(void);
+void sigsys_trap_install(void);
 
 /* broker.c (isolation mode) */
 void broker_start(payload_config_t *cfg);

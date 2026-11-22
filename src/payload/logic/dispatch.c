@@ -125,6 +125,35 @@ long dispatch_syscall(long number, long a[6])
     if (async_io_syscall(number, a, &faked))
         return faked;
     switch (number) {
+    case __NR_sched_setaffinity:
+        if (g_payload_config.cpu_mask != 0) {
+            if (!a[2] || (unsigned long)a[1] < sizeof(uint64_t))
+                return -EINVAL;
+            uint64_t req = 0;
+            memcpy(&req, (const void *)a[2], sizeof(req));
+            uint64_t clamped = req & g_payload_config.cpu_mask;
+            if (!clamped)
+                clamped = g_payload_config.cpu_mask;
+            unsigned long kmask[2] = { (unsigned long)clamped, 0ul };
+            return raw_syscall(__NR_sched_setaffinity, a[0], sizeof(kmask), (long)kmask, 0, 0, 0);
+        }
+        return passthrough(number, a);
+    case __NR_sched_getaffinity:
+        if (g_payload_config.cpu_mask != 0) {
+            long rc = passthrough(number, a);
+            if (rc > 0 && a[2] && (unsigned long)a[1] >= sizeof(uint64_t)) {
+                uint64_t cur = 0;
+                memcpy(&cur, (const void *)a[2], sizeof(cur));
+                cur &= g_payload_config.cpu_mask;
+                if (!cur)
+                    cur = g_payload_config.cpu_mask;
+                memcpy((void *)a[2], &cur, sizeof(cur));
+                if ((unsigned long)rc > sizeof(uint64_t))
+                    memset((unsigned char *)a[2] + sizeof(uint64_t), 0, (size_t)rc - sizeof(uint64_t));
+            }
+            return rc;
+        }
+        return passthrough(number, a);
     case __NR_mmap:
         /* On HarmonyOS, a large unhinted mmap(NULL, ...) (e.g. Android Bionic
          * Scudo's 8 GiB primary arena) is placed bottom-up from 0x10000,

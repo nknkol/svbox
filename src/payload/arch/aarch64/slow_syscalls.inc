@@ -9,6 +9,15 @@ SLOW_SYSCALL(__NR_getcwd)
 #ifdef __NR_rt_sigaction
 SLOW_SYSCALL(__NR_rt_sigaction)
 #endif
+#ifdef __NR_rt_sigprocmask
+SLOW_SYSCALL(__NR_rt_sigprocmask)
+#endif
+#ifdef __NR_sched_setaffinity
+SLOW_SYSCALL(__NR_sched_setaffinity)
+#endif
+#ifdef __NR_sched_getaffinity
+SLOW_SYSCALL(__NR_sched_getaffinity)
+#endif
 #ifdef __NR_mknodat
 SLOW_SYSCALL(__NR_mknodat)
 #endif

@@ -22,7 +22,7 @@
 #define CONFIG_MAX_PATH     256
 #define CONFIG_AUXV_PAIRS   64
 #define CONFIG_MAX_BINDS    64
-#define CONFIG_MAX_VDEVS    8
+#define CONFIG_MAX_VDEVS    16
 
 struct vdev_entry {
     char guest[CONFIG_MAX_PATH];
@@ -174,6 +174,17 @@ typedef struct payload_config {
     struct vdev_entry vdevs[CONFIG_MAX_VDEVS];
     /* --cap-add ALL|<hex>: additional Linux capability bits added to default bounding set. */
     uint64_t extra_caps;
+    /* Generic container resource governance & signal guard:
+     * cpu_mask: allowed host CPU bitmask (0 = unrestricted, up to 64 CPUs).
+     * mem_limit_mb: virtual /proc/meminfo MemTotal cap in MiB (0 = unrestricted).
+     * nice_val: initial setpriority() nice value (0x7fffffff = unset).
+     * sched_policy: initial sched_setscheduler() policy (-1 = unset).
+     * trap_sigsys: install zero-stack SIGSYS(SYS_SECCOMP) -> -ENOSYS guard. */
+    uint64_t cpu_mask;
+    uint32_t mem_limit_mb;
+    int32_t nice_val;
+    int32_t sched_policy;
+    int32_t trap_sigsys;
     uint64_t guest_auxv_bytes;
     uint64_t guest_auxv[CONFIG_AUXV_PAIRS * 2];
 } payload_config_t;

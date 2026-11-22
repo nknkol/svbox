@@ -429,6 +429,11 @@ long vdev_path_call(long number, long a[6], int vdev_idx)
         s->memfd_size = rep.memfd_size;
         s->owner_pid = cur_pid;
         vdev_unlock();
+        if (a[2] & O_NONBLOCK) {
+            long fl = raw_syscall(__NR_fcntl, fd, F_GETFL, 0, 0, 0, 0);
+            if (fl >= 0)
+                raw_syscall(__NR_fcntl, fd, F_SETFL, fl | O_NONBLOCK, 0, 0, 0);
+        }
         return fd;
     }
     case __NR_newfstatat: {
@@ -762,10 +767,11 @@ static long generic_chr_ioctl(struct vdev_open_slot *slot, unsigned long cmd, un
         return rc;
     if (rep.status < 0)
         return rep.status;
-    if (req->out_len > 0 && rep.payload_len >= req->out_len) {
+    if (req->out_len > 0 && rep.payload_len > 0) {
         if (!arg)
             return -EFAULT;
-        memcpy((void *)arg, buf, req->out_len);
+        uint32_t copy_n = rep.payload_len < req->out_len ? rep.payload_len : req->out_len;
+        memcpy((void *)arg, buf, copy_n);
     }
     return rep.status;
 }

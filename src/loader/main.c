@@ -400,8 +400,23 @@ void z_entry(unsigned long *sp, void (*fini)(void))
 
 	if (cfg.log_level != LOG_LEVEL_NONE)
 		debugger_install();
+	if (!opt.child) {
+		if (cfg.cpu_mask) {
+			unsigned long mask[2] = { (unsigned long)cfg.cpu_mask, 0ul };
+			z_syscall(__NR_sched_setaffinity, 0, sizeof(mask), mask, 0, 0, 0);
+		}
+		if (cfg.nice_val != 0x7fffffff) {
+			z_syscall(__NR_setpriority, 0 /* PRIO_PROCESS */, 0, cfg.nice_val, 0, 0, 0);
+		}
+		if (cfg.sched_policy >= 0) {
+			int sp[1] = { 0 };
+			z_syscall(__NR_sched_setscheduler, 0, cfg.sched_policy, sp, 0, 0, 0);
+		}
+	}
 	if (cfg.seccomp_backstop)
 		backstop_install(payload_entry, !opt.child);
+	else if (cfg.trap_sigsys)
+		sigsys_trap_install();
 	/* --cwd: the guest directory, through the root and binds (the program
 	 * and its interpreter are loaded: they were named from the root). */
 	if (opt.cwd && !opt.child) {

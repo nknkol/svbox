@@ -51,6 +51,63 @@ static int numbers(const char *s, char sep, uint32_t *out, int max, int exact)
 	return exact && count != exact ? -1 : count;
 }
 
+static uint64_t parse_cpuset(const char *s)
+{
+	uint64_t mask = 0;
+	if (!*s)
+		z_errx(1, "invalid --cpuset value");
+	for (;;) {
+		unsigned long lo = 0, hi = 0;
+		const char *start = s;
+		while (*s >= '0' && *s <= '9') {
+			lo = lo * 10 + (unsigned long)(*s++ - '0');
+			if (lo >= 64)
+				z_errx(1, "invalid --cpuset cpu index (expect 0..63)");
+		}
+		if (s == start)
+			z_errx(1, "invalid --cpuset syntax");
+		hi = lo;
+		if (*s == '-') {
+			s++;
+			const char *hstart = s;
+			hi = 0;
+			while (*s >= '0' && *s <= '9') {
+				hi = hi * 10 + (unsigned long)(*s++ - '0');
+				if (hi >= 64)
+					z_errx(1, "invalid --cpuset cpu index (expect 0..63)");
+			}
+			if (s == hstart || hi < lo)
+				z_errx(1, "invalid --cpuset range");
+		}
+		for (unsigned long c = lo; c <= hi; c++)
+			mask |= (1ull << c);
+		if (!*s)
+			break;
+		if (*s != ',')
+			z_errx(1, "invalid --cpuset syntax");
+		s++;
+	}
+	if (!mask)
+		z_errx(1, "empty --cpuset mask");
+	return mask;
+}
+
+static int32_t parse_nice(const char *s)
+{
+	int neg = 0;
+	if (*s == '-') {
+		neg = 1;
+		s++;
+	} else if (*s == '+') {
+		s++;
+	}
+	unsigned long v = number(s, 20ul, "--nice value");
+	int32_t res = neg ? -(int32_t)v : (int32_t)v;
+	if (res < -20 || res > 19)
+		z_errx(1, "invalid --nice value (expect -20..19)");
+	return res;
+}
+
 static char parse_access_mode(const char *s, const char *what)
 {
 	if (is(s, "rw"))
@@ -299,6 +356,13 @@ void options_print_help(int fd)
 		"  --revalidate-fds               Re-derive regular-file FD origins instead of trusting snapshots\n"
 		"  --fd-capacity N                Cap tracked FD records (default: hard RLIMIT_NOFILE)\n"
 		"  --seccomp-backstop             Trap unhooked syscalls via seccomp SIGSYS backstop\n"
+		"  --trap-sigsys                  Convert host seccomp SIGSYS traps into -ENOSYS\n"
+		"\n"
+		"Resources & Scheduling:\n"
+		"  --cpuset LIST                  Pin container to host CPUs (e.g. 0-3 or 4,5,6,7)\n"
+		"  --mem-mb N                     Virtual /proc/meminfo MemTotal cap in MiB\n"
+		"  --nice N                       Initial process nice value (-20..19)\n"
+		"  --sched POLICY                 Initial scheduler policy: other|batch|idle\n"
 		"\n"
 		"Process & Identity:\n"
 		"  -w, --workdir DIR              Guest working directory (absolute guest path)\n"
@@ -340,6 +404,8 @@ void options_parse(int argc, char **argv, payload_config_t *cfg, struct loader_o
 	cfg->loader_fd = -1;
 	cfg->mount_table_fd = -1;
 	cfg->owner_db_fd = -1;
+	cfg->nice_val = 0x7fffffff;
+	cfg->sched_policy = -1;
 
 	for (int i = 1; i < argc; i++) {
 		const char *arg = argv[i];
@@ -452,6 +518,26 @@ void options_parse(int argc, char **argv, payload_config_t *cfg, struct loader_o
 				z_errx(1, "fd capacity must be positive");
 		} else if (is(arg, "--seccomp-backstop")) {
 			cfg->seccomp_backstop = 1;
+		} else if (is(arg, "--trap-sigsys")) {
+			cfg->trap_sigsys = 1;
+		} else if (is(arg, "--cpuset")) {
+			cfg->cpu_mask |= parse_cpuset(value(argc, argv, &i));
+		} else if (is(arg, "--mem-mb")) {
+			cfg->mem_limit_mb = (uint32_t)number(value(argc, argv, &i), 1024ul * 1024ul, "--mem-mb");
+			if (!cfg->mem_limit_mb)
+				z_errx(1, "--mem-mb must be positive");
+		} else if (is(arg, "--nice")) {
+			cfg->nice_val = parse_nice(value(argc, argv, &i));
+		} else if (is(arg, "--sched")) {
+			const char *v = value(argc, argv, &i);
+			if (is(v, "other"))
+				cfg->sched_policy = 0; /* SCHED_OTHER */
+			else if (is(v, "batch"))
+				cfg->sched_policy = 3; /* SCHED_BATCH */
+			else if (is(v, "idle"))
+				cfg->sched_policy = 5; /* SCHED_IDLE */
+			else
+				z_errx(1, "invalid --sched %s (expect other|batch|idle)", v);
 		} else if (is(arg, "--link-copy")) {
 			cfg->link_copy = 1;
 		} else if (is(arg, "--emulate-mounts")) {

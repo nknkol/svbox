@@ -19,6 +19,49 @@ int signal_install(int sig, signal_handler_t handler, unsigned long flags)
 	return z_syscall(__NR_rt_sigaction, sig, handler ? &sa : NULL, NULL, sizeof(sa.mask)) < 0 ? -1 : 0;
 }
 
+#ifdef __aarch64__
+/* Zero-stack resident SIGSYS handler converting kernel SECCOMP_RET_TRAP
+ * (si_code == SYS_SECCOMP == 1) directly into x0 = -ENOSYS (-38), so
+ * unallowed host syscalls fall back cleanly instead of terminating the guest. */
+__asm__(
+	".text\n"
+	".balign 4\n"
+	"svbox_sigsys_restorer:\n"
+	"    mov x8, #139\n"
+	"    svc #0\n"
+	".balign 4\n"
+	"svbox_sigsys_handler:\n"
+	"    cbz x1, 1f\n"
+	"    cbz x2, 1f\n"
+	"    ldr w4, [x1, #8]\n"
+	"    cmp w4, #1\n"
+	"    b.ne 1f\n"
+	"    mov x3, #-38\n"
+	"    str x3, [x2, #184]\n"
+	"1:\n"
+	"    ret\n"
+);
+extern void svbox_sigsys_handler(int, siginfo_t *, void *);
+extern void svbox_sigsys_restorer(void);
+#endif
+
+void sigsys_trap_install(void)
+{
+#ifdef __aarch64__
+	/* SA_SIGINFO(4) | SA_RESTORER(0x04000000) | SA_ONSTACK(0x08000000) |
+	 * SA_RESTART(0x10000000) | SA_NODEFER(0x40000000) */
+	k_sigaction_t sa = {
+		svbox_sigsys_handler,
+		0x5c000004ul,
+		svbox_sigsys_restorer,
+		0
+	};
+	z_syscall(__NR_rt_sigaction, 31 /* SIGSYS */, &sa, NULL, sizeof(sa.mask));
+	unsigned long unblock = 1ul << (31 - 1);
+	z_syscall(__NR_rt_sigprocmask, 1 /* SIG_UNBLOCK */, &unblock, NULL, sizeof(unblock));
+#endif
+}
+
 /* Restore the default action and die of the signal, as the program would
  * natively. */
 void die_of_signal(int sig)

@@ -167,6 +167,8 @@ long pb_proc_cmdline(Bridge *b, int flags);
 int pb_proc_link(void *opaque, char *out, const char *path, const char *component, Comparison comparison);
 long pb_proc_mounts(Bridge *b, int flags);
 long pb_proc_status(Bridge *b, int flags);
+long pb_proc_cpuinfo(Bridge *b, int flags);
+long pb_proc_meminfo(Bridge *b, int flags);
 long pb_proc_readlink(Bridge *b, long a[6]);
 
 #endif

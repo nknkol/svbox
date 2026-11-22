@@ -398,3 +398,233 @@ long pb_proc_status(Bridge *b, int flags)
     }
     return mfd;
 }
+
+static long write_all_fd(int fd, const char *buf, size_t len)
+{
+    size_t done = 0;
+    while (done < len) {
+        long w = raw_syscall(__NR_write, fd, (long)(buf + done), (long)(len - done), 0, 0, 0);
+        if (w <= 0)
+            return w ? w : -EIO;
+        done += (size_t)w;
+    }
+    return 0;
+}
+
+static size_t append_u64(char *dst, size_t cap, size_t pos, uint64_t v)
+{
+    char tmp[24];
+    int d = 0;
+    do { tmp[d++] = (char)('0' + (v % 10)); v /= 10; } while (v);
+    while (d > 0 && pos < cap) dst[pos++] = tmp[--d];
+    return pos;
+}
+
+static uint32_t popcount64(uint64_t x)
+{
+    uint32_t c = 0;
+    while (x) {
+        x &= x - 1;
+        c++;
+    }
+    return c;
+}
+
+/* Virtualize /proc/cpuinfo and /sys/devices/system/cpu/{online,present,possible}
+ * when --cpuset restricts the container's CPU mask, so guest runtimes size their
+ * thread pools to the allocated core count instead of host core count. */
+long pb_proc_cpuinfo(Bridge *b, int flags)
+{
+    uint64_t mask = g_payload_config.cpu_mask;
+    if (!mask)
+        return -ENOENT;
+    uint32_t ncpus = popcount64(mask);
+    if (!ncpus)
+        return -ENOENT;
+
+    if (!strcmp(b->guest, "/sys/devices/system/cpu/online") ||
+        !strcmp(b->guest, "/sys/devices/system/cpu/present") ||
+        !strcmp(b->guest, "/sys/devices/system/cpu/possible")) {
+        char buf[64];
+        size_t p = 0;
+        buf[p++] = '0';
+        if (ncpus > 1) {
+            buf[p++] = '-';
+            p = append_u32(buf, sizeof(buf) - 2, p, ncpus - 1);
+        }
+        buf[p++] = '\n';
+        long mfd = raw_syscall(__NR_memfd_create, (long)"cpu_online",
+                               (flags & O_CLOEXEC) ? 1 : 0, 0, 0, 0, 0);
+        if (mfd < 0)
+            return mfd;
+        long rc = write_all_fd((int)mfd, buf, p);
+        if (rc >= 0) rc = raw_syscall(__NR_lseek, mfd, 0, 0, 0, 0, 0);
+        if (rc < 0) {
+            raw_syscall(__NR_close, mfd, 0, 0, 0, 0, 0);
+            return rc;
+        }
+        return mfd;
+    }
+
+    if (strcmp(b->guest, "/proc/cpuinfo") != 0)
+        return -ENOENT;
+
+    /* Extract the first processor stanza's body from host /proc/cpuinfo to keep
+     * authentic Features/implementer/part fields while emitting exactly ncpus entries. */
+    size_t body_len = 0;
+    long kfd = raw_syscall(__NR_openat, AT_FDCWD, (long)"/proc/cpuinfo", O_RDONLY | O_CLOEXEC, 0, 0, 0);
+    if (kfd >= 0) {
+        size_t total = 0;
+        while (total < sizeof(b->proc_data)) {
+            long r = raw_syscall(__NR_read, kfd, (long)(b->proc_data + total),
+                                 (long)(sizeof(b->proc_data) - total), 0, 0, 0);
+            if (r <= 0) break;
+            total += (size_t)r;
+        }
+        raw_syscall(__NR_close, kfd, 0, 0, 0, 0, 0);
+        size_t pos = 0;
+        int in_first = 0;
+        while (pos < total) {
+            size_t nl = pos;
+            while (nl < total && b->proc_data[nl] != '\n') nl++;
+            size_t llen = (nl < total) ? (nl - pos + 1) : (nl - pos);
+            if (llen >= 9 && !strncmp(b->proc_data + pos, "processor", 9)) {
+                if (in_first)
+                    break;
+                in_first = 1;
+            } else if (in_first) {
+                if (llen <= 1)
+                    break;
+                if (body_len + llen < sizeof(b->proc_candidate)) {
+                    memcpy(b->proc_candidate + body_len, b->proc_data + pos, llen);
+                    body_len += llen;
+                }
+            }
+            pos += llen;
+        }
+    }
+    if (body_len == 0) {
+        const char *fallback = "Features\t: fp asimd evtstrm crc32\nCPU architecture: 8\n";
+        body_len = strlen(fallback);
+        memcpy(b->proc_candidate, fallback, body_len);
+    }
+
+    long mfd = raw_syscall(__NR_memfd_create, (long)"cpuinfo",
+                           (flags & O_CLOEXEC) ? 1 : 0, 0, 0, 0, 0);
+    if (mfd < 0)
+        return mfd;
+    long rc = 0;
+    for (uint32_t i = 0; i < ncpus && rc >= 0; i++) {
+        char hdr[48];
+        const char *pfx = "processor\t: ";
+        size_t p = strlen(pfx);
+        memcpy(hdr, pfx, p);
+        p = append_u32(hdr, sizeof(hdr) - 2, p, i);
+        hdr[p++] = '\n';
+        rc = write_all_fd((int)mfd, hdr, p);
+        if (rc >= 0) rc = write_all_fd((int)mfd, b->proc_candidate, body_len);
+        if (rc >= 0) rc = write_all_fd((int)mfd, "\n", 1);
+    }
+    if (rc >= 0) rc = raw_syscall(__NR_lseek, mfd, 0, 0, 0, 0, 0);
+    if (rc < 0) {
+        raw_syscall(__NR_close, mfd, 0, 0, 0, 0, 0);
+        return rc;
+    }
+    return mfd;
+}
+
+static uint64_t parse_kb_value(const char *line, size_t len)
+{
+    size_t i = 0;
+    while (i < len && line[i] != ':') i++;
+    if (i < len) i++;
+    while (i < len && (line[i] == ' ' || line[i] == '\t')) i++;
+    uint64_t v = 0;
+    while (i < len && line[i] >= '0' && line[i] <= '9') {
+        v = v * 10 + (uint64_t)(line[i] - '0');
+        i++;
+    }
+    return v;
+}
+
+static size_t format_meminfo_line(char *dst, size_t cap, const char *key, uint64_t kb)
+{
+    size_t p = 0;
+    for (size_t i = 0; key[i] && p < cap; i++) dst[p++] = key[i];
+    if (p < cap) dst[p++] = ' ';
+    char num[24];
+    size_t nlen = append_u64(num, sizeof(num), 0, kb);
+    size_t target_col = 24;
+    while (p + nlen < target_col && p < cap) dst[p++] = ' ';
+    for (size_t i = 0; i < nlen && p < cap; i++) dst[p++] = num[i];
+    const char *suf = " kB\n";
+    for (size_t i = 0; suf[i] && p < cap; i++) dst[p++] = suf[i];
+    return p;
+}
+
+/* Virtualize /proc/meminfo when --mem-mb is configured: cap MemTotal to
+ * mem_limit_mb * 1024 kB and clamp MemFree/MemAvailable/Buffers/Cached within it. */
+long pb_proc_meminfo(Bridge *b, int flags)
+{
+    if (!g_payload_config.mem_limit_mb || strcmp(b->guest, "/proc/meminfo") != 0)
+        return -ENOENT;
+    uint64_t limit_kb = (uint64_t)g_payload_config.mem_limit_mb * 1024ull;
+
+    long kfd = raw_syscall(__NR_openat, AT_FDCWD, (long)"/proc/meminfo", O_RDONLY | O_CLOEXEC, 0, 0, 0);
+    if (kfd < 0)
+        return kfd;
+    size_t total = 0;
+    while (total < sizeof(b->proc_data)) {
+        long r = raw_syscall(__NR_read, kfd, (long)(b->proc_data + total),
+                             (long)(sizeof(b->proc_data) - total), 0, 0, 0);
+        if (r <= 0) break;
+        total += (size_t)r;
+    }
+    raw_syscall(__NR_close, kfd, 0, 0, 0, 0, 0);
+
+    long mfd = raw_syscall(__NR_memfd_create, (long)"meminfo",
+                           (flags & O_CLOEXEC) ? 1 : 0, 0, 0, 0, 0);
+    if (mfd < 0)
+        return mfd;
+
+    long rc = 0;
+    size_t pos = 0;
+    size_t span_start = 0;
+    while (pos < total && rc >= 0) {
+        size_t nl = pos;
+        while (nl < total && b->proc_data[nl] != '\n') nl++;
+        size_t llen = (nl < total) ? (nl - pos + 1) : (nl - pos);
+        const char *lp = b->proc_data + pos;
+        const char *rkey = NULL;
+        uint64_t rval = 0;
+        if (llen >= 9 && !strncmp(lp, "MemTotal:", 9)) {
+            rkey = "MemTotal:";
+            rval = limit_kb;
+        } else if (llen >= 8 && !strncmp(lp, "MemFree:", 8)) {
+            uint64_t v = parse_kb_value(lp, llen);
+            if (v > limit_kb) { rkey = "MemFree:"; rval = limit_kb / 2; }
+        } else if (llen >= 13 && !strncmp(lp, "MemAvailable:", 13)) {
+            uint64_t v = parse_kb_value(lp, llen);
+            if (v > limit_kb) { rkey = "MemAvailable:"; rval = (limit_kb * 3) / 4; }
+        }
+        if (rkey) {
+            if (pos > span_start)
+                rc = write_all_fd((int)mfd, b->proc_data + span_start, pos - span_start);
+            if (rc >= 0) {
+                char line[96];
+                size_t n = format_meminfo_line(line, sizeof(line), rkey, rval);
+                rc = write_all_fd((int)mfd, line, n);
+            }
+            span_start = pos + llen;
+        }
+        pos += llen;
+    }
+    if (rc >= 0 && total > span_start)
+        rc = write_all_fd((int)mfd, b->proc_data + span_start, total - span_start);
+    if (rc >= 0) rc = raw_syscall(__NR_lseek, mfd, 0, 0, 0, 0, 0);
+    if (rc < 0) {
+        raw_syscall(__NR_close, mfd, 0, 0, 0, 0, 0);
+        return rc;
+    }
+    return mfd;
+}
