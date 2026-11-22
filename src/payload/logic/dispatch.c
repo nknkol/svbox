@@ -19,7 +19,9 @@
 #define PROT_READ     0x1
 #define PROT_WRITE    0x2
 #define PROT_EXEC     0x4
+#define MAP_FIXED     0x10
 #define MAP_ANONYMOUS 0x20
+#define MAP_FIXED_NOREPLACE 0x100000
 #define MAP_TYPE      0x0f
 #define MAP_PRIVATE   0x02
 
@@ -124,6 +126,16 @@ long dispatch_syscall(long number, long a[6])
         return faked;
     switch (number) {
     case __NR_mmap:
+        /* On HarmonyOS, a large unhinted mmap(NULL, ...) (e.g. Android Bionic
+         * Scudo's 8 GiB primary arena) is placed bottom-up from 0x10000,
+         * exhausting the low 4 GiB space required by Android ART's 32-bit
+         * compressed heap and boot image. Hint it above 4 GiB when unfixed. */
+        if (platform_is_harmonyos() && a[0] == 0 && (unsigned long)a[1] >= (1UL << 28) &&
+            !(a[3] & (MAP_FIXED | MAP_FIXED_NOREPLACE)))
+            a[0] = 0x1000000000L;
+        if (a[2] & PROT_EXEC)
+            return map_exec(number, a);
+        return passthrough(number, a);
     case __NR_mprotect:
         if (a[2] & PROT_EXEC)
             return map_exec(number, a);
