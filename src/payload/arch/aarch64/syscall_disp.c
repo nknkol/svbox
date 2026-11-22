@@ -84,6 +84,18 @@ long syscall_dispatcher(long sys_no, pt_regs *regs)
         fake_ids_stat_owner(sys_no, a);
         owners_stat(sys_no, a); /* R5: recorded owners and modes */
         union_lazy_stat(sys_no, a); /* R6: layer image placeholders */
+        /* HarmonyOS hmdfs reports st_dev == 0, breaking POSIX (st_dev, st_ino)
+         * deduplication in dynamic linkers and tools. */
+        if ((sys_no == __NR_fstat && a[1]) || (sys_no == __NR_newfstatat && a[2])) {
+            uint64_t *dev = (uint64_t *)(sys_no == __NR_fstat ? a[1] : a[2]);
+            if (*dev == 0)
+                *dev = 1;
+        } else if (sys_no == __NR_statx && a[4]) {
+            uint32_t *dmaj = (uint32_t *)((unsigned char *)a[4] + 136);
+            uint32_t *dmin = (uint32_t *)((unsigned char *)a[4] + 140);
+            if (*dmaj == 0 && *dmin == 0)
+                *dmin = 1;
+        }
     }
     /* struct utsname: six 65-byte fields; sysname, nodename, release. */
     if (!ret && sys_no == __NR_uname && a[0]) {

@@ -140,6 +140,13 @@ long dispatch_syscall(long number, long a[6])
         if (a[2] & PROT_EXEC)
             return map_exec(number, a);
         return passthrough(number, a);
+    /* HarmonyOS AArch64 enables TBID0 (data-only TBI), so tagged pointers
+     * trap infinitely on instruction fetch (e.g. JIT code in heap pages). */
+    case __NR_prctl:
+        if (platform_is_harmonyos() && (a[0] == 55 /* PR_SET_TAGGED_ADDR_CTRL */ ||
+                                        a[0] == 56 /* PR_GET_TAGGED_ADDR_CTRL */))
+            return -EINVAL;
+        return passthrough(number, a);
     /* glibc falls back from both; the sandbox kills rseq with SIGSYS. */
     case __NR_rseq:
     case __NR_clone3:
