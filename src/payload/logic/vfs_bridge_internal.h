@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <string.h>
 #include "config.h"
+#include "platform.h"
 #include "syscall_nums.h"
 #include "vfs_bridge.h"
 #include "fake_ids.h"

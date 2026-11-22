@@ -1273,6 +1273,12 @@ static long socket_address(Bridge *b, long number, long a[6])
      * own loopback address (net_view.h). */
     uint16_t family = 0;
     if (name && length >= 2) memcpy(&family, name, 2);
+    if (number == __NR_bind && family == 16 /* AF_NETLINK */ && platform_is_harmonyos()) {
+        long rc = raw_syscall(__NR_bind, a[0], a[1], a[2], 0, 0, 0);
+        if (rc == -EAFNOSUPPORT || rc == -EINVAL || rc == -EACCES || rc == -EPERM)
+            return 0;
+        return rc;
+    }
     if (net_enabled() && (family == AF_INET || family == AF_INET6)) {
         unsigned char moved[128];
         unsigned moved_length;

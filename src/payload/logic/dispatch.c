@@ -162,6 +162,19 @@ long dispatch_syscall(long number, long a[6])
         if (mounts_enabled() && (a[0] & ~0x00020000L /* CLONE_NEWNS */) == 0)
             return (a[0] & 0x00020000L) ? mounts_unshare() : 0;
         return platform_is_harmonyos() ? -ENOSYS : passthrough(number, a);
+    /* HarmonyOS app sandboxes refuse AF_NETLINK/NETLINK_KOBJECT_UEVENT with
+     * EACCES; fall back to an idle AF_UNIX SOCK_DGRAM so uevent listeners
+     * (udev/UEventObserver) block cleanly instead of aborting. */
+    case __NR_socket:
+        if (platform_is_harmonyos() && a[0] == 16 /* AF_NETLINK */ &&
+            a[2] == 15 /* NETLINK_KOBJECT_UEVENT */) {
+            long rc = passthrough(number, a);
+            if (rc == -EACCES || rc == -EPERM)
+                return raw_syscall(__NR_socket, 1 /* AF_UNIX */,
+                                   (a[1] & ~0xffL) | 2 /* SOCK_DGRAM */, 0, 0, 0, 0);
+            return rc;
+        }
+        return passthrough(number, a);
     /* The HarmonyOS sandbox kills these with SIGSYS: report them as not
      * implemented instead. Other kernels serve them natively. */
     case __NR_mount: case __NR_umount2: case __NR_pivot_root: case __NR_chroot:
