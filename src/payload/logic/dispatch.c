@@ -149,10 +149,16 @@ long dispatch_syscall(long number, long a[6])
     case __NR_fsopen: case __NR_fsconfig: case __NR_fsmount: case __NR_fspick:
     case __NR_open_tree: case __NR_move_mount: case __NR_mount_setattr:
         return mounts_enabled() ? -ENOSYS : passthrough(number, a);
+    /* Emulated mount table: unshare(CLONE_NEWNS) succeeds as a no-op since
+     * mount(2)/umount2(2) are already isolated in the emulated mount table. */
+    case __NR_unshare:
+        if (mounts_enabled() && (a[0] & ~0x00020000L /* CLONE_NEWNS */) == 0)
+            return 0;
+        return platform_is_harmonyos() ? -ENOSYS : passthrough(number, a);
     /* The HarmonyOS sandbox kills these with SIGSYS: report them as not
      * implemented instead. Other kernels serve them natively. */
     case __NR_mount: case __NR_umount2: case __NR_pivot_root: case __NR_chroot:
-    case __NR_unshare: case __NR_setns: case __NR_kcmp: case __NR_fchmodat2:
+    case __NR_setns: case __NR_kcmp: case __NR_fchmodat2:
     case __NR_close_range: case __NR_openat2: case __NR_open_by_handle_at:
     case __NR_io_uring_enter: case __NR_io_uring_register:
         return platform_is_harmonyos() ? -ENOSYS : passthrough(number, a);

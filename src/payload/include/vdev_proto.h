@@ -199,6 +199,25 @@ struct sv_binder_handle_cookie {
     uint64_t cookie;
 };
 
+#define SV_BINDER_BUFFER_FLAG_HAS_PARENT 0x01u
+
+struct sv_binder_buffer_object {
+    uint32_t type;
+    uint32_t flags;
+    uint64_t buffer;
+    uint64_t length;
+    uint64_t parent;
+    uint64_t parent_offset;
+};
+
+struct sv_binder_fd_array_object {
+    uint32_t type;
+    uint32_t pad;
+    uint64_t num_fds;
+    uint64_t parent;
+    uint64_t parent_offset;
+};
+
 /* Packed BINDER_WRITE_READ request over VDEV_OP_BINDER_WR:
  *   struct vdev_binder_wr_req
  *   followed by packed write stream:

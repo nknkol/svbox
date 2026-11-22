@@ -303,6 +303,7 @@ void options_print_help(int fd)
 		"Process & Identity:\n"
 		"  -w, --workdir DIR              Guest working directory (absolute guest path)\n"
 		"  -u, --user UID[:GID]           Initial guest uid and gid\n"
+		"  --cap-add ALL|HEX              Add Linux capability bits to default bounding set\n"
 		"  -e, --env KEY=VALUE            Set environment variable (repeatable)\n"
 		"  --hostname NAME                Override uname nodename\n"
 		"  --kernel-release VER           Override uname release\n"
@@ -508,6 +509,27 @@ void options_parse(int argc, char **argv, payload_config_t *cfg, struct loader_o
 			}
 			cfg->fake_group_count = 1;
 			cfg->fake_groups[0] = n > 1 ? ids[1] : 0;
+		} else if (is(arg, "--cap-add")) {
+			const char *v = value(argc, argv, &i);
+			if (is(v, "ALL") || is(v, "all")) {
+				cfg->extra_caps = ~0ull;
+			} else {
+				const char *p = v;
+				if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
+					p += 2;
+				uint64_t mask = 0;
+				if (!*p)
+					z_errx(1, "--cap-add expects ALL or a hex capability mask");
+				for (; *p; p++) {
+					uint64_t d;
+					if (*p >= '0' && *p <= '9') d = (uint64_t)(*p - '0');
+					else if (*p >= 'a' && *p <= 'f') d = (uint64_t)(*p - 'a' + 10);
+					else if (*p >= 'A' && *p <= 'F') d = (uint64_t)(*p - 'A' + 10);
+					else z_errx(1, "--cap-add expects ALL or a hex capability mask");
+					mask = (mask << 4) | d;
+				}
+				cfg->extra_caps |= mask;
+			}
 		} else if (is(arg, "-e") || is(arg, "--env")) {
 			const char *kv = value(argc, argv, &i);
 			if (!z_strchr(kv, '='))

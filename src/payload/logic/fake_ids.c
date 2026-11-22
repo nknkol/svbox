@@ -38,7 +38,8 @@ static int keepcaps;
 
 static void caps_from_ids(void)
 {
-    cap_bnd = DOCKER_CAPS;
+    uint64_t all_caps = (1ull << (CAP_LAST_ + 1)) - 1;
+    cap_bnd = (DOCKER_CAPS | g_payload_config.extra_caps) & all_caps;
     cap_prm = ids[0][REAL] == 0 || ids[0][EFFECTIVE] == 0 ? cap_bnd : 0;
     cap_eff = ids[0][EFFECTIVE] == 0 ? cap_prm : 0;
     cap_inh = cap_amb = 0;

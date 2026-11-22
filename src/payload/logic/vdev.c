@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include "syscall_nums.h"
 #include "config.h"
+#include "fake_ids.h"
 #include "vdev.h"
 #include "vdev_proto.h"
 
@@ -374,8 +375,8 @@ long vdev_path_call(long number, long a[6], int vdev_idx)
         memset(&req, 0, sizeof(req));
         req.pid = (uint32_t)raw_syscall(__NR_getpid, 0, 0, 0, 0, 0, 0);
         req.tid = (uint32_t)raw_syscall(__NR_gettid, 0, 0, 0, 0, 0, 0);
-        req.uid = g_payload_config.fake_ids[1];
-        req.gid = g_payload_config.fake_ids[5];
+        req.uid = fake_ids_effective(0);
+        req.gid = fake_ids_effective(1);
         req.vdev_type = (uint32_t)ve->type;
         req.flags = (uint32_t)a[2];
         size_t glen = strlen(ve->guest);
@@ -481,10 +482,12 @@ static long binder_write_read(struct vdev_open_slot *slot, unsigned long arg)
     if (rpc_fd < 0)
         return rpc_fd;
 
-    /* Drain any level-triggered epoll wakeup bytes on the notify socket. */
-    char drain[64];
-    while (raw_syscall(__NR_recvfrom, slot->fd, (long)drain, sizeof(drain),
-                       MSG_DONTWAIT_, 0, 0) > 0) {
+    /* Drain level-triggered epoll wakeup bytes only when actually reading. */
+    if (bwr.read_size > 0) {
+        char drain[64];
+        while (raw_syscall(__NR_recvfrom, slot->fd, (long)drain, sizeof(drain),
+                           MSG_DONTWAIT_, 0, 0) > 0) {
+        }
     }
 
     size_t buf_cap = 262144;
@@ -543,15 +546,21 @@ static long binder_write_read(struct vdev_open_slot *slot, unsigned long arg)
             if (txn.offsets_size > 0 && txn.data.ptr.offsets)
                 memcpy(toffs, (const void *)(uintptr_t)txn.data.ptr.offsets, (size_t)txn.offsets_size);
 
-            /* Extract any BINDER_TYPE_FD objects into SCM_RIGHTS array. */
+            /* Extract any BINDER_TYPE_FD / BINDER_TYPE_FDA objects into SCM_RIGHTS
+             * array, and append BINDER_TYPE_PTR scatter-gather payloads right after offsets. */
+            size_t sg_extra = 0;
             size_t n_offs = (size_t)txn.offsets_size / sizeof(uint64_t);
+            uint8_t *sg_packed_ptrs[64];
+            size_t sg_packed_lens[64];
+            memset(sg_packed_ptrs, 0, sizeof(sg_packed_ptrs));
+            memset(sg_packed_lens, 0, sizeof(sg_packed_lens));
             for (size_t k = 0; k < n_offs; k++) {
                 uint64_t o;
                 memcpy(&o, toffs + k * sizeof(uint64_t), sizeof(uint64_t));
-                if (o + sizeof(struct sv_binder_fd_object) <= txn.data_size) {
+                if (o + 4 <= txn.data_size) {
                     uint32_t otype;
                     memcpy(&otype, tdata + o, 4);
-                    if (otype == SV_BINDER_TYPE_FD) {
+                    if (otype == SV_BINDER_TYPE_FD && o + sizeof(struct sv_binder_fd_object) <= txn.data_size) {
                         struct sv_binder_fd_object fobj;
                         memcpy(&fobj, tdata + o, sizeof(fobj));
                         if (send_fd_count >= VDEV_MAX_FDS) {
@@ -562,12 +571,51 @@ static long binder_write_read(struct vdev_open_slot *slot, unsigned long arg)
                         send_fds[send_fd_count++] = (int)fobj.fd;
                         fobj.fd = fidx;
                         memcpy(tdata + o, &fobj, sizeof(fobj));
+                    } else if (otype == SV_BINDER_TYPE_PTR && o + sizeof(struct sv_binder_buffer_object) <= txn.data_size) {
+                        struct sv_binder_buffer_object bbo;
+                        memcpy(&bbo, tdata + o, sizeof(bbo));
+                        if (dst_off + total + sg_extra + bbo.length > dst_cap) {
+                            rc = -ENOMEM;
+                            break;
+                        }
+                        uint8_t *sg_dst = dst + dst_off + total + sg_extra;
+                        if (bbo.length > 0 && bbo.buffer)
+                            memcpy(sg_dst, (const void *)(uintptr_t)bbo.buffer, (size_t)bbo.length);
+                        if (k < 64) {
+                            sg_packed_ptrs[k] = sg_dst;
+                            sg_packed_lens[k] = (size_t)bbo.length;
+                        }
+                        sg_extra += (size_t)bbo.length;
+                    } else if (otype == SV_BINDER_TYPE_FDA && o + sizeof(struct sv_binder_fd_array_object) <= txn.data_size) {
+                        struct sv_binder_fd_array_object fda;
+                        memcpy(&fda, tdata + o, sizeof(fda));
+                        if (fda.parent < k && fda.parent < 64 && sg_packed_ptrs[fda.parent]) {
+                            for (uint64_t j = 0; j < fda.num_fds; j++) {
+                                size_t foff = (size_t)fda.parent_offset + (size_t)j * 4;
+                                if (foff + 4 > sg_packed_lens[fda.parent])
+                                    break;
+                                int32_t raw_fd = -1;
+                                memcpy(&raw_fd, sg_packed_ptrs[fda.parent] + foff, 4);
+                                int32_t fidx = -1;
+                                if (raw_fd >= 0) {
+                                    if (send_fd_count >= VDEV_MAX_FDS) {
+                                        rc = -EMFILE;
+                                        break;
+                                    }
+                                    fidx = (int32_t)send_fd_count;
+                                    send_fds[send_fd_count++] = raw_fd;
+                                }
+                                memcpy(sg_packed_ptrs[fda.parent] + foff, &fidx, 4);
+                            }
+                            if (rc < 0)
+                                break;
+                        }
                     }
                 }
             }
             if (rc < 0)
                 break;
-            dst_off += total;
+            dst_off += total + sg_extra;
         } else {
             if (dst_off + 4 + asz > dst_cap) {
                 rc = -ENOMEM;

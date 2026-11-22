@@ -172,6 +172,8 @@ typedef struct payload_config {
     /* --vdev GUEST:SOCK[:chr|binder]: generic userspace character-device proxies. */
     int32_t vdev_count;
     struct vdev_entry vdevs[CONFIG_MAX_VDEVS];
+    /* --cap-add ALL|<hex>: additional Linux capability bits added to default bounding set. */
+    uint64_t extra_caps;
     uint64_t guest_auxv_bytes;
     uint64_t guest_auxv[CONFIG_AUXV_PAIRS * 2];
 } payload_config_t;
