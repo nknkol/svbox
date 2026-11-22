@@ -172,6 +172,35 @@ long dispatch_syscall(long number, long a[6])
     case __NR_bpf:
 #endif
         return platform_is_harmonyos() ? -ENOSYS : passthrough(number, a);
+    /* Privileged host-wide syscalls killed by HarmonyOS HAP seccomp: return EPERM. */
+#ifdef __NR_settimeofday
+    case __NR_settimeofday:
+#endif
+#ifdef __NR_clock_settime
+    case __NR_clock_settime:
+#endif
+#ifdef __NR_adjtimex
+    case __NR_adjtimex:
+#endif
+#ifdef __NR_clock_adjtime
+    case __NR_clock_adjtime:
+#endif
+#ifdef __NR_sethostname
+    case __NR_sethostname:
+#endif
+#ifdef __NR_setdomainname
+    case __NR_setdomainname:
+#endif
+#ifdef __NR_acct
+    case __NR_acct:
+#endif
+#ifdef __NR_reboot
+    case __NR_reboot:
+#endif
+#ifdef __NR_syslog
+    case __NR_syslog:
+#endif
+        return platform_is_harmonyos() ? -EPERM : passthrough(number, a);
     default:
         return passthrough(number, a);
     }

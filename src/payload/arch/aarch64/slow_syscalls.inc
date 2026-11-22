@@ -459,3 +459,30 @@ SLOW_SYSCALL(__NR_capget)
 #ifdef __NR_capset
 SLOW_SYSCALL(__NR_capset)
 #endif
+#ifdef __NR_settimeofday
+SLOW_SYSCALL(__NR_settimeofday)
+#endif
+#ifdef __NR_clock_settime
+SLOW_SYSCALL(__NR_clock_settime)
+#endif
+#ifdef __NR_adjtimex
+SLOW_SYSCALL(__NR_adjtimex)
+#endif
+#ifdef __NR_clock_adjtime
+SLOW_SYSCALL(__NR_clock_adjtime)
+#endif
+#ifdef __NR_sethostname
+SLOW_SYSCALL(__NR_sethostname)
+#endif
+#ifdef __NR_setdomainname
+SLOW_SYSCALL(__NR_setdomainname)
+#endif
+#ifdef __NR_acct
+SLOW_SYSCALL(__NR_acct)
+#endif
+#ifdef __NR_reboot
+SLOW_SYSCALL(__NR_reboot)
+#endif
+#ifdef __NR_syslog
+SLOW_SYSCALL(__NR_syslog)
+#endif
