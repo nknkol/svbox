@@ -127,6 +127,69 @@ static int send_l3_packet(struct net_daemon *d, uint32_t ifindex, int is_v6,
 
 /* ---- TCP Connection Lifecycle & Helpers ---- */
 
+static inline uint32_t tcp_hash_bucket(int is_v6, uint16_t local_port,
+                                       uint16_t remote_port, const uint8_t remote_ip[16])
+{
+    uint32_t h = ((uint32_t)local_port << 16) | (uint32_t)remote_port;
+    h ^= (uint32_t)is_v6 * 0x9e3779b9u;
+    uint32_t w0 = 0;
+    memcpy(&w0, remote_ip, 4);
+    h ^= w0;
+    if (is_v6) {
+        uint32_t w1 = 0, w2 = 0, w3 = 0;
+        memcpy(&w1, remote_ip + 4, 4);
+        memcpy(&w2, remote_ip + 8, 4);
+        memcpy(&w3, remote_ip + 12, 4);
+        h ^= w1 * 0x85ebca6bu;
+        h ^= w2 * 0xc2b2ae35u;
+        h ^= w3;
+    }
+    h ^= h >> 16;
+    h *= 0x7feb352du;
+    h ^= h >> 15;
+    return h & (NET_TCP_HASH_BUCKETS - 1u);
+}
+
+static void tcp_hash_insert(struct net_daemon *d, struct tcp_conn *c)
+{
+    uint32_t b = tcp_hash_bucket(c->is_v6, c->local_port, c->remote_port, c->remote_ip);
+    c->hash_next = d->tcp_buckets[b];
+    d->tcp_buckets[b] = c->idx;
+}
+
+static void tcp_hash_remove(struct net_daemon *d, struct tcp_conn *c)
+{
+    uint32_t b = tcp_hash_bucket(c->is_v6, c->local_port, c->remote_port, c->remote_ip);
+    int *pp = &d->tcp_buckets[b];
+    while (*pp >= 0) {
+        int cur = *pp;
+        if (cur == c->idx) {
+            *pp = c->hash_next;
+            c->hash_next = -1;
+            return;
+        }
+        pp = &d->conns[cur].hash_next;
+    }
+    c->hash_next = -1;
+}
+
+static struct tcp_conn *tcp_hash_find(struct net_daemon *d, int is_v6,
+                                      uint16_t local_port, uint16_t remote_port,
+                                      const uint8_t remote_ip[16])
+{
+    size_t ip_cmp_len = is_v6 ? 16u : 4u;
+    uint32_t b = tcp_hash_bucket(is_v6, local_port, remote_port, remote_ip);
+    for (int idx = d->tcp_buckets[b]; idx >= 0; idx = d->conns[idx].hash_next) {
+        struct tcp_conn *cand = &d->conns[idx];
+        if (cand->active && cand->is_v6 == (uint8_t)is_v6 &&
+            cand->local_port == local_port && cand->remote_port == remote_port &&
+            memcmp(cand->remote_ip, remote_ip, ip_cmp_len) == 0) {
+            return cand;
+        }
+    }
+    return NULL;
+}
+
 static void tcp_free_ooo(struct tcp_conn *c)
 {
     for (int i = 0; i < NET_TCP_OOO_MAX; i++) {
@@ -162,6 +225,9 @@ static void tcp_destroy(struct net_daemon *d, struct tcp_conn *c, int abort_rst)
 {
     if (!c->active)
         return;
+    tcp_hash_remove(d, c);
+    if (d->active_conns > 0)
+        d->active_conns--;
     if (c->relay_fd >= 0) {
         epoll_ctl(d->ep_fd, EPOLL_CTL_DEL, c->relay_fd, NULL);
         if (abort_rst) {
@@ -182,9 +248,9 @@ static void tcp_destroy(struct net_daemon *d, struct tcp_conn *c, int abort_rst)
             d->flows[i].local_port == c->local_port &&
             d->flows[i].is_v6 == c->is_v6) {
             d->flows[i].active = 0;
+            net_sync_flow_slot(d, i);
         }
     }
-    net_sync_flow_table(d);
     c->active = 0;
     c->state = TCP_ST_CLOSED;
 }
@@ -512,19 +578,8 @@ static void stack_handle_tcp(struct net_daemon *d, uint32_t ifindex, int is_v6,
     uint16_t rwnd  = rd_be16(seg + 14);
     const uint8_t *payload = seg + doff;
     uint32_t plen = (uint32_t)(seg_len - doff);
-    size_t ip_cmp_len = is_v6 ? 16u : 4u;
 
-    struct tcp_conn *c = NULL;
-    for (int i = 0; i < NET_MAX_TCP_CONNS; i++) {
-        struct tcp_conn *cand = &d->conns[i];
-        if (!cand->active || cand->is_v6 != (uint8_t)is_v6)
-            continue;
-        if (cand->local_port == dport && cand->remote_port == sport &&
-            memcmp(cand->remote_ip, src_ip, ip_cmp_len) == 0) {
-            c = cand;
-            break;
-        }
-    }
+    struct tcp_conn *c = tcp_hash_find(d, is_v6, dport, sport, src_ip);
     if (!c) {
         if (!(flags & TCP_RST)) {
             if (flags & TCP_ACK)
@@ -771,6 +826,12 @@ void stack_init(struct net_daemon *d)
 {
     d->next_ip_id = 1;
     d->next_dns_port = 50000;
+    d->active_conns = 0;
+    d->conn_alloc_cursor = 0;
+    for (int i = 0; i < NET_TCP_HASH_BUCKETS; i++)
+        d->tcp_buckets[i] = -1;
+    for (int i = 0; i < NET_MAX_TCP_CONNS; i++)
+        d->conns[i].hash_next = -1;
 }
 
 void stack_on_tun_packet(struct net_daemon *d, uint32_t ifindex, const uint8_t *pkt, size_t len)
@@ -840,8 +901,13 @@ void stack_on_tcp_accept(struct net_daemon *d, int listen_fd, int is_v6)
         }
 
         int slot = -1;
-        for (int i = 0; i < NET_MAX_TCP_CONNS; i++) {
-            if (!d->conns[i].active) { slot = i; break; }
+        for (int n = 0; n < NET_MAX_TCP_CONNS; n++) {
+            int i = (d->conn_alloc_cursor + n) % NET_MAX_TCP_CONNS;
+            if (!d->conns[i].active) {
+                slot = i;
+                d->conn_alloc_cursor = (i + 1) % NET_MAX_TCP_CONNS;
+                break;
+            }
         }
         if (slot < 0) {
             close(cfd);
@@ -860,6 +926,7 @@ void stack_on_tcp_accept(struct net_daemon *d, int listen_fd, int is_v6)
         memset(c, 0, sizeof(*c));
         c->active = 1;
         c->idx = slot;
+        c->hash_next = -1;
         c->relay_fd = cfd;
         c->tag.kind = EP_TCP_RELAY;
         c->tag.idx = slot;
@@ -884,6 +951,8 @@ void stack_on_tcp_accept(struct net_daemon *d, int listen_fd, int is_v6)
         c->rto_ms = 200u;
         c->rtx_deadline_ms = net_now_ms() + c->rto_ms;
         c->last_activity_ms = net_now_ms();
+        tcp_hash_insert(d, c);
+        d->active_conns++;
 
         struct epoll_event ev;
         memset(&ev, 0, sizeof(ev));
@@ -1122,31 +1191,33 @@ void stack_on_tun_closed(struct net_daemon *d, uint32_t ifindex)
 void stack_tick(struct net_daemon *d)
 {
     uint64_t now = net_now_ms();
-    for (int i = 0; i < NET_MAX_TCP_CONNS; i++) {
-        struct tcp_conn *c = &d->conns[i];
-        if (!c->active)
-            continue;
-        if (c->state == TCP_ST_TIME_WAIT) {
-            if (now >= c->tw_deadline_ms)
-                tcp_destroy(d, c, 0);
-            continue;
-        }
-        if (c->rtx_deadline_ms != 0 && now >= c->rtx_deadline_ms) {
-            if (c->rtx_retries >= 8) {
-                tcp_send_seg(d, c, TCP_RST | TCP_ACK, c->snd_nxt, NULL, 0);
-                tcp_destroy(d, c, 1);
+    if (d->active_conns > 0) {
+        for (int i = 0; i < NET_MAX_TCP_CONNS; i++) {
+            struct tcp_conn *c = &d->conns[i];
+            if (!c->active)
+                continue;
+            if (c->state == TCP_ST_TIME_WAIT) {
+                if (now >= c->tw_deadline_ms)
+                    tcp_destroy(d, c, 0);
                 continue;
             }
-            c->rtx_retries++;
-            tcp_retransmit_una(d, c);
-            c->rto_ms *= 2u;
-            if (c->rto_ms > 4000u) c->rto_ms = 4000u;
-            c->rtx_deadline_ms = now + c->rto_ms;
-        }
-        /* Reap completely idle half-closed connections after 60s. */
-        if ((c->state == TCP_ST_FIN_WAIT_2 || c->state == TCP_ST_CLOSING) &&
-            now > c->last_activity_ms + 60000u) {
-            tcp_destroy(d, c, 0);
+            if (c->rtx_deadline_ms != 0 && now >= c->rtx_deadline_ms) {
+                if (c->rtx_retries >= 8) {
+                    tcp_send_seg(d, c, TCP_RST | TCP_ACK, c->snd_nxt, NULL, 0);
+                    tcp_destroy(d, c, 1);
+                    continue;
+                }
+                c->rtx_retries++;
+                tcp_retransmit_una(d, c);
+                c->rto_ms *= 2u;
+                if (c->rto_ms > 4000u) c->rto_ms = 4000u;
+                c->rtx_deadline_ms = now + c->rto_ms;
+            }
+            /* Reap completely idle half-closed connections after 60s. */
+            if ((c->state == TCP_ST_FIN_WAIT_2 || c->state == TCP_ST_CLOSING) &&
+                now > c->last_activity_ms + 60000u) {
+                tcp_destroy(d, c, 0);
+            }
         }
     }
     /* Expire stale UDP encap mappings after 120s. */

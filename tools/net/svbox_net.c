@@ -291,24 +291,30 @@ void net_recompute_tun_active(struct net_daemon *d)
     __atomic_add_fetch(&d->st->seq, 1u, __ATOMIC_RELEASE);
 }
 
+void net_sync_flow_slot(struct net_daemon *d, int idx)
+{
+    if (idx < 0 || idx >= SV_NET_FLOW_CAP)
+        return;
+    struct sv_net_flow_slot *dst = &d->st->flows[idx];
+    const struct pending_flow *src = &d->flows[idx];
+    if (!src->active) {
+        __atomic_store_n(&dst->active, 0u, __ATOMIC_RELEASE);
+    } else {
+        dst->local_port = src->local_port;
+        dst->dst_port = src->dst_port;
+        dst->proto = src->proto;
+        dst->is_v6 = src->is_v6;
+        dst->tun_ifindex = src->tun_ifindex;
+        memcpy(dst->dst_ip, src->dst_ip, 16);
+        memcpy(dst->tun_ip, src->tun_ip, 16);
+        __atomic_store_n(&dst->active, 1u, __ATOMIC_RELEASE);
+    }
+}
+
 void net_sync_flow_table(struct net_daemon *d)
 {
-    for (int i = 0; i < SV_NET_FLOW_CAP; i++) {
-        struct sv_net_flow_slot *dst = &d->st->flows[i];
-        const struct pending_flow *src = &d->flows[i];
-        if (!src->active) {
-            dst->active = 0;
-        } else {
-            dst->local_port = src->local_port;
-            dst->dst_port = src->dst_port;
-            dst->proto = src->proto;
-            dst->is_v6 = src->is_v6;
-            dst->tun_ifindex = src->tun_ifindex;
-            memcpy(dst->dst_ip, src->dst_ip, 16);
-            memcpy(dst->tun_ip, src->tun_ip, 16);
-            __atomic_store_n(&dst->active, 1u, __ATOMIC_RELEASE);
-        }
-    }
+    for (int i = 0; i < SV_NET_FLOW_CAP; i++)
+        net_sync_flow_slot(d, i);
 }
 
 static int route4_add(struct net_daemon *d, uint32_t dst_net, uint32_t prefix,
@@ -930,7 +936,7 @@ static void tun_on_readable(struct net_daemon *d, int tidx, uint32_t events)
 
     uint8_t buf[NET_MAX_PKT_SIZE];
     int closed = 0;
-    for (;;) {
+    for (int budget = 0; budget < 64; budget++) {
         ssize_t n = recv(td->data_fd, buf, sizeof(buf), MSG_DONTWAIT);
         if (n > 0) {
             const uint8_t *pkt = buf;
@@ -1465,7 +1471,7 @@ static void handle_ctl_client(struct net_daemon *d, int cfd)
         }
         fl->last_ms = net_now_ms();
         fl->encap = 0;
-        net_sync_flow_table(d);
+        net_sync_flow_slot(d, slot);
         net_send_ctl_reply(cfd, hdr.op, 0, 0, 0, NULL, 0, -1);
         close(cfd);
         return;
@@ -1638,7 +1644,7 @@ static int open_loop_tcp(int is_v6, uint16_t *port_out)
         memset(&a, 0, sizeof(a));
         a.sin6_family = AF_INET6;
         a.sin6_addr = in6addr_loopback;
-        if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(fd, 128) < 0) {
+        if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(fd, 512) < 0) {
             close(fd); return -1;
         }
         socklen_t len = sizeof(a);
@@ -1649,7 +1655,7 @@ static int open_loop_tcp(int is_v6, uint16_t *port_out)
         memset(&a, 0, sizeof(a));
         a.sin_family = AF_INET;
         a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(fd, 128) < 0) {
+        if (bind(fd, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(fd, 512) < 0) {
             close(fd); return -1;
         }
         socklen_t len = sizeof(a);
@@ -1870,7 +1876,7 @@ int main(int argc, char **argv)
     sa.sun_family = AF_UNIX;
     strncpy(sa.sun_path, sock_path, sizeof(sa.sun_path) - 1);
     if (bind(d->ctl_listen_fd, (struct sockaddr *)&sa, sizeof(sa)) < 0 ||
-        listen(d->ctl_listen_fd, 64) < 0) {
+        listen(d->ctl_listen_fd, 512) < 0) {
         perror("bind/listen net.sock");
         return 1;
     }
@@ -1897,10 +1903,10 @@ int main(int argc, char **argv)
         fflush(stderr);
     }
 
-    struct epoll_event events[64];
+    struct epoll_event events[256];
     uint64_t last_tick = net_now_ms();
     while (!g_stop) {
-        int n = epoll_wait(d->ep_fd, events, 64, 15);
+        int n = epoll_wait(d->ep_fd, events, 256, 15);
         for (int i = 0; i < n; i++) {
             struct ep_tag *tag = (struct ep_tag *)events[i].data.ptr;
             if (!tag) continue;

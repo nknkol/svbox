@@ -26,16 +26,19 @@
  * lowers are protected by the trees. */
 #ifndef UNION_VIEW_H
 #define UNION_VIEW_H
+#include <asm/stat.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <linux/limits.h>
 #include "config.h"
+#include "vfs_cache.h"
 
 #define UNION_LAYERS (1 + CONFIG_MAX_LOWERS)
 
 struct union_view {
     int count;                        /* layers, upper included */
+    bool ro_cacheable;                /* true only for root --lower without --isolate */
     const char *layer[UNION_LAYERS];  /* host directories, no trailing '/' */
     size_t length[UNION_LAYERS];
     /* Layer images (lazy_layer.h): the erofs file whose cache the layer is,
@@ -50,7 +53,9 @@ struct union_hit {
     bool dir;        /* the object is a directory */
     bool below;      /* a layer other than the upper has it (removal leaves a whiteout) */
     bool whiteout;   /* the upper hides it with a whiteout */
+    bool has_stat;   /* st holds the lstat result of the winning layer */
     uint32_t dirs;   /* directory: the layers whose copies merge (bit per layer) */
+    struct stat st;
 };
 
 /* Successive lookups of the same call share the walk of a common prefix. */
@@ -58,7 +63,10 @@ struct union_memo {
     bool valid;
     const void *view; /* the walk was of this view */
     size_t length;
-    uint32_t mask;   /* layers where rel[0..length) is a visible directory */
+    uint32_t mask;       /* layers where rel[0..length) is a visible directory */
+    uint32_t child_mask; /* subset of mask that may contain children (non-empty) */
+    bool upper_dir_valid;
+    struct vfs_upper_dir_info upper_dir;
     char rel[PATH_MAX];
 };
 

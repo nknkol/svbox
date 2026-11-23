@@ -15,9 +15,9 @@
 #define SV_NET_MAX_ROUTES     64
 #define SV_NET_MAX_ROUTES6    32
 #define SV_NET_MAX_UID_RULES  32
-#define SV_NET_PROTECT_CAP    512
-#define SV_NET_FLOW_CAP       256
-#define SV_NET_UDP_REP_CAP    256
+#define SV_NET_PROTECT_CAP    2048
+#define SV_NET_FLOW_CAP       2048
+#define SV_NET_UDP_REP_CAP    1024
 #define SV_NET_MAX_DNS        4
 
 #define SV_UDP_ENCAP_MAGIC    0x53565531u /* "SVU1" */

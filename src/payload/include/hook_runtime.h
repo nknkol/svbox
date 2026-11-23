@@ -14,5 +14,7 @@ long install_hook_file(void *target_base, size_t target_size, void *payload_entr
                        int fd, unsigned long file_off);
 /* Whether [addr, addr + len) touches loader, payload or stub-island memory. */
 int hook_protected_overlap(uintptr_t addr, size_t len);
+/* Reclaim pooled stub-island pages associated with an unmapped code range. */
+void hook_on_munmap(uintptr_t addr, size_t len);
 
 #endif /* PAYLOAD_HOOK_RUNTIME_H */

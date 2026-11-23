@@ -1,9 +1,14 @@
 /* SPDX-License-Identifier: MIT */
 /* Internal to the PRoot path backend: the per-call Bridge and the helpers
- * its parts share. vfs_bridge.c (path translation, dispatch, bridge
- * lifecycle), vfs_mounts.c (R4 mount table, tmpfs, loop devices,
- * overlay, /proc/filesystems), vfs_procfs.c (/proc links, cmdline,
- * mount tables). Not a public interface: include only from these. */
+ * its parts share:
+ *  - vfs_bridge.c : Bridge pool, table caching, optimism retry, public proot_* APIs
+ *  - vfs_walk.c   : path resolution, view/visibility, reverse map, secure walk, union_prepare
+ *  - vfs_ops.c    : syscall dispatch, mutations, owners, socket addresses
+ *  - vfs_glue.c   : synthetic bind-mount parent glue tree
+ *  - vfs_cache.c  : coherent read-only --lower stat/dir/readlink cache
+ *  - vfs_mounts.c : R4 mount table, tmpfs, loop devices, overlay, /proc/filesystems
+ *  - vfs_procfs.c : /proc links, cmdline, mount tables, status, cpuinfo, meminfo
+ * Not a public interface: include only from these. */
 #ifndef PROOT_BRIDGE_INTERNAL_H
 #define PROOT_BRIDGE_INTERNAL_H
 #include <asm/stat.h>
@@ -30,6 +35,7 @@
 #include "fake_ids.h"
 #include "container_state.h"
 #include "union_view.h"
+#include "vfs_cache.h"
 #include "net_view.h"
 #include "fd_runtime.h"
 #include "fs_policy.h"
@@ -61,6 +67,7 @@ struct guest_msghdr {
 _Static_assert(sizeof(struct guest_msghdr) == 56, "AArch64 msghdr ABI");
 
 #define BRIDGE_FRAMES 6
+#define DEEP_FRAMES_SIZE ((CANON_LEVELS - BRIDGE_FRAMES) * sizeof(PathFrame))
 #define LINK_HINTS 8
 struct link_hints {
     int count;
@@ -68,6 +75,10 @@ struct link_hints {
 };
 
 typedef struct {
+    /* Cached binding/mount/view tables across pooled Bridge reuses. */
+    bool table_ready;
+    uint64_t cached_mount_ver;
+
     BindingTable table;
     bool mutation;
     bool traverse; /* Final ancestor-only paths are acceptable for this call. */
@@ -84,18 +95,15 @@ typedef struct {
      * guarded walk rewrites b->host; the walk pins that same inode). */
     bool final_match;
     struct stat final_stat;
-    /* Isolation mode: every host lookup is a round trip to the broker.
-     * Optimistic resolution skips them and maps the guest path lexically;
-     * the broker then refuses (ELOOP) any symlink on the way, and the call
-     * is run again with full resolution. Allowed for the first attempt of
-     * a call; used once a resolution actually skipped lookups. */
+    /* Per-resolve last host_map dedup (eliminates redundant resolve_core final map). */
+    bool last_map_valid;
+    const struct union_view *last_map_view;
+    char last_map_guest[PATH_MAX];
+    char last_map_host[PATH_MAX];
+    /* Isolation mode: every host lookup is a round trip to the broker. */
     bool optimistic_allowed, optimistic, optimistic_used, force_full;
-    /* Symlinks the broker reported in earlier attempts of this call: an
-     * optimistic lookup of such a host path is a symlink, read from here. */
     const struct link_hints *hints;
-    /* Guarded modes: the final call goes through a directory descriptor
-     * walked component by component without following symlinks, so a
-     * component swapped for a symlink after resolution cannot redirect it. */
+    /* Guarded modes: walked parent directory descriptors. */
     bool secure;
     int walk_fd[4], walk_count;
     bool reads; /* Immutable read policy snapshot below is active. */
@@ -121,22 +129,15 @@ typedef struct {
     char proc_guest[PATH_MAX], proc_host[PATH_MAX], proc_link_host[PATH_MAX];
     char proc_data[8192]; /* A loader-run process's kernel cmdline. */
     char proc_candidate[PATH_MAX];
-    /* Path walking scratch kept off the guest stack: a vfork child may run
-     * on a small spawn stack (glibc posix_spawn gives about 36 KiB), and
-     * each followed symlink would otherwise cost 8 KiB of it. Deeper
-     * chains use deep_frames, mapped on first use and kept with the bridge. */
     PathFrame path_frames[BRIDGE_FRAMES];
     PathFrame *deep_frames;
     char resolve_scratch[2][PATH_MAX];
     char fd_host[PATH_MAX], mapped[PATH_MAX], final_host[PATH_MAX];
-    /* R6: the root's merged view (union_view.h). union_op says what the
-     * call does to its resolved name; resolution leaves the name's layer
-     * and path relative to the layers in union_layer/union_rel (layer -1:
-     * not in the view). */
+    /* R6: the root's merged view (union_view.h). */
     struct union_view views[1 + MOUNT_OVERLAYS];
     int view_count;
-    const struct union_view *uv, *first_uv; /* the view of union_rel, first_union_rel */
-    const struct union_view *map_view, *final_view; /* of the last mapping, of the resolution */
+    const struct union_view *uv, *first_uv;
+    const struct union_view *map_view, *final_view;
     bool root_union; /* views[0] is the root's */
     char overlay_lowers[MOUNT_OVERLAYS * CONFIG_MAX_LOWERS][CONFIG_MAX_PATH];
     bool union_on;
@@ -150,19 +151,41 @@ typedef struct {
 
 enum { UOP_READ, UOP_COPY, UOP_RECORD, UOP_CREATE, UOP_OPEN };
 
-/* Shared between the parts (pb_: proot bridge). */
-/* The guest of a bind the container unmounted: compared by address. */
+/* Shared between the VFS modules (pb_: proot bridge). */
 extern const char pb_unmounted[];
 #define UNMOUNTED pb_unmounted
-int pb_resolve(Bridge *b, int dirfd, const char *path, bool follow);
+
+/* vfs_glue.c */
+bool pb_glue_ancestor(const Bridge *b, const char *guest);
+int pb_glue_host(Bridge *b);
+bool pb_glue_guest(const char *host, char *guest);
+
+/* vfs_walk.c */
 int pb_bridge_alias(Bridge *b, const char *host, char *out);
-int pb_guest_link_target(Bridge *b, char *target);
+int pb_host_map(void *opaque, const char *guest, char *host);
+int pb_path_visibility(Bridge *b, const char *guest);
+int pb_watch_hides_child(Bridge *b, const char *guest);
 int pb_host_readlink(void *opaque, const char *path, char *out, size_t size);
+int pb_guest_link_target(Bridge *b, char *target);
+int pb_observed_guest_path(Bridge *b, const char *host, char *guest);
+int pb_preferred_guest_path(Bridge *b, const char *host, char *guest);
+int pb_host_fd(void *opaque, int fd, char *guest);
+long pb_guest_cwd(Bridge *b);
+int pb_union_fd(Bridge *b, int fd);
+bool pb_lexical_path(const char *path);
+int pb_resolve(Bridge *b, int dirfd, const char *path, bool follow);
+
+/* vfs_ops.c */
+long pb_dispatch(Bridge *b, long number, long a[6], struct proot_open_origin *origin);
+
+/* vfs_mounts.c */
 int pb_loop_device(const char *guest);
 long pb_loop_path_call(long number, long a[6], int device);
 long pb_mount_call(Bridge *b, long a[6]);
 long pb_umount_call(Bridge *b, long a[6]);
 long pb_proc_filesystems(Bridge *b, int flags);
+
+/* vfs_procfs.c */
 long pb_proc_cmdline(Bridge *b, int flags);
 int pb_proc_link(void *opaque, char *out, const char *path, const char *component, Comparison comparison);
 long pb_proc_mounts(Bridge *b, int flags);

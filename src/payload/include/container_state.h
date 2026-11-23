@@ -73,6 +73,7 @@ struct mount_table {
 _Static_assert(MOUNT_TABLE_SIZE == CONFIG_MOUNT_TABLE_BYTES, "the loader sizes the table");
 
 int mounts_enabled(void);
+uint64_t mounts_version(void);
 int mounts_unshare(void);
 /* Copies the used slots (count returned, at most max); free slots have an
  * empty guest. */

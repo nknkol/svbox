@@ -66,8 +66,12 @@ static long map_exec_copy(const long a[6])
         return mapped;
     long rc = read_region(fd, (unsigned char *)mapped, len, a[5]);
     if (rc >= 0 && install_hook_file((void *)mapped, len, (void *)&_start,
-                                     PROT_READ | PROT_WRITE, fd, (unsigned long)a[5]) < 0)
-        rc = -ENOMEM;
+                                     PROT_READ | PROT_WRITE, fd, (unsigned long)a[5]) < 0) {
+        /* With --seccomp-backstop active, unpatched svc #0 traps cleanly into
+         * payload via SIGSYS so even >256 MiB or packed VA segments succeed. */
+        if (!g_payload_config.seccomp_backstop)
+            rc = -ENOMEM;
+    }
     if (rc >= 0)
         rc = platform_mprotect_exec(mapped, len, prot);
     if (rc < 0) {
@@ -98,12 +102,16 @@ static long map_exec(long number, long a[6])
         return ret;
     unsigned long base = number == __NR_mmap ? (unsigned long)ret : (unsigned long)a[0];
     if (install_hook_prot((void *)base, (size_t)a[1], (void *)&_start, (int)a[2]) < 0) {
-        /* Fail closed: drop the mapping (or its execute right). */
-        if (number == __NR_mmap)
-            raw_syscall(__NR_munmap, (long)base, a[1], 0, 0, 0, 0);
-        else
-            raw_syscall(__NR_mprotect, (long)base, a[1], a[2] & ~PROT_EXEC, 0, 0, 0);
-        return -ENOMEM;
+        /* When --seccomp-backstop is active, leave unpatched svc #0 to the
+         * seccomp SIGSYS backstop instead of failing the mapping. */
+        if (!g_payload_config.seccomp_backstop) {
+            /* Fail closed: drop the mapping (or its execute right). */
+            if (number == __NR_mmap)
+                raw_syscall(__NR_munmap, (long)base, a[1], 0, 0, 0, 0);
+            else
+                raw_syscall(__NR_mprotect, (long)base, a[1], a[2] & ~PROT_EXEC, 0, 0, 0);
+            return -ENOMEM;
+        }
     }
     return number == __NR_mmap ? ret : 0;
 }

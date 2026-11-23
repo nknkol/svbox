@@ -13,6 +13,7 @@
 #include "fake_ids.h"
 #include "host_syscall.h"
 #include "fd_runtime.h"
+#include "hook_runtime.h"
 #include "vdev.h"
 static inline long dispatch_call(long n, long args[6])
 {
@@ -65,6 +66,8 @@ long syscall_dispatcher(long sys_no, pt_regs *regs)
     if (sys_no == __NR_ioctl && mounts_enabled() && proot_loop_ioctl(a[0], (unsigned long)a[1], a[2], &ret))
         return ret;
     ret = DISPATCH(sys_no, args);
+    if (sys_no == __NR_munmap && ret == 0)
+        hook_on_munmap((uintptr_t)a[0], (size_t)a[1]);
     /* R6: a directory of the merged view lists every layer. */
     if (sys_no == __NR_getdents64 && union_enabled())
         ret = union_getdents((int)a[0], (void *)a[1], (unsigned long)a[2], ret);

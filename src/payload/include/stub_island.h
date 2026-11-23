@@ -93,38 +93,66 @@ static inline int island_branch_ok(uintptr_t from, uintptr_t to)
 static inline int island_slot_ok(uintptr_t site, uintptr_t slot)
 {
     return island_branch_ok(site, slot) && island_branch_ok(slot + 15 * 4, site + 4) &&
-           island_branch_ok(slot + 17 * 4, site + 4) && island_branch_ok(slot + 27 * 4, site + 4);
+           island_branch_ok(slot + 17 * 4, site + 4) && island_branch_ok(slot + 27 * 4, site + 4) &&
+           island_branch_ok(slot + 31 * 4, site + 4);
 }
 
 /* An island of len bytes at exactly `want`, or 0. Kernels that treat
  * MAP_FIXED_NOREPLACE as a hint return another address: refused too. */
-static inline uintptr_t island_map_at(uintptr_t want, size_t len)
+static inline uintptr_t island_map_at_prot(uintptr_t want, size_t len, int prot)
 {
-    long r = island_mmap(want, len, ISLAND_PROT_READ | ISLAND_PROT_WRITE,
+    long r = island_mmap(want, len, prot,
                          ISLAND_MAP_PRIVATE | ISLAND_MAP_ANONYMOUS | ISLAND_MAP_FIXED_NOREPLACE);
     if (r < 0 && r > -4096) return 0;
     if ((uintptr_t)r != want) { island_munmap((uintptr_t)r, len); return 0; }
     return want;
 }
 
-/* Search outward from the code: after its end (dir > 0) or before its start. */
-static inline int island_place(struct island *is, uintptr_t lo, uintptr_t hi, size_t len, int dir)
+static inline uintptr_t island_map_at(uintptr_t want, size_t len)
 {
-    for (uintptr_t step = 0; step < (uintptr_t)ISLAND_REACH - ISLAND_STEP; step += ISLAND_STEP) {
+    return island_map_at_prot(want, len, ISLAND_PROT_READ | ISLAND_PROT_WRITE);
+}
+
+/* Search outward from the code with a given stride: after end (dir > 0) or before start. */
+static inline int island_place_stride(struct island *is, uintptr_t lo, uintptr_t hi, size_t len,
+                                      int dir, uintptr_t stride, uintptr_t max_dist, int prot)
+{
+    uintptr_t limit = (uintptr_t)ISLAND_REACH;
+    if (len >= limit) return 0;
+    limit -= len;
+    if (max_dist && max_dist < limit) limit = max_dist;
+    for (uintptr_t step = 0; step <= limit; step += stride) {
         uintptr_t want;
         if (dir > 0) {
             want = ((hi + ISLAND_PAGE - 1) & ~(ISLAND_PAGE - 1)) + step;
         } else {
-            uintptr_t top = (lo & ~(ISLAND_PAGE - 1)) - step;
-            if (top < len + ISLAND_PAGE) return 0;
-            want = top - len;
+            uintptr_t base_lo = lo & ~(ISLAND_PAGE - 1);
+            if (base_lo <= step + len + ISLAND_PAGE) return 0;
+            want = base_lo - step - len;
         }
-        if (island_map_at(want, len)) {
+        if (island_map_at_prot(want, len, prot)) {
             *is = (struct island){want, len, 0};
             return 1;
         }
     }
     return 0;
+}
+
+/* Three-stage outward hole search: fast 1 MiB coarse scan, then 64 KiB fine scan,
+ * then 4 KiB ultra-fine edge scan so even tight gaps in crowded VA spaces work. */
+static inline int island_place_prot(struct island *is, uintptr_t lo, uintptr_t hi, size_t len,
+                                    int dir, int prot)
+{
+    if (island_place_stride(is, lo, hi, len, dir, ISLAND_STEP, 0, prot))
+        return 1;
+    if (island_place_stride(is, lo, hi, len, dir, 65536ul, 0, prot))
+        return 1;
+    return island_place_stride(is, lo, hi, len, dir, ISLAND_PAGE, 2ul << 20, prot);
+}
+
+static inline int island_place(struct island *is, uintptr_t lo, uintptr_t hi, size_t len, int dir)
+{
+    return island_place_prot(is, lo, hi, len, dir, ISLAND_PROT_READ | ISLAND_PROT_WRITE);
 }
 
 static inline uintptr_t island_take(struct island *is, uintptr_t site)
@@ -169,17 +197,34 @@ static inline long island_hook_code(uintptr_t base, size_t size, uintptr_t paylo
     for (size_t i = 0; i < words; i++)
         sites += ISLAND_SITE(i);
     if (!sites) return 0;
-    /* The sites' word indexes, so later passes do not rescan the code. */
-    size_t list_len = (sites * sizeof(uint32_t) + ISLAND_PAGE - 1) & ~(ISLAND_PAGE - 1);
-    long list_mem = island_mmap(0, list_len, ISLAND_PROT_READ | ISLAND_PROT_WRITE,
-                                ISLAND_MAP_PRIVATE | ISLAND_MAP_ANONYMOUS);
-    if (list_mem < 0 && list_mem > -4096) return list_mem;
-    uint32_t *list = (uint32_t *)list_mem;
+    /* The sites' word indexes, so later passes do not rescan the code.
+     * Avoid mmap/munmap overhead on small JIT / shared-lib segments. */
+    uint32_t small_list[256];
+    uint32_t *list = small_list;
+    size_t list_len = 0;
+    if (sites > 256) {
+        list_len = (sites * sizeof(uint32_t) + ISLAND_PAGE - 1) & ~(ISLAND_PAGE - 1);
+        long list_mem = island_mmap(0, list_len, ISLAND_PROT_READ | ISLAND_PROT_WRITE,
+                                    ISLAND_MAP_PRIVATE | ISLAND_MAP_ANONYMOUS);
+        if (list_mem < 0 && list_mem > -4096) return list_mem;
+        list = (uint32_t *)list_mem;
+    }
     for (size_t i = 0, n = 0; i < words && n < sites; i++)
         if (ISLAND_SITE(i)) list[n++] = (uint32_t)i;
     size_t len = (sites * STUB_SIZE + ISLAND_PAGE - 1) & ~(ISLAND_PAGE - 1);
     struct island after = {0, 0, 0}, before = {0, 0, 0};
-    island_place(&after, base, base + size, len, 1);
+    int after_pooled = 0, before_pooled = 0;
+#ifdef ISLAND_HAS_POOL
+    if (size <= (120ul << 20)) {
+        uintptr_t pbase = island_pool_alloc(base, base + size, len);
+        if (pbase) {
+            after = (struct island){pbase, len, 0};
+            after_pooled = 1;
+        }
+    }
+#endif
+    if (!after.base)
+        island_place(&after, base, base + size, len, 1);
     /* Sites the after-island cannot reach (segments over 128 MiB). */
     size_t far = 0;
     for (size_t k = 0; k < sites; k++) {
@@ -190,7 +235,17 @@ static inline long island_hook_code(uintptr_t base, size_t size, uintptr_t paylo
     }
     if (far) {
         size_t far_len = (far * STUB_SIZE + ISLAND_PAGE - 1) & ~(ISLAND_PAGE - 1);
-        island_place(&before, base, base + size, far_len, -1);
+#ifdef ISLAND_HAS_POOL
+        if (size <= (120ul << 20)) {
+            uintptr_t pbase = island_pool_alloc(base, base + size, far_len);
+            if (pbase) {
+                before = (struct island){pbase, far_len, 0};
+                before_pooled = 1;
+            }
+        }
+#endif
+        if (!before.base)
+            island_place(&before, base, base + size, far_len, -1);
     }
     /* Assign every site before touching the code: all or nothing. */
     long rc = 0;
@@ -202,21 +257,44 @@ static inline long island_hook_code(uintptr_t base, size_t size, uintptr_t paylo
         stub_emit((void *)slot, payload_entry, site + 4);
     }
     struct island *islands[2] = {&after, &before};
+    int pooled[2] = {after_pooled, before_pooled};
     for (int k = 0; k < 2; k++) {
         struct island *is = islands[k];
         if (!is->base) continue;
-        if (rc || !is->used) { island_munmap(is->base, is->size); is->base = 0; continue; }
+        if (rc || !is->used) {
+#ifdef ISLAND_HAS_POOL
+            if (pooled[k]) island_pool_free(is->base, is->size);
+            else
+#endif
+            island_munmap(is->base, is->size);
+            is->base = 0;
+            continue;
+        }
         size_t used = (is->used + ISLAND_PAGE - 1) & ~(ISLAND_PAGE - 1);
-        if (used < is->size) island_munmap(is->base + used, is->size - used);
+        if (used < is->size) {
+#ifdef ISLAND_HAS_POOL
+            if (pooled[k]) island_pool_free(is->base + used, is->size - used);
+            else
+#endif
+            island_munmap(is->base + used, is->size - used);
+            is->size = used;
+        }
         island_flush(is->base, is->used);
         long p = island_mprotect(is->base, used, ISLAND_PROT_READ | ISLAND_PROT_EXEC);
         if (p < 0 && !rc) rc = p;
-        /* An island that cannot be protected is not used at all. */
-        if (p >= 0 && island_note(is->base, used) && !rc) rc = -12;
+        /* Non-pooled islands register individually; pooled regions are already protected. */
+        if (p >= 0 && !pooled[k] && island_note(is->base, used) && !rc) rc = -12;
     }
     for (int k = 0; rc && k < 2; k++) {
         struct island *is = islands[k];
-        if (is->base) { island_munmap(is->base, is->size); is->base = 0; }
+        if (is->base) {
+#ifdef ISLAND_HAS_POOL
+            if (pooled[k]) island_pool_free(is->base, is->size);
+            else
+#endif
+            island_munmap(is->base, is->size);
+            is->base = 0;
+        }
     }
     long hooked = 0;
     if (!rc) {
@@ -256,9 +334,18 @@ static inline long island_hook_code(uintptr_t base, size_t size, uintptr_t paylo
             }
             __asm__ volatile("dsb ish\n isb" ::: "memory");
             rc = island_mprotect(page_lo, span, final_prot);
+#ifdef ISLAND_HAS_POOL
+            if (!rc) {
+                for (int k = 0; k < 2; k++) {
+                    if (pooled[k] && islands[k]->base)
+                        island_pool_record(page_lo, span, islands[k]->base, islands[k]->size);
+                }
+            }
+#endif
         }
     }
-    island_munmap((uintptr_t)list, list_len);
+    if (list_len)
+        island_munmap((uintptr_t)list, list_len);
     return rc < 0 ? rc : hooked;
 }
 #undef ISLAND_SITE

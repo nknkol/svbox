@@ -45,7 +45,10 @@ extern long raw_syscall(long number, long a1, long a2, long a3, long a4, long a5
 #define MSG_NOSIGNAL_     0x4000
 #define MSG_CMSG_CLOEXEC_ 0x40000000
 #define PROT_READ_        1
+#define PROT_WRITE_       2
 #define MAP_SHARED_       1
+#define MAP_PRIVATE_      2
+#define MAP_ANONYMOUS_    0x20
 #define F_DUPFD_          0
 #define F_SETFD_          2
 #define F_GETFL_          3
@@ -112,8 +115,9 @@ static inline uint32_t ns_be32(uint32_t v) { return __builtin_bswap32(v); }
 static volatile int g_ns_lock = 0;
 static const struct sv_net_state *g_net_state = NULL;
 
-#define NS_MAX_NL_FDS    32
-#define NS_MAX_MARK_FDS  64
+#define NS_MAX_NL_FDS       64
+#define NS_MARK_INLINE_CAP  64
+#define NS_MARK_MAX_CAP     4096
 
 struct ns_nl_slot {
     int32_t  active;
@@ -131,8 +135,14 @@ struct ns_mark_slot {
     char     bind_dev[16];
 };
 
-static struct ns_nl_slot   g_nl_fds[NS_MAX_NL_FDS];
-static struct ns_mark_slot g_mark_fds[NS_MAX_MARK_FDS];
+static struct ns_nl_slot    g_nl_fds[NS_MAX_NL_FDS];
+static volatile int         g_nl_active_count = 0;
+
+static struct ns_mark_slot  g_mark_inline[NS_MARK_INLINE_CAP];
+static struct ns_mark_slot *g_mark_fds = g_mark_inline;
+static int                  g_mark_cap = NS_MARK_INLINE_CAP;
+static size_t               g_mark_mmap_bytes = 0;
+static volatile int         g_mark_active_count = 0;
 
 static void ns_lock(void)
 {
@@ -344,14 +354,19 @@ static struct ns_nl_slot *nl_find(int fd)
 
 static void nl_clear_fd(int fd)
 {
-    if (fd < 0) return;
+    if (fd < 0 || __atomic_load_n(&g_nl_active_count, __ATOMIC_RELAXED) == 0)
+        return;
     ns_lock();
+    int removed = 0;
     for (int i = 0; i < NS_MAX_NL_FDS; i++) {
         if (g_nl_fds[i].active && g_nl_fds[i].fd == fd) {
             g_nl_fds[i].active = 0;
             g_nl_fds[i].fd = -1;
+            removed++;
         }
     }
+    if (removed > 0)
+        __atomic_sub_fetch(&g_nl_active_count, removed, __ATOMIC_RELEASE);
     ns_unlock();
 }
 
@@ -359,9 +374,11 @@ static void nl_register(int fd, uint32_t nl_id, uint32_t groups, uint32_t pid)
 {
     ns_lock();
     int free_idx = -1;
+    int existed = 0;
     for (int i = 0; i < NS_MAX_NL_FDS; i++) {
         if (g_nl_fds[i].active && g_nl_fds[i].fd == fd) {
             free_idx = i;
+            existed = 1;
             break;
         }
         if (!g_nl_fds[i].active && free_idx < 0)
@@ -373,24 +390,56 @@ static void nl_register(int fd, uint32_t nl_id, uint32_t groups, uint32_t pid)
         g_nl_fds[free_idx].nl_id = nl_id;
         g_nl_fds[free_idx].nl_groups = groups;
         g_nl_fds[free_idx].nl_pid = pid;
+        if (!existed)
+            __atomic_add_fetch(&g_nl_active_count, 1, __ATOMIC_RELEASE);
     }
     ns_unlock();
+}
+
+static int mark_grow_locked(void)
+{
+    if (g_mark_cap >= NS_MARK_MAX_CAP)
+        return -1;
+    int new_cap = g_mark_cap * 4;
+    if (new_cap < 256) new_cap = 256;
+    if (new_cap > NS_MARK_MAX_CAP) new_cap = NS_MARK_MAX_CAP;
+    size_t raw_bytes = (size_t)new_cap * sizeof(struct ns_mark_slot);
+    size_t map_bytes = (raw_bytes + 4095u) & ~(size_t)4095u;
+    long addr = raw_syscall(__NR_mmap, 0, (long)map_bytes, PROT_READ_ | PROT_WRITE_,
+                            MAP_PRIVATE_ | MAP_ANONYMOUS_, -1, 0);
+    if (addr < 0 || (unsigned long)addr >= (unsigned long)-4095)
+        return -1;
+    struct ns_mark_slot *ntbl = (struct ns_mark_slot *)addr;
+    memcpy(ntbl, g_mark_fds, (size_t)g_mark_cap * sizeof(struct ns_mark_slot));
+    if (g_mark_fds != g_mark_inline && g_mark_mmap_bytes > 0)
+        raw_syscall(__NR_munmap, (long)g_mark_fds, (long)g_mark_mmap_bytes, 0, 0, 0, 0);
+    g_mark_fds = ntbl;
+    g_mark_cap = new_cap;
+    g_mark_mmap_bytes = map_bytes;
+    return 0;
 }
 
 static struct ns_mark_slot *mark_find_locked(int fd, int create)
 {
     if (fd < 0) return NULL;
     int free_idx = -1;
-    for (int i = 0; i < NS_MAX_MARK_FDS; i++) {
+    for (int i = 0; i < g_mark_cap; i++) {
         if (g_mark_fds[i].active && g_mark_fds[i].fd == fd)
             return &g_mark_fds[i];
         if (!g_mark_fds[i].active && free_idx < 0)
             free_idx = i;
     }
-    if (create && free_idx >= 0) {
+    if (create) {
+        if (free_idx < 0) {
+            int old_cap = g_mark_cap;
+            if (mark_grow_locked() < 0)
+                return NULL;
+            free_idx = old_cap;
+        }
         memset(&g_mark_fds[free_idx], 0, sizeof(g_mark_fds[free_idx]));
         g_mark_fds[free_idx].active = 1;
         g_mark_fds[free_idx].fd = fd;
+        __atomic_add_fetch(&g_mark_active_count, 1, __ATOMIC_RELEASE);
         return &g_mark_fds[free_idx];
     }
     return NULL;
@@ -398,19 +447,26 @@ static struct ns_mark_slot *mark_find_locked(int fd, int create)
 
 static void mark_clear_fd(int fd)
 {
-    if (fd < 0) return;
+    if (fd < 0 || __atomic_load_n(&g_mark_active_count, __ATOMIC_RELAXED) == 0)
+        return;
     ns_lock();
-    for (int i = 0; i < NS_MAX_MARK_FDS; i++) {
+    int removed = 0;
+    for (int i = 0; i < g_mark_cap; i++) {
         if (g_mark_fds[i].active && g_mark_fds[i].fd == fd) {
             g_mark_fds[i].active = 0;
             g_mark_fds[i].fd = -1;
+            removed++;
         }
     }
+    if (removed > 0)
+        __atomic_sub_fetch(&g_mark_active_count, removed, __ATOMIC_RELEASE);
     ns_unlock();
 }
 
 static int mark_is_bypass(int fd)
 {
+    if (fd < 0 || __atomic_load_n(&g_mark_active_count, __ATOMIC_RELAXED) == 0)
+        return 0;
     int bypass = 0;
     ns_lock();
     struct ns_mark_slot *s = mark_find_locked(fd, 0);
@@ -424,6 +480,9 @@ static void dup_tracked_fd(int oldfd, int newfd)
 {
     if (oldfd < 0 || newfd < 0 || oldfd == newfd)
         return;
+    if (__atomic_load_n(&g_nl_active_count, __ATOMIC_RELAXED) == 0 &&
+        __atomic_load_n(&g_mark_active_count, __ATOMIC_RELAXED) == 0)
+        return;
     ns_lock();
     struct ns_nl_slot nl_copy;
     int has_nl = 0;
@@ -436,7 +495,7 @@ static void dup_tracked_fd(int oldfd, int newfd)
     }
     struct ns_mark_slot mk_copy;
     int has_mk = 0;
-    for (int i = 0; i < NS_MAX_MARK_FDS; i++) {
+    for (int i = 0; i < g_mark_cap; i++) {
         if (g_mark_fds[i].active && g_mark_fds[i].fd == oldfd) {
             mk_copy = g_mark_fds[i];
             has_mk = 1;
@@ -445,18 +504,23 @@ static void dup_tracked_fd(int oldfd, int newfd)
     }
     /* Clear any prior slot at newfd. */
     for (int i = 0; i < NS_MAX_NL_FDS; i++) {
-        if (g_nl_fds[i].active && g_nl_fds[i].fd == newfd)
+        if (g_nl_fds[i].active && g_nl_fds[i].fd == newfd) {
             g_nl_fds[i].active = 0;
+            __atomic_sub_fetch(&g_nl_active_count, 1, __ATOMIC_RELEASE);
+        }
     }
-    for (int i = 0; i < NS_MAX_MARK_FDS; i++) {
-        if (g_mark_fds[i].active && g_mark_fds[i].fd == newfd)
+    for (int i = 0; i < g_mark_cap; i++) {
+        if (g_mark_fds[i].active && g_mark_fds[i].fd == newfd) {
             g_mark_fds[i].active = 0;
+            __atomic_sub_fetch(&g_mark_active_count, 1, __ATOMIC_RELEASE);
+        }
     }
     if (has_nl) {
         for (int i = 0; i < NS_MAX_NL_FDS; i++) {
             if (!g_nl_fds[i].active) {
                 g_nl_fds[i] = nl_copy;
                 g_nl_fds[i].fd = newfd;
+                __atomic_add_fetch(&g_nl_active_count, 1, __ATOMIC_RELEASE);
                 break;
             }
         }
@@ -839,9 +903,10 @@ int net_stack_pre_syscall(long number, long a[6], long *out)
     }
 
     /* 3. Virtual Netlink FD operations. */
-    if (number == __NR_bind || number == __NR_getsockname || number == __NR_sendto ||
-        number == __NR_sendmsg || number == __NR_setsockopt ||
-        number == __NR_recvfrom || number == __NR_recvmsg) {
+    if (__atomic_load_n(&g_nl_active_count, __ATOMIC_RELAXED) > 0 &&
+        (number == __NR_bind || number == __NR_getsockname || number == __NR_sendto ||
+         number == __NR_sendmsg || number == __NR_setsockopt ||
+         number == __NR_recvfrom || number == __NR_recvmsg)) {
         ns_lock();
         struct ns_nl_slot *nls = nl_find((int)a[0]);
         struct ns_nl_slot nl_copy;
@@ -1283,7 +1348,8 @@ void net_stack_post_syscall(long number, long a[6], long ret, unsigned name_cap)
     }
 
     /* Virtual netlink recvfrom/recvmsg: synthesize kernel sockaddr_nl (nl_pid = 0). */
-    if (number == __NR_recvfrom || number == __NR_recvmsg) {
+    if ((number == __NR_recvfrom || number == __NR_recvmsg) &&
+        __atomic_load_n(&g_nl_active_count, __ATOMIC_RELAXED) > 0) {
         ns_lock();
         int is_nl = nl_find((int)a[0]) != NULL;
         ns_unlock();
@@ -1522,6 +1588,9 @@ static const char *match_proc_net_leaf(const char *p)
 long net_stack_proc_call(long number, long a[6], const char *guest_path)
 {
     if (!net_stack_enabled() || !guest_path || guest_path[0] != '/')
+        return -ENOENT;
+    /* Fast bail-out: only /proc/... and /sys/class/net... are handled here. */
+    if (guest_path[1] != 'p' && guest_path[1] != 's')
         return -ENOENT;
 
     /* 1. /proc[/<pid>|self]/net/{dev,route,if_inet6} */

@@ -5,18 +5,17 @@
 #include "config.h"
 #include "platform.h"
 #include "stub.h"
-#include "stub_island.h"
 #include "syscall_nums.h"
 
 /*
  * Run-time hooking: code that becomes executable (shared libraries, JIT
  * output) is scanned for svc instructions, which are replaced by branches
- * to stubs calling the payload. Stub placement (stub_island.h): islands on
- * either side cover segments up to 256 MiB; otherwise the whole range
- * fails. Raw syscalls only, no host libc.
+ * to stubs calling the payload. Uses a page-granular shared region pool so
+ * small shared libraries and JIT allocations reuse protected VA regions and
+ * reclaim stub pages when guest code is munmapped. Raw syscalls only.
  */
 
-
+#define PROT_NONE   0x0
 #define PROT_READ   0x1
 #define PROT_WRITE  0x2
 #define PROT_EXEC   0x4
@@ -25,6 +24,13 @@
 #endif
 
 extern long raw_syscall(long sys_no, long a1, long a2, long a3, long a4, long a5, long a6);
+
+#define ISLAND_HAS_POOL 1
+static uintptr_t island_pool_alloc(uintptr_t lo, uintptr_t hi, size_t len);
+static void island_pool_free(uintptr_t base, size_t len);
+static void island_pool_record(uintptr_t code_lo, size_t code_len, uintptr_t island_base, size_t island_len);
+
+#include "stub_island.h"
 
 long island_mmap(uintptr_t addr, size_t len, int prot, int flags)
 {
@@ -46,14 +52,12 @@ long island_pread(int fd, void *buf, size_t len, long offset)
 /* Memory the guest's own mm calls must not unmap, remap or reprotect: the
  * payload image and the loader image with its islands (fixed before the
  * guest runs: the config the loader wrote), and the islands made at run
- * time (appended lock-free; fork copies them). Nothing is lazily copied,
- * so no check can see a half-filled table. */
+ * time (appended lock-free; fork copies them). */
 #define PROTECTED_MAX 4096
 static uintptr_t protected_lo[PROTECTED_MAX], protected_hi[PROTECTED_MAX];
 static unsigned protected_count;
 extern char __ehdr_start[], _end[];
 
-/* Nonzero when the table is full: callers must not rely on protection. */
 static int protected_add(uintptr_t lo, uintptr_t hi)
 {
     unsigned n = __atomic_load_n(&protected_count, __ATOMIC_ACQUIRE);
@@ -88,6 +92,198 @@ int hook_protected_overlap(uintptr_t addr, size_t len)
         if (hi && addr < hi && end > protected_lo[i]) return 1;
     }
     return 0;
+}
+
+/* ---- Page-granular Shared Region Stub Pool + munmap reclamation ---- */
+#define POOL_MAX_REGIONS 64
+#define POOL_PAGES       64u
+#define POOL_BYTES       (POOL_PAGES * ISLAND_PAGE) /* 256 KiB per region */
+#define POOL_MAX_ALLOC   (16u * ISLAND_PAGE)        /* 64 KiB max single pooled carve */
+#define POOL_TRACK_MAX   1024
+
+struct stub_pool_region {
+    uintptr_t base;
+    uint64_t  used_mask; /* bit i = page i is allocated */
+};
+
+struct stub_code_track {
+    uintptr_t code_lo;
+    uintptr_t code_hi;
+    uintptr_t island_base;
+    size_t    island_len;
+};
+
+static volatile int g_pool_lock = 0;
+static struct stub_pool_region g_pools[POOL_MAX_REGIONS];
+static unsigned g_pool_count = 0;
+static struct stub_code_track g_tracks[POOL_TRACK_MAX];
+static unsigned g_track_active = 0;
+
+static void pool_lock(void)
+{
+    while (__sync_lock_test_and_set(&g_pool_lock, 1))
+        __asm__ volatile("yield" ::: "memory");
+}
+
+static void pool_unlock(void)
+{
+    __sync_lock_release(&g_pool_lock);
+}
+
+static int pool_range_ok(uintptr_t lo, uintptr_t hi, uintptr_t pbase, size_t plen)
+{
+    if (!hi || hi <= lo) return 0;
+    uintptr_t first_site = lo;
+    uintptr_t last_site = (hi - 4) & ~(uintptr_t)3;
+    uintptr_t first_slot = pbase;
+    uintptr_t last_slot = pbase + plen - STUB_SIZE;
+    return island_slot_ok(first_site, first_slot) &&
+           island_slot_ok(first_site, last_slot) &&
+           island_slot_ok(last_site, first_slot) &&
+           island_slot_ok(last_site, last_slot);
+}
+
+static uintptr_t pool_carve_locked(struct stub_pool_region *r, uintptr_t lo, uintptr_t hi,
+                                   unsigned npages, size_t len)
+{
+    uint64_t want_mask = (npages >= 64u) ? ~0ull : ((1ull << npages) - 1ull);
+    for (unsigned p = 0; p + npages <= POOL_PAGES; p++) {
+        uint64_t m = want_mask << p;
+        if ((r->used_mask & m) == 0) {
+            uintptr_t addr = r->base + (uintptr_t)p * ISLAND_PAGE;
+            if (pool_range_ok(lo, hi, addr, len)) {
+                r->used_mask |= m;
+                return addr;
+            }
+        }
+    }
+    return 0;
+}
+
+static uintptr_t island_pool_alloc(uintptr_t lo, uintptr_t hi, size_t len)
+{
+    if (!len || len > POOL_MAX_ALLOC || (len & (ISLAND_PAGE - 1)))
+        return 0;
+    unsigned npages = (unsigned)(len / ISLAND_PAGE);
+    uintptr_t addr = 0;
+
+    pool_lock();
+    for (unsigned i = 0; i < g_pool_count; i++) {
+        addr = pool_carve_locked(&g_pools[i], lo, hi, npages, len);
+        if (addr) break;
+    }
+    pool_unlock();
+
+    if (addr) {
+        if (raw_syscall(__NR_mprotect, (long)addr, (long)len, PROT_READ | PROT_WRITE, 0, 0, 0) < 0) {
+            island_pool_free(addr, len);
+            return 0;
+        }
+        return addr;
+    }
+
+    /* Try to reserve a new 256 KiB PROT_NONE region nearby (after, then before). */
+    struct island reg = {0, 0, 0};
+    if (!island_place_prot(&reg, lo, hi, POOL_BYTES, 1, PROT_NONE) &&
+        !island_place_prot(&reg, lo, hi, POOL_BYTES, -1, PROT_NONE))
+        return 0;
+
+    if (island_note(reg.base, POOL_BYTES) != 0) {
+        island_munmap(reg.base, POOL_BYTES);
+        return 0;
+    }
+
+    pool_lock();
+    if (g_pool_count < POOL_MAX_REGIONS) {
+        struct stub_pool_region *r = &g_pools[g_pool_count++];
+        r->base = reg.base;
+        r->used_mask = 0;
+        addr = pool_carve_locked(r, lo, hi, npages, len);
+    }
+    pool_unlock();
+
+    if (!addr) {
+        /* Region is already in protected_ranges; leave it PROT_NONE if pool table full. */
+        return 0;
+    }
+    if (raw_syscall(__NR_mprotect, (long)addr, (long)len, PROT_READ | PROT_WRITE, 0, 0, 0) < 0) {
+        island_pool_free(addr, len);
+        return 0;
+    }
+    return addr;
+}
+
+static void island_pool_free(uintptr_t base, size_t len)
+{
+    if (!base || !len || (base & (ISLAND_PAGE - 1)) || (len & (ISLAND_PAGE - 1)))
+        return;
+    unsigned npages = (unsigned)(len / ISLAND_PAGE);
+    if (npages == 0 || npages > POOL_PAGES)
+        return;
+    /* Drop permissions before returning pages to the free bitmap. */
+    raw_syscall(__NR_mprotect, (long)base, (long)len, PROT_NONE, 0, 0, 0);
+    pool_lock();
+    for (unsigned i = 0; i < g_pool_count; i++) {
+        uintptr_t rb = g_pools[i].base;
+        if (base >= rb && base + len <= rb + POOL_BYTES) {
+            unsigned p = (unsigned)((base - rb) / ISLAND_PAGE);
+            uint64_t m = (npages >= 64u) ? ~0ull : (((1ull << npages) - 1ull) << p);
+            g_pools[i].used_mask &= ~m;
+            break;
+        }
+    }
+    pool_unlock();
+}
+
+static void island_pool_record(uintptr_t code_lo, size_t code_len, uintptr_t island_base, size_t island_len)
+{
+    if (!code_len || !island_base || !island_len)
+        return;
+    pool_lock();
+    for (unsigned i = 0; i < POOL_TRACK_MAX; i++) {
+        if (!g_tracks[i].island_base) {
+            g_tracks[i].code_lo = code_lo;
+            g_tracks[i].code_hi = code_lo + code_len;
+            g_tracks[i].island_base = island_base;
+            g_tracks[i].island_len = island_len;
+            __atomic_fetch_add(&g_track_active, 1u, __ATOMIC_RELEASE);
+            break;
+        }
+    }
+    pool_unlock();
+}
+
+void hook_on_munmap(uintptr_t addr, size_t len)
+{
+    if (!len || __atomic_load_n(&g_track_active, __ATOMIC_ACQUIRE) == 0)
+        return;
+    uintptr_t u_lo = addr & ~(ISLAND_PAGE - 1);
+    uintptr_t u_hi = (addr + len + ISLAND_PAGE - 1) & ~(ISLAND_PAGE - 1);
+    if (u_hi <= u_lo)
+        return;
+
+    uintptr_t free_bases[16];
+    size_t free_lens[16];
+    unsigned free_n = 0;
+
+    pool_lock();
+    for (unsigned i = 0; i < POOL_TRACK_MAX; i++) {
+        if (g_tracks[i].island_base &&
+            u_lo <= g_tracks[i].code_lo && u_hi >= g_tracks[i].code_hi) {
+            if (free_n < 16) {
+                free_bases[free_n] = g_tracks[i].island_base;
+                free_lens[free_n] = g_tracks[i].island_len;
+                free_n++;
+            }
+            g_tracks[i].island_base = 0;
+            g_tracks[i].island_len = 0;
+            __atomic_fetch_sub(&g_track_active, 1u, __ATOMIC_RELEASE);
+        }
+    }
+    pool_unlock();
+
+    for (unsigned i = 0; i < free_n; i++)
+        island_pool_free(free_bases[i], free_lens[i]);
 }
 
 long install_hook_prot(void *target_base, size_t target_size, void *payload_entry, int prot)

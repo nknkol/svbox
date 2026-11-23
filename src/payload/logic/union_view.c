@@ -15,6 +15,7 @@
 #include "broker_proto.h"
 #include "lazy_layer.h"
 #include "union_view.h"
+#include "vfs_cache.h"
 
 extern long raw_syscall(long number, long a1, long a2, long a3, long a4, long a5, long a6);
 
@@ -106,6 +107,7 @@ bool union_root(struct union_view *u)
 {
     const payload_config_t *cfg = &g_payload_config;
     if (cfg->lower_count <= 0 || !cfg->root[0]) return false;
+    u->ro_cacheable = !cfg->isolate;
     u->layer[0] = cfg->root;
     u->image[0] = NULL;
     u->count = 1;
@@ -136,6 +138,7 @@ int union_views(struct union_view *views, int max, char (*storage)[CONFIG_MAX_PA
         used++;
         struct union_view *u = &views[n++];
         u->count = 1 + count;
+        u->ro_cacheable = false;
         u->layer[0] = mounts[i].host;
         u->image[0] = NULL;
         for (int k = 0; k < count; k++) { u->layer[1 + k] = lowers[k]; u->image[1 + k] = NULL; }
@@ -350,17 +353,24 @@ static int walk(const struct union_view *u, const char *rel, struct union_hit *h
     char path[PATH_MAX];
     uint32_t all = (1u << u->count) - 1, mask = all;
     size_t pos = 0, len = strlen(rel);
+    bool p_udir_valid = false;
+    struct vfs_upper_dir_info p_udir;
     while (len && rel[len - 1] == '/') len--;
     if (memo && memo->view != u) memo->valid = false;
     if (memo && memo->valid && memo->length <= len && !strncmp(rel, memo->rel, memo->length) &&
         (rel[memo->length] == '/' || memo->length == len)) {
-        mask = memo->mask;
+        mask = (memo->length == len) ? memo->mask : memo->child_mask;
         pos = memo->length;
+        if (memo->length < len && memo->upper_dir_valid) {
+            p_udir_valid = true;
+            p_udir = memo->upper_dir;
+        }
     }
     hit->layer = -1;
     hit->dir = false;
     hit->below = false;
     hit->whiteout = false;
+    hit->has_stat = false;
     hit->dirs = 0;
     long lazy = lazy_tops(u);
     if (lazy < 0) return (int)lazy;
@@ -391,27 +401,107 @@ static int walk(const struct union_view *u, const char *rel, struct union_hit *h
         }
         int first = -1;
         bool first_dir = false, stop = false, below = false, whiteout = false;
-        uint32_t next_mask = 0;
+        bool first_has_st = false, defer_upper_opq = false;
+        bool cur_udir_valid = false;
+        struct vfs_upper_dir_info cur_udir;
+        struct stat first_st;
+        uint32_t next_mask = 0, child_mask = 0;
         for (int i = 0; i < u->count; i++) {
             if (!(mask & (1u << i))) continue;
             int rc = join(path, u->layer[i], u->length[i], rel, next, NULL);
             if (rc < 0) return rc;
             struct stat st;
-            if (lstat_at(path, &st) == 0) {
+            if (i > 0 && u->ro_cacheable && !u->image[i]) {
+                bool has_below_layers = (mask >> (i + 1)) != 0;
+                char opq_path[PATH_MAX], wh_path[PATH_MAX];
+                const char *opq_p = NULL, *wh_p = NULL;
+                if (has_below_layers) {
+                    if (join(opq_path, u->layer[i], u->length[i], rel, next, OPAQUE) == 0)
+                        opq_p = opq_path;
+                    int wrc = join(wh_path, u->layer[i], u->length[i], rel, start, ".wh.");
+                    size_t at = wrc < 0 ? 0 : strlen(wh_path);
+                    if (wrc < 0 || at + (next - start) >= PATH_MAX) return -ENAMETOOLONG;
+                    memcpy(wh_path + at, rel + start, next - start);
+                    wh_path[at + next - start] = 0;
+                    wh_p = wh_path;
+                }
+                bool empty_dir = false, is_opq = false, has_wh = false;
+                int found = vfs_ro_lookup(i, path, rel, next,
+                                          has_below_layers && !stop, opq_p,
+                                          has_below_layers, wh_p,
+                                          &st, &empty_dir, &is_opq, &has_wh);
+                if (found > 0) {
+                    bool is_dir = (st.st_mode & S_IFMT_) == S_IFDIR_;
+                    if (first < 0) {
+                        first = i;
+                        first_dir = is_dir;
+                        first_st = st;
+                        first_has_st = true;
+                    }
+                    below = true;
+                    if (!stop) {
+                        if (first_dir && is_dir) {
+                            next_mask |= 1u << i;
+                            if (!empty_dir)
+                                child_mask |= 1u << i;
+                            if (is_opq)
+                                stop = true;
+                        } else {
+                            stop = true;
+                        }
+                    }
+                    if (stop && (!last || !need_below || below)) break;
+                } else {
+                    if (has_wh)
+                        break;
+                }
+            } else if (i == 0 && u->ro_cacheable && p_udir_valid &&
+                       !vfs_upper_bloom_may_contain(&p_udir, rel + start, next - start)) {
+                /* Coherent parent upper-dir Bloom filter guarantees absent in upper. */
+                if (p_udir.has_any_wh && ((mask >> 1) || need_below)) {
+                    rc = join(path, u->layer[0], u->length[0], rel, start, ".wh.");
+                    size_t at = rc < 0 ? 0 : strlen(path);
+                    if (rc < 0 || at + (next - start) >= PATH_MAX) return -ENAMETOOLONG;
+                    memcpy(path + at, rel + start, next - start);
+                    path[at + next - start] = 0;
+                    if (exists(path)) {
+                        if (first < 0) whiteout = true;
+                        break;
+                    }
+                }
+            } else if (lstat_at(path, &st) == 0) {
                 bool is_dir = (st.st_mode & S_IFMT_) == S_IFDIR_;
                 if (is_dir && u->image[i]) {
                     long lr = lazy_dir(u, i, path, &st);
                     if (lr < 0) return (int)lr;
                 }
-                if (first < 0) { first = i; first_dir = is_dir; }
+                if (first < 0) {
+                    first = i;
+                    first_dir = is_dir;
+                    first_st = st;
+                    first_has_st = true;
+                }
                 if (i > 0) below = true;
                 if (!stop) {
                     if (first_dir && is_dir) {
                         next_mask |= 1u << i;
-                        /* Opaque: the layers below do not merge in. */
-                        if ((mask >> (i + 1)) &&
-                            join(path, u->layer[i], u->length[i], rel, next, OPAQUE) == 0 && exists(path))
+                        child_mask |= 1u << i;
+                        if (i == 0 && u->ro_cacheable) {
+                            cur_udir_valid = !need_below && vfs_upper_dir_probe(path, &st, &cur_udir);
+                            if (cur_udir_valid) {
+                                if ((mask >> 1) && cur_udir.has_opaque)
+                                    stop = true;
+                            } else if ((mask >> 1) && !need_below) {
+                                defer_upper_opq = true;
+                            } else if ((mask >> 1) &&
+                                       join(path, u->layer[0], u->length[0], rel, next, OPAQUE) == 0 &&
+                                       exists(path)) {
+                                stop = true;
+                            }
+                        } else if ((mask >> (i + 1)) &&
+                            join(path, u->layer[i], u->length[i], rel, next, OPAQUE) == 0 && exists(path)) {
                             stop = true;
+                        }
                     } else {
                         stop = true;
                     }
@@ -419,29 +509,49 @@ static int walk(const struct union_view *u, const char *rel, struct union_hit *h
                 if (stop && (!last || !need_below || below)) break;
             } else {
                 /* A whiteout of this name hides the layers below:
-                 * <layer><parent>/.wh.<name>. */
-                rc = join(path, u->layer[i], u->length[i], rel, start, ".wh.");
-                size_t at = rc < 0 ? 0 : strlen(path);
-                if (rc < 0 || at + (next - start) >= PATH_MAX) return -ENAMETOOLONG;
-                memcpy(path + at, rel + start, next - start);
-                path[at + next - start] = 0;
-                if (exists(path)) {
-                    if (i == 0 && first < 0) whiteout = true;
-                    break;
+                 * <layer><parent>/.wh.<name>. Skip when no lower layer
+                 * remains in mask (unless need_below needs upper whiteout flag),
+                 * or when coherent upper-dir scan proved zero .wh.* exist. */
+                bool skip_wh = (i == 0 && u->ro_cacheable && p_udir_valid && !p_udir.has_any_wh);
+                if (!skip_wh && ((mask >> (i + 1)) || (i == 0 && need_below))) {
+                    rc = join(path, u->layer[i], u->length[i], rel, start, ".wh.");
+                    size_t at = rc < 0 ? 0 : strlen(path);
+                    if (rc < 0 || at + (next - start) >= PATH_MAX) return -ENAMETOOLONG;
+                    memcpy(path + at, rel + start, next - start);
+                    path[at + next - start] = 0;
+                    if (exists(path)) {
+                        if (i == 0 && first < 0) whiteout = true;
+                        break;
+                    }
                 }
             }
         }
+        if (defer_upper_opq && (child_mask & ~1u)) {
+            if (join(path, u->layer[0], u->length[0], rel, next, OPAQUE) == 0 && exists(path)) {
+                next_mask = 1u;
+                child_mask = 1u;
+            }
+        }
+        bool next_udir_valid = (next_mask & 1u) && cur_udir_valid;
         if (last) {
             hit->layer = first;
             hit->dir = first >= 0 && first_dir;
             hit->below = below;
             hit->whiteout = whiteout;
             hit->dirs = hit->dir ? next_mask : 0;
+            if (first_has_st) {
+                hit->st = first_st;
+                hit->has_stat = true;
+            }
             if (memo && hit->dir && next < PATH_MAX) {
                 memcpy(memo->rel, rel, next);
                 memo->rel[next] = 0;
                 memo->length = next;
                 memo->mask = next_mask;
+                memo->child_mask = child_mask;
+                memo->upper_dir_valid = next_udir_valid;
+                if (next_udir_valid)
+                    memo->upper_dir = cur_udir;
                 memo->view = u;
                 memo->valid = true;
             }
@@ -454,13 +564,20 @@ static int walk(const struct union_view *u, const char *rel, struct union_hit *h
             hit->dirs = first < 0 ? 0 : 1u << first;
             return 0;
         }
-        mask = next_mask;
+        mask = child_mask;
         pos = next;
+        p_udir_valid = next_udir_valid;
+        if (next_udir_valid)
+            p_udir = cur_udir;
         if (memo && next < PATH_MAX) {
             memcpy(memo->rel, rel, next);
             memo->rel[next] = 0;
             memo->length = next;
-            memo->mask = mask;
+            memo->mask = next_mask;
+            memo->child_mask = child_mask;
+            memo->upper_dir_valid = next_udir_valid;
+            if (next_udir_valid)
+                memo->upper_dir = cur_udir;
             memo->view = u;
             memo->valid = true;
         }
@@ -672,6 +789,7 @@ long union_copy_up(const struct union_view *u, const char *rel, bool data)
     rc = copy_parents(s, u, rel);
     if (!rc) rc = copy_one(s, u, hit.layer, rel, data);
     scratch_put(s);
+    vfs_upper_note_mutation();
     return rc;
 }
 
@@ -714,7 +832,7 @@ long union_prepare_create(const struct union_view *u, const char *rel, bool *opa
     if (!rel[0]) return -EEXIST;
     if (union_hidden_name(final_name(rel)) && strlen(final_name(rel)) >= 4) return -EPERM;
     struct union_hit hit;
-    long rc = walk(u, rel, &hit, NULL, false);
+    long rc = walk(u, rel, &hit, NULL, true);
     if (rc < 0) return rc;
     if (hit.layer >= 0) return -EEXIST;
     if (hit.dirs) return -ENOTDIR; /* A non-directory on the way. */
@@ -728,6 +846,7 @@ long union_prepare_create(const struct union_view *u, const char *rel, bool *opa
         *opaque = true;
     }
     scratch_put(s);
+    vfs_upper_note_mutation();
     return rc;
 }
 
@@ -739,6 +858,7 @@ long union_make_opaque(const struct union_view *u, const char *rel)
     long fd = hs(__NR_openat, AT_FDCWD_, (long)path, O_WRONLY_ | O_CREAT_ | O_CLOEXEC_, 0600, 0, 0);
     if (fd < 0) return fd;
     raw_syscall(__NR_close, fd, 0, 0, 0, 0, 0);
+    vfs_upper_note_mutation();
     return 0;
 }
 
@@ -847,6 +967,7 @@ long union_remove(const struct union_view *u, const char *rel, bool dir)
     if (!s) return -ENOMEM;
     long rc = remove_in(s, u, rel, dir);
     scratch_put(s);
+    vfs_upper_note_mutation();
     return rc;
 }
 
@@ -912,6 +1033,7 @@ long union_rename(const struct union_view *u, const char *from, const char *to, 
     if (!s) return -ENOMEM;
     long rc = rename_in(s, u, from, to, flags);
     scratch_put(s);
+    vfs_upper_note_mutation();
     return rc;
 }
 

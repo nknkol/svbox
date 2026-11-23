@@ -8,12 +8,13 @@
 #include "vdev_proto.h"
 #include "net_proto.h"
 
-#define NET_MAX_TUNS       16
-#define NET_MAX_NLS        64
-#define NET_MAX_TCP_CONNS  256
-#define NET_MAX_UDP_PORTS  256
-#define NET_MAX_DNS_REQS   32
-#define NET_TCP_BUF_SIZE   262144u /* 256 KiB per-direction ring */
+#define NET_MAX_TUNS         16
+#define NET_MAX_NLS          256
+#define NET_MAX_TCP_CONNS    2048
+#define NET_MAX_UDP_PORTS    2048
+#define NET_MAX_DNS_REQS     128
+#define NET_TCP_HASH_BUCKETS 4096
+#define NET_TCP_BUF_SIZE     262144u /* 256 KiB per-direction ring */
 #define NET_TCP_OOO_MAX    16
 #define NET_MAX_PKT_SIZE   65536u
 
@@ -100,6 +101,7 @@ struct tcp_ooo_seg {
 struct tcp_conn {
     int            active;
     int            idx;
+    int            hash_next;    /* next conn idx in tcp_buckets chain, or -1 */
     int            relay_fd;
     int            ep_out_armed;
     struct ep_tag  tag;
@@ -179,6 +181,9 @@ struct net_daemon {
     struct nl_client      nls[NET_MAX_NLS];
     struct pending_flow   flows[SV_NET_FLOW_CAP];
     struct tcp_conn       conns[NET_MAX_TCP_CONNS];
+    int                   tcp_buckets[NET_TCP_HASH_BUCKETS];
+    int                   active_conns;
+    int                   conn_alloc_cursor;
     struct dns_pending    dns_reqs[NET_MAX_DNS_REQS];
 };
 
@@ -188,6 +193,7 @@ void net_recompute_tun_active(struct net_daemon *d);
 struct sv_net_iface *net_find_iface_by_idx(struct net_daemon *d, uint32_t ifindex);
 struct tun_dev *net_find_tun_by_ifindex(struct net_daemon *d, uint32_t ifindex);
 int net_tun_send_packet(struct net_daemon *d, uint32_t ifindex, const uint8_t *pkt, size_t len);
+void net_sync_flow_slot(struct net_daemon *d, int idx);
 void net_sync_flow_table(struct net_daemon *d);
 int net_send_ctl_reply(int fd, uint32_t op, int32_t status, uint32_t proc_id,
                        uint64_t arg0, const void *payload, uint32_t payload_len, int send_fd);

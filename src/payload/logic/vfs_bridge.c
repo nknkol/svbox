@@ -1,1862 +1,20 @@
 /* SPDX-License-Identifier: MIT */
-/* PRoot path backend: path translation, the syscall dispatch and the
- * per-call bridge (vfs_bridge_internal.h lists the other parts). */
+/* PRoot path backend lifecycle: Bridge pool, mount/binding/view table caching,
+ * isolation optimistic retry loop, getdents visibility filter, and public
+ * proot_* entry points (see vfs_bridge_internal.h for sibling modules). */
 #include "vfs_bridge_internal.h"
-#include "vdev.h"
-#include "net_stack.h"
-
-/* The view holding a host path (union_find), NULL if none. */
-static const struct union_view *bridge_view(Bridge *b, const char *host, int *layer, const char **rel)
-{
-    int v = union_find(b->views, b->view_count, host, layer, rel);
-    return v < 0 ? NULL : &b->views[v];
-}
-
-/* A path in the root's lower layers as the root's upper names it; 1 if
- * rewritten. (The lowerdirs of an overlay mount are guest directories of
- * their own, named as such.) */
-int pb_bridge_alias(Bridge *b, const char *host, char *out)
-{
-    return b->root_union ? union_alias(&b->views[0], host, out) : 0;
-}
-
-/* The view whose upper holds host (the longest), NULL if none. */
-static const struct union_view *upper_view(Bridge *b, const char *host)
-{
-    const struct union_view *best = NULL;
-    for (int v = 0; v < b->view_count; v++) {
-        const struct union_view *u = &b->views[v];
-        size_t n = u->length[0];
-        if (!strncmp(host, u->layer[0], n) && (host[n] == 0 || host[n] == '/') &&
-            (!best || n > best->length[0]))
-            best = u;
-    }
-    return best;
-}
 
 size_t proot_bridge_scratch_size(void) { return sizeof(Bridge); }
 
 /* A free or hidden mount slot: a prefix no path has. */
 const char pb_unmounted[] = "/\001elf-unmounted";
 
-/* A case variant of a marked mountpoint names it on this host storage: use
- * its exact spelling, so mount selection and policy see the same object. */
-static void respell(void *opaque, char *path)
-{
-    Bridge *b = opaque;
-    for (size_t i = 0; i < b->table.count && i < (size_t)g_payload_config.bind_count; i++) {
-        const PathBinding *e = &b->table.entries[i];
-        uint32_t fold = g_payload_config.binds[i].fold;
-        if (!fold || e->guest == UNMOUNTED) continue;
-        size_t from = fold - 1, n = strlen(e->guest), k = from;
-        if (strncmp(path, e->guest, from)) continue;
-        for (; k < n; k++) {
-            char x = path[k], y = e->guest[k];
-            if (x >= 'A' && x <= 'Z') x |= 0x20;
-            if (y >= 'A' && y <= 'Z') y |= 0x20;
-            if (x != y) break;
-        }
-        if (k == n && (path[n] == '\0' || path[n] == '/'))
-            memcpy(path + from, e->guest + from, n - from);
-    }
-}
+/* ---- Bridge Pool & Table Caching ---- */
 
-#define DEEP_FRAMES_SIZE ((CANON_LEVELS - BRIDGE_FRAMES) * sizeof(PathFrame))
-static PathFrame *deep_frames(void *opaque)
-{
-    Bridge *b = opaque;
-    if (!b->deep_frames) {
-        long mem = raw_syscall(__NR_mmap, 0, DEEP_FRAMES_SIZE, 3, 0x22, -1, 0);
-        if ((unsigned long)mem >= (unsigned long)-4095)
-            return NULL;
-        b->deep_frames = (PathFrame *)mem;
-    }
-    return b->deep_frames;
-}
-
-static int host_map(void *opaque, const char *guest, char *host)
-{
-    Bridge *b = opaque;
-    int rc = binding_table_map(&b->table, GUEST, guest, host);
-    /* R6: a name in the root's layers (through the root or a bind made of
-     * it) is shown by the topmost layer that has it. */
-    if (rc >= 0 && b->union_on) {
-        pb_bridge_alias(b, host, host);
-        const struct union_view *view = upper_view(b, host);
-        b->map_view = view;
-        int u = view ? union_map(view, host, NULL, &b->umemo) : 0;
-        if (u < 0) return u;
-    }
-    return rc;
-}
-
-/* Lexical decision for a canonical guest path, before any host lookup. */
-static int path_visibility(Bridge *b, const char *guest)
-{
-    if (!b->reads) return FS_VISIBLE;
-    /* A final "/" or "." keeps directory semantics in PRoot's canonical
-     * result; classify the directory itself. */
-    size_t length = strnlen(guest, PATH_MAX);
-    if (length == PATH_MAX) return -ENAMETOOLONG;
-    memcpy(b->classified, guest, length + 1);
-    for (;;) {
-        if (length > 1 && b->classified[length - 1] == '/') b->classified[--length] = 0;
-        else if (length > 2 && !strcmp(b->classified + length - 2, "/."))
-            b->classified[length -= 2] = 0;
-        else break;
-    }
-    if (!length || !strcmp(b->classified, "/.")) strcpy(b->classified, "/");
-    size_t mount;
-    int rc = binding_table_mount_id(&b->table, b->classified, &mount);
-    if (rc < 0) return rc;
-    return fs_policy_visibility(&b->policy, mount, b->classified, b->exposed, b->exposed_count);
-}
-
-/* inotify reports names of a watched directory's direct children. Refuse a
- * watch whose events could name a hidden bind mountpoint (or the host object
- * aliased there); event filtering per watch descriptor is not modeled. */
-static int watch_hides_child(Bridge *b, const char *guest)
-{
-    size_t length = strlen(guest);
-    for (size_t i = 0; b->reads && i < b->table.count; i++) {
-        const char *child = b->table.entries[i].guest;
-        size_t parent = 0;
-        for (size_t j = 1; child[j]; j++)
-            if (child[j] == '/') parent = j;
-        if (!parent) parent = 1; /* Direct child of "/". */
-        if (parent != length || strncmp(child, guest, length)) continue;
-        int visibility = path_visibility(b, child);
-        if (visibility < 0) return visibility;
-        if (visibility == FS_HIDDEN) return -EACCES;
-    }
-    return 0;
-}
-
-/* PRoot "glue": a guest directory that does not exist on the host but leads
- * to a bind destination (component-wise strict ancestor of one). */
-static bool glue_ancestor(const Bridge *b, const char *guest)
-{
-    size_t length = strlen(guest);
-    for (size_t i = 0; i < b->table.count; i++) {
-        const char *target = b->table.entries[i].guest;
-        if (length == 1 && guest[0] == '/') { if (target[1]) return true; continue; }
-        if (!strncmp(target, guest, length) && target[length] == '/' && target[length + 1])
-            return true;
-    }
-    return false;
-}
-
-/* Glue directories missing from the root are served, like PRoot's glue in
- * its temporary directory, from a private read-only tree that mirrors every
- * bind destination: they can be opened, listed and entered. The tree lives
- * under the glue base (PROOT_TMP_DIR, TMPDIR or /tmp), is named after the
- * user and mount table, is built once and atomically, and is shared by every
- * process of the same view. Nothing is created in the root. */
-static char glue_name[PATH_MAX];
-static int glue_named, glue_state, glue_scanned;
-static unsigned short glue_missing[CONFIG_MAX_BINDS];
-
-static const char *glue_tree(void)
-{
-    const payload_config_t *cfg = &g_payload_config;
-    if (__atomic_load_n(&glue_named, __ATOMIC_ACQUIRE))
-        return glue_named > 0 ? glue_name : NULL;
-    unsigned long long hash = 0xcbf29ce484222325ULL;
-    long uid = raw_syscall(__NR_getuid, 0, 0, 0, 0, 0, 0);
-    for (int i = -2; i < cfg->bind_count; i++) {
-        const unsigned char *p = (const unsigned char *)(i == -2 ? "" : i == -1 ? cfg->root :
-                                                         cfg->binds[i].src);
-        for (int pass = 0; pass < 2; pass++) {
-            for (; *p; p++) hash = (hash ^ *p) * 0x100000001b3ULL;
-            hash = (hash ^ (pass ? 0 : 0xff)) * 0x100000001b3ULL;
-            if (i < 0) break;
-            p = (const unsigned char *)cfg->binds[i].dst;
-        }
-    }
-    hash = (hash ^ (unsigned long long)uid) * 0x100000001b3ULL;
-    size_t length = strlen(cfg->glue_dir);
-    int named = -1;
-    if (cfg->glue_dir[0] == '/' && length + 32 < PATH_MAX) {
-        memcpy(glue_name, cfg->glue_dir, length);
-        while (length > 1 && glue_name[length - 1] == '/') length--;
-        memcpy(glue_name + length, "/proot-glue-", 12);
-        length += 12;
-        for (int shift = 60; shift >= 0; shift -= 4)
-            glue_name[length++] = "0123456789abcdef"[(hash >> shift) & 15];
-        glue_name[length] = 0;
-        named = 1;
-    }
-    __atomic_store_n(&glue_named, named, __ATOMIC_RELEASE);
-    return named > 0 ? glue_name : NULL;
-}
-
-/* Per bind, the length of its shallowest ancestor missing from the root
- * mount (0 if none), scanned once per process. */
-static void glue_scan(Bridge *b)
-{
-    if (__atomic_load_n(&glue_scanned, __ATOMIC_ACQUIRE)) return;
-    for (size_t i = 0; i < b->table.count; i++) {
-        const char *dst = b->table.entries[i].guest;
-        unsigned short missing = 0;
-        for (size_t j = 1; dst[j] && !missing; j++) {
-            if (dst[j] != '/') continue;
-            memcpy(b->proc_guest, dst, j);
-            b->proc_guest[j] = 0;
-            size_t mount;
-            struct stat st;
-            if (binding_table_mount_id(&b->table, b->proc_guest, &mount) < 0 || mount) continue;
-            if (host_map(b, b->proc_guest, b->proc_host) < 0) break;
-            long ret = raw_syscall(__NR_newfstatat, AT_FDCWD, (long)b->proc_host, (long)&st, 0, 0, 0);
-            if (ret == -ENOENT) missing = (unsigned short)j;
-        }
-        glue_missing[i] = missing;
-    }
-    __atomic_store_n(&glue_scanned, 1, __ATOMIC_RELEASE);
-}
-
-/* Whether the first length bytes of guest name a glue directory missing from
- * the root (a root-mount strict ancestor of a bind below its missing point). */
-static bool glue_missing_dir(Bridge *b, const char *guest, size_t length)
-{
-    if (length <= 1) return false;
-    glue_scan(b);
-    for (size_t i = 0; i < b->table.count; i++) {
-        const char *dst = b->table.entries[i].guest;
-        if (glue_missing[i] && length >= glue_missing[i] && !strncmp(dst, guest, length) &&
-            dst[length] == '/')
-            return true;
-    }
-    return false;
-}
-
-/* Walks the tree's directories of every bind, op 0 creating (mode 0755),
- * 1 sealing (0555), 2 unsealing (0700) top-down, 3 removing bottom-up. */
-static int glue_walk(Bridge *b, const char *base, int op)
-{
-    size_t base_length = strlen(base);
-    char *path = b->proc_link_host;
-    for (size_t i = 0; i < b->table.count; i++) {
-        const char *dst = b->table.entries[i].guest;
-        size_t length = strlen(dst);
-        if (length <= 1 || base_length + length >= PATH_MAX) continue;
-        memcpy(path, base, base_length);
-        memcpy(path + base_length, dst, length + 1);
-        /* The leaf mirrors the bind source's type. */
-        struct stat st;
-        bool directory = raw_syscall(__NR_newfstatat, AT_FDCWD, (long)b->table.entries[i].host,
-                                     (long)&st, 0, 0, 0) < 0 || (st.st_mode & S_IFMT) == S_IFDIR;
-        size_t end = base_length + length;
-        for (size_t j = op == 3 ? end : base_length + 1; op == 3 ? j > base_length : j <= end;
-             op == 3 ? j-- : j++) {
-            if (j != end && path[j] != '/') continue;
-            char saved = path[j];
-            path[j] = 0;
-            bool leaf = j == end;
-            long ret = 0;
-            if (op == 0) {
-                if (leaf && !directory) {
-                    ret = raw_syscall(__NR_openat, AT_FDCWD, (long)path,
-                                      O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0444, 0, 0);
-                    if (ret >= 0) ret = raw_syscall(__NR_close, ret, 0, 0, 0, 0, 0);
-                } else {
-                    ret = raw_syscall(__NR_mkdirat, AT_FDCWD, (long)path, 0755, 0, 0, 0);
-                }
-                if (ret == -EEXIST) ret = 0;
-            } else if (op == 3) {
-                raw_syscall(__NR_unlinkat, AT_FDCWD, (long)path,
-                            leaf && !directory ? 0 : AT_REMOVEDIR, 0, 0, 0);
-            } else if (!leaf || directory) {
-                ret = raw_syscall(__NR_fchmodat, AT_FDCWD, (long)path, op == 1 ? 0555 : 0700, 0, 0, 0);
-            }
-            path[j] = saved;
-            if (ret < 0) return (int)ret;
-        }
-    }
-    return 0;
-}
-
-/* A published tree: a directory no one else can write, owned like this
- * process's own creations (some storage ignores modes and assigns a service
- * owner). The bridge itself refuses every mutation inside the tree. */
-static bool glue_valid(const char *path, long owner)
-{
-    struct stat st;
-    return !raw_syscall(__NR_newfstatat, AT_FDCWD, (long)path, (long)&st, AT_SYMLINK_NOFOLLOW, 0, 0) &&
-           (st.st_mode & S_IFMT) == S_IFDIR && !(st.st_mode & 022) && (long)st.st_uid == owner;
-}
-
-static int glue_ready(Bridge *b)
-{
-    int state = __atomic_load_n(&glue_state, __ATOMIC_ACQUIRE);
-    if (state) return state;
-    const char *name = glue_tree();
-    if (!name) return -1;
-    if (glue_valid(name, raw_syscall(__NR_getuid, 0, 0, 0, 0, 0, 0))) {
-        __atomic_store_n(&glue_state, 1, __ATOMIC_RELEASE);
-        return 1;
-    }
-    /* Build privately, seal, then publish with one rename; a concurrent
-     * builder's identical tree wins instead. */
-    char *temp = b->proc_host;
-    size_t length = strlen(name);
-    if (length + 34 >= PATH_MAX) return -1;
-    memcpy(temp, name, length);
-    temp[length++] = '.';
-    for (int pass = 0; pass < 2; pass++) {
-        unsigned long value = (unsigned long)raw_syscall(pass ? __NR_gettid : __NR_getpid,
-                                                         0, 0, 0, 0, 0, 0);
-        do { temp[length++] = '0' + value % 10; value /= 10; } while (value);
-        temp[length++] = pass ? 0 : '.';
-    }
-    state = -1;
-    if (raw_syscall(__NR_mkdirat, AT_FDCWD, (long)temp, 0700, 0, 0, 0) < 0) {
-        __atomic_store_n(&glue_state, state, __ATOMIC_RELEASE);
-        return state;
-    }
-    struct stat st;
-    long owner = raw_syscall(__NR_newfstatat, AT_FDCWD, (long)temp, (long)&st,
-                             AT_SYMLINK_NOFOLLOW, 0, 0) ? -1 : (long)st.st_uid;
-    if (glue_valid(name, owner)) {
-        raw_syscall(__NR_unlinkat, AT_FDCWD, (long)temp, AT_REMOVEDIR, 0, 0, 0);
-        __atomic_store_n(&glue_state, 1, __ATOMIC_RELEASE);
-        return 1;
-    }
-    if (!glue_walk(b, temp, 0) && !glue_walk(b, temp, 1) &&
-        !raw_syscall(__NR_fchmodat, AT_FDCWD, (long)temp, 0555, 0, 0, 0)) {
-        if (!raw_syscall(__NR_renameat2, AT_FDCWD, (long)temp, AT_FDCWD, (long)name, 0, 0))
-            state = 1;
-        else if (glue_valid(name, owner))
-            state = 1;
-    }
-    if (glue_valid(temp, owner) || state < 0) {
-        /* Unpublished: undo the private copy. */
-        raw_syscall(__NR_fchmodat, AT_FDCWD, (long)temp, 0700, 0, 0, 0);
-        glue_walk(b, temp, 2);
-        glue_walk(b, temp, 3);
-        raw_syscall(__NR_unlinkat, AT_FDCWD, (long)temp, AT_REMOVEDIR, 0, 0, 0);
-    }
-    __atomic_store_n(&glue_state, state, __ATOMIC_RELEASE);
-    return state;
-}
-
-/* Serves a resolved root-mount guest path that is, or is directly inside, a
- * missing glue directory from the tree. Returns 1 when b->host was replaced. */
-static int glue_host(Bridge *b)
-{
-    if (!b->table.count) return 0;
-    size_t length = strlen(b->guest);
-    for (;;) {
-        if (length > 1 && b->guest[length - 1] == '/') length--;
-        else if (length > 2 && b->guest[length - 1] == '.' && b->guest[length - 2] == '/')
-            length -= 2;
-        else break;
-    }
-    if (length <= 1) return 0;
-    size_t parent = length - 1;
-    while (parent && b->guest[parent] != '/') parent--;
-    if (!glue_missing_dir(b, b->guest, length) && !glue_missing_dir(b, b->guest, parent))
-        return 0;
-    size_t mount;
-    if (binding_table_mount_id(&b->table, b->guest, &mount) < 0 || mount) return 0;
-    if (glue_ready(b) < 0) return 0;
-    size_t base = strlen(glue_name), total = strlen(b->guest);
-    if (base + total >= PATH_MAX) return -ENAMETOOLONG;
-    memcpy(b->host, glue_name, base);
-    memcpy(b->host + base, b->guest, total + 1);
-    return 1;
-}
-
-/* Reverse of glue_host for kernel-reported paths (cwd, FD links). */
-static bool glue_guest(const char *host, char *guest)
-{
-    const char *name = glue_tree();
-    if (!name) return false;
-    size_t length = strlen(name);
-    if (strncmp(host, name, length) || (host[length] && host[length] != '/')) return false;
-    strcpy(guest, host[length] ? host + length : "/");
-    return true;
-}
-
-static int host_lookup(void *opaque, Finality finality, unsigned int depth,
-                       const char *guest, char *host)
-{
-    (void)depth;
-    /* Every component, base and symlink referee is checked before the host
-     * sees it: a hidden name yields EACCES whether or not it exists. */
-    int visibility = path_visibility(opaque, guest);
-    if (visibility < 0) return visibility;
-    if (visibility == FS_HIDDEN) return -EACCES;
-    int rc = host_map(opaque, guest, host);
-    if (rc < 0)
-        return rc;
-    Bridge *b = opaque;
-    /* The broker checks the lexical result for symlinks itself, from the
-     * mount's root: ancestors of a nested mount point stay real lookups. */
-    if (b->optimistic && (!strcmp(guest, "/") || !glue_ancestor(b, guest))) {
-        for (int i = 0; b->hints && i < b->hints->count; i++)
-            if (!strcmp(b->hints->path[i], host))
-                return 1;
-        return 0;
-    }
-    /* Each host lstat walks the whole host path, which dominates path calls.
-     * Skip it where the answer cannot change resolution: a non-followed final
-     * name (an existing link stays a link; a missing one is fine), and the
-     * root or a bind mount point, whose configured host path the kernel
-     * follows itself rather than PRoot reinterpreting it as a guest link. */
-    if (finality == FINAL_NORMAL && (!b->follow_final || b->defer_final))
-        return 0;
-    if (!strcmp(guest, "/"))
-        return 0;
-    for (size_t i = 0; i < b->table.count; i++)
-        if (!strcmp(guest, b->table.entries[i].guest))
-            return 0;
-    struct stat st;
-    long ret = raw_syscall(__NR_newfstatat, AT_FDCWD, (long)host, (long)&st,
-                          AT_SYMLINK_NOFOLLOW, 0, 0);
-    /* A missing directory on the way to a bind is glue, not ENOENT. */
-    if (ret == -ENOENT && glue_ancestor(b, guest))
-        return 0;
-    /* HarmonyOS refuses lstat on many system library links while readlink
-     * works: readlink tells a link from anything else. */
-    if (ret == -EACCES) {
-        char probe[1];
-        long link = raw_syscall(__NR_readlinkat, AT_FDCWD, (long)host, (long)probe, 1, 0, 0);
-        if (link >= 0)
-            return 1;
-        if (link == -EINVAL)
-            return 0;
-    }
-    if (ret < 0)
-        return IS_FINAL(finality) ? 0 : (int)ret;
-    unsigned int type = st.st_mode & S_IFMT;
-    if (!IS_FINAL(finality) && type != S_IFDIR && type != S_IFLNK)
-        return -ENOTDIR;
-    if (IS_FINAL(finality) && type != S_IFLNK && strlen(host) < PATH_MAX) {
-        b->final_stat = st;
-        strcpy(b->final_host, host);
-        b->final_valid = true;
-    }
-    return type == S_IFLNK;
-}
-
-int pb_host_readlink(void *opaque, const char *path, char *out, size_t size)
-{
-    const Bridge *b = opaque;
-    for (int i = 0; b->optimistic && b->hints && i < b->hints->count; i++)
-        if (!strcmp(b->hints->path[i], path)) {
-            size_t n = strlen(b->hints->target[i]);
-            if (n > size) n = size;
-            memcpy(out, b->hints->target[i], n);
-            return (int)n;
-        }
-    return (int)raw_syscall(__NR_readlinkat, AT_FDCWD, (long)path, (long)out,
-                           size, 0, 0);
-}
-
-static int visible_guest_path(Bridge *b, const char *host, char *guest);
-static int preferred_guest_path(Bridge *b, const char *host, char *guest);
-static int path_visibility(Bridge *b, const char *guest);
-
-/* Kernel /proc links name host objects. An absolute target is reported in
- * guest terms; like PRoot, one outside the view is left unchanged, except
- * under the read guard, which refuses unmappable or hidden objects rather
- * than leaking host names. Non-path targets such as "pipe:[1]" are kept. */
-int pb_guest_link_target(Bridge *b, char *target)
-{
-    if (target[0] != '/') return 0;
-    int guarded = 0;
-    guarded = g_payload_config.guard == GUARD_READS;
-    int rc = preferred_guest_path(b, target, b->proc_guest);
-    if (rc < 0) return guarded ? -EACCES : 0;
-    rc = path_visibility(b, b->proc_guest);
-    if (rc < 0) return rc;
-    if (rc == FS_HIDDEN) return -EACCES;
-    strcpy(target, b->proc_guest);
-    return 0;
-}
-
-static int ordinary_link(void *opaque, char *path, const char *referrer)
-{
-    Bridge *b = opaque;
-    /* Ordinary link contents are guest paths, not host paths to reverse-map.
-     * A kernel /proc link (kept as a magic link when final) is traversed
-     * here as an intermediate component: its content is a host path. */
-    if (binding_table_map(&b->table, GUEST, "/proc", b->proc_link_host) < 0)
-        return 0;
-    Comparison c = compare_paths(b->proc_link_host, referrer);
-    if (c != PATH1_IS_PREFIX) return 0;
-    return pb_guest_link_target(b, path);
-}
-
-
-/* A reverse name must still denote the same host path after forward mapping.
- * A directory renamed beneath an overmount otherwise silently switches FD
- * identity to the mounted directory. Full retained mount/FD identity is not
- * modeled yet: reject such names rather than traverse a different object. */
-/* R6: the same path of the merged view in two layers (a directory merges;
- * a lower file a descriptor still holds was copied up since): named the
- * same, it is the same guest name. named is already the upper's form. */
-static bool union_same(Bridge *b, const char *named, const char *mapped)
-{
-    if (!b->union_on) return false;
-    const char *rel;
-    const struct union_view *u = b->map_view; /* host_map just made mapped */
-    if (!u || union_layer_of(u, mapped, &rel) < 0) return false;
-    size_t n = u->length[0];
-    return !strncmp(named, u->layer[0], n) && !strcmp(named + n, rel);
-}
-
-static int visible_guest_path(Bridge *b, const char *host, char *guest)
-{
-    char *mapped = b->mapped;
-    if (glue_guest(host, guest)) return 0;
-    /* Prefer a direct bind/root reverse match on the real host path before
-     * falling back to root-union lower->upper aliasing (e.g. when a bind's
-     * host directory lives inside a --lower tree). */
-    const char *alias = NULL;
-    if (b->union_on && pb_bridge_alias(b, host, b->union_named))
-        alias = b->union_named;
-    if (binding_table_map(&b->table, HOST, host, guest) >= 0 &&
-        host_map(b, guest, mapped) >= 0 &&
-        (!strcmp(host, mapped) || (alias && union_same(b, alias, mapped))))
-        return 0;
-    /* R6: a lower layer's object, named as the upper names its path. */
-    const char *named = alias ? alias : host;
-    int rc = binding_table_map(&b->table, HOST, named, guest);
-    if (rc < 0) return rc;
-    rc = host_map(b, guest, mapped);
-    if (rc < 0) return rc;
-    return strcmp(host, mapped) && !union_same(b, named, mapped) ? -EXDEV : 0;
-}
-
-static int observed_guest_path_len(Bridge *b, const char *host, char *guest, size_t *matched_out)
-{
-    int rc;
-    if (glue_guest(host, guest)) {
-        if (matched_out) *matched_out = 0;
-        return 0;
-    }
-    /* Reverse through the retained mount, never whichever host alias
-     * happens to win the global reverse map. Refuse a moved/overmounted
-     * object when this immutable mount can no longer name it faithfully. */
-    size_t id = b->anchor.mount_id, mapped_id;
-    if (id > b->table.count) return -EXDEV;
-    const char *host_prefix = id ? b->table.entries[id-1].host : b->table.root;
-    const char *guest_prefix = id ? b->table.entries[id-1].guest : "/";
-    const char *named = host;
-    bool aliased = false;
-    Comparison prefix_match = compare_paths(host_prefix, named);
-    if (prefix_match != PATHS_ARE_EQUAL && prefix_match != PATH1_IS_PREFIX) {
-        if (b->union_on && pb_bridge_alias(b, host, b->union_named)) {
-            named = b->union_named;
-            aliased = true;
-            prefix_match = compare_paths(host_prefix, named);
-        }
-    }
-    if (prefix_match != PATHS_ARE_EQUAL && prefix_match != PATH1_IS_PREFIX)
-        return -EXDEV;
-    strcpy(guest, named);
-    rc = binding_replace_core(guest, host_prefix, guest_prefix);
-    if (rc < 0) return rc;
-    rc = binding_table_mount_id(&b->table, guest, &mapped_id);
-    if (rc < 0) return rc;
-    if (mapped_id != id) return -EXDEV;
-    char *mapped = b->mapped;
-    rc = host_map(b, guest, mapped);
-    if (rc < 0) return rc;
-    if (strcmp(host, mapped)) {
-        const char *upper_form = aliased ? named : host;
-        if (!aliased && b->union_on && pb_bridge_alias(b, host, b->union_named))
-            upper_form = b->union_named;
-        if (!union_same(b, upper_form, mapped))
-            return -EXDEV;
-    }
-    if (matched_out) {
-        size_t plen = strlen(host_prefix);
-        if (aliased && b->root_union) {
-            const char *rel = NULL;
-            int layer = union_layer_of(&b->views[0], host, &rel);
-            if (layer > 0) {
-                size_t ulen = b->views[0].length[0];
-                size_t llen = b->views[0].length[layer];
-                plen = (plen >= ulen) ? (llen + (plen - ulen)) : llen;
-            }
-        }
-        *matched_out = plen;
-    }
-    return 0;
-}
-
-static int observed_guest_path(Bridge *b, const char *host, char *guest)
-{
-    return observed_guest_path_len(b, host, guest, NULL);
-}
-
-/* A host object can have several faithful guest names when a bind's host
- * directory lies inside another mount's host tree. Report it like the
- * kernel/PRoot would: through the most specific mount, never a hidden alias
- * under the read guard. The caller's anchor is preserved. */
-static int preferred_guest_path(Bridge *b, const char *host, char *guest)
-{
-    struct proot_open_origin saved = b->anchor;
-    size_t best = 0;
-    int found = 0;
-    for (size_t id = 0; id <= b->table.count; id++) {
-        b->anchor = (struct proot_open_origin){id, true};
-        size_t matched = 0;
-        if (observed_guest_path_len(b, host, b->proc_candidate, &matched)) continue;
-        if (found && matched <= best) continue;
-        if (path_visibility(b, b->proc_candidate) == FS_HIDDEN) continue;
-        strcpy(guest, b->proc_candidate);
-        best = matched;
-        found = 1;
-    }
-    b->anchor = saved;
-    return found ? 0 : -EXDEV;
-}
-
-static void select_anchor(Bridge *b, int fd)
-{
-    if (!b->context) return;
-    b->anchor_fd = fd;
-    b->anchor = (struct proot_open_origin){0, false};
-    if (fd == AT_FDCWD) b->anchor = b->context->cwd;
-    else for (size_t i = 0; i < 2; i++)
-        if (b->context->fd[i] == fd) { b->anchor = b->context->directory[i]; break; }
-}
-
-static int host_fd(void *opaque, int fd, char *guest)
-{
-    Bridge *b = opaque;
-    select_anchor(b, fd);
-    struct stat st;
-    long ret = raw_syscall(__NR_fstat, fd, (long)&st, 0, 0, 0, 0);
-    if (ret < 0)
-        return (int)ret;
-    if ((st.st_mode & S_IFMT) != S_IFDIR)
-        return -ENOTDIR;
-
-    char link[64] = "/proc/self/fd/", digits[16], *host = b->fd_host;
-    unsigned int value = (unsigned int)fd;
-    size_t count = 0, pos = strlen(link);
-    do {
-        digits[count++] = '0' + value % 10;
-        value /= 10;
-    } while (value);
-    while (count)
-        link[pos++] = digits[--count];
-    link[pos] = 0;
-
-    int rc = pb_host_readlink(opaque, link, host, PATH_MAX);
-    if (rc < 0)
-        return rc;
-    if (rc >= PATH_MAX)
-        return -ENAMETOOLONG;
-    host[rc] = 0;
-    if (b->anchor.known && fd == b->anchor_fd)
-        return observed_guest_path(b, host, guest);
-    return visible_guest_path(b, host, guest);
-}
-
-static long guest_cwd(Bridge *b)
-{
-    select_anchor(b, AT_FDCWD);
-    long ret = raw_syscall(__NR_getcwd, (long)b->host, sizeof(b->host), 0, 0, 0, 0);
-    if (ret < 0)
-        return ret;
-    if (b->anchor.known && b->anchor_fd == AT_FDCWD)
-        return observed_guest_path(b, b->host, b->cwd);
-    return visible_guest_path(b, b->host, b->cwd);
-}
-
-static int resolve_once(Bridge *b, int dirfd, const char *path, bool follow);
-
-#define RACED 1 /* secure_host: a component changed into a non-directory. */
-/* Replaces b->host by "/proc/self/fd/N/<last>" where N is the parent
- * directory, opened from the mount's configured host root one component at
- * a time with O_NOFOLLOW: no intermediate component is looked up by name
- * again, so swapping one for a symlink after resolution cannot send the call
- * outside the view (PRoot itself has this race). Only the final component
- * is looked up by the kernel, with the call's own follow semantics. */
-/* One O_PATH descriptor per mount root, opened once per process (a full
- * host path walk is the expensive part on this storage), kept at a high
- * number and close-on-exec. The guest may close or reuse that number, so
- * each use checks it still names the same directory, else reopens it. */
-static long mount_root_fd[CONFIG_MOUNT_IDS];
-static unsigned long mount_root_dev[CONFIG_MOUNT_IDS], mount_root_ino[CONFIG_MOUNT_IDS];
-/* An emulated mount's slot is reused by later mounts: its id tags the FD. */
-static uint32_t mount_root_tag[CONFIG_MOUNT_IDS];
-
-static long mount_root(Bridge *b, size_t mount, const char *prefix, size_t plen)
-{
-    if (mount >= CONFIG_MOUNT_IDS) return -EINVAL;
-    size_t slot = mount - 1 - (size_t)g_payload_config.bind_count;
-    uint32_t tag = mount > (size_t)g_payload_config.bind_count && slot < (size_t)b->mount_count ?
-        b->mounts[slot].id : 0;
-    long fd = __atomic_load_n(&mount_root_fd[mount], __ATOMIC_ACQUIRE) - 1;
-    struct stat st;
-    if (fd >= 0 && __atomic_load_n(&mount_root_tag[mount], __ATOMIC_ACQUIRE) == tag &&
-        !raw_syscall(__NR_fstat, fd, (long)&st, 0, 0, 0, 0) &&
-        st.st_dev == __atomic_load_n(&mount_root_dev[mount], __ATOMIC_ACQUIRE) &&
-        st.st_ino == __atomic_load_n(&mount_root_ino[mount], __ATOMIC_ACQUIRE) &&
-        (st.st_mode & S_IFMT) == S_IFDIR)
-        return fd;
-    memcpy(b->mapped, plen ? prefix : "/", plen ? plen : 1);
-    b->mapped[plen ? plen : 1] = 0;
-    long opened = raw_syscall(__NR_openat, AT_FDCWD, (long)b->mapped,
-                              O_PATH | O_DIRECTORY | O_CLOEXEC, 0, 0, 0);
-    if (opened < 0) return opened;
-    long high = raw_syscall(__NR_fcntl, opened, F_DUPFD_CLOEXEC, 512, 0, 0, 0);
-    if (high >= 0) { raw_syscall(__NR_close, opened, 0, 0, 0, 0, 0); opened = high; }
-    if (raw_syscall(__NR_fstat, opened, (long)&st, 0, 0, 0, 0) < 0) return opened;
-    /* Publish; a concurrent opener's copy is simply kept by whoever won. */
-    __atomic_store_n(&mount_root_tag[mount], tag, __ATOMIC_RELEASE);
-    __atomic_store_n(&mount_root_dev[mount], st.st_dev, __ATOMIC_RELEASE);
-    __atomic_store_n(&mount_root_ino[mount], st.st_ino, __ATOMIC_RELEASE);
-    __atomic_store_n(&mount_root_fd[mount], opened + 1, __ATOMIC_RELEASE);
-    return opened;
-}
-
-static int secure_host(Bridge *b)
-{
-    if (!b->secure) return 0;
-    if (b->walk_count >= 4) return -ENFILE; /* Never fall back to an unwalked path. */
-    size_t mount;
-    if (binding_table_mount_id(&b->table, b->guest, &mount) < 0) return 0;
-    const char *prefix = mount ? b->table.entries[mount - 1].host : b->table.root;
-    size_t plen = strlen(prefix);
-    while (plen > 1 && prefix[plen - 1] == '/') plen--;
-    /* Kernel magic links (/proc/self, fd links) are meant to be followed. */
-    if (!strncmp(prefix, "/proc", 5) && (plen == 5 || prefix[5] == '/')) return 0;
-    if (plen == 1) plen = 0; /* Root "/": every component is walked. */
-    if (strncmp(b->host, prefix, plen) || (b->host[plen] && b->host[plen] != '/'))
-        return 0; /* Not under its mount's host root (the glue tree). */
-    const char *rest = b->host + plen;
-    size_t end = strlen(rest);
-    while (end && rest[end - 1] == '/') end--;
-    if (!end) return 0; /* The mount root itself. */
-    size_t base = end;
-    while (base && rest[base - 1] != '/') base--;
-    if (plen >= PATH_MAX) return -ENAMETOOLONG;
-    long root = mount_root(b, mount, prefix, plen);
-    if (root < 0) return (int)root;
-    long dir = root; /* Cached: never closed here. */
-    for (size_t at = 0; at < base;) {
-        while (at < base && rest[at] == '/') at++;
-        size_t next = at;
-        while (next < base && rest[next] != '/') next++;
-        if (next == at) break;
-        memcpy(b->mapped, rest + at, next - at);
-        b->mapped[next - at] = 0;
-        long child = raw_syscall(__NR_openat, dir, (long)b->mapped,
-                                 O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC, 0, 0, 0);
-        if (dir != root) raw_syscall(__NR_close, dir, 0, 0, 0, 0, 0);
-        if (child < 0) return child == -ELOOP || child == -ENOTDIR ? RACED : (int)child;
-        dir = child;
-        at = next;
-    }
-    if (dir == root) {
-        /* The parent is the mount root: hold a private copy for the call. */
-        dir = raw_syscall(__NR_fcntl, root, F_DUPFD_CLOEXEC, 256, 0, 0, 0);
-        if (dir < 0) return (int)dir;
-    }
-    /* A followed final name is held by inode, so a symlink swapped in now
-     * is never followed; the call then names that inode through its magic
-     * link. If resolution looked at it, it must be the same file (dev/ino),
-     * else it is resolved again; a symlink is always a race; missing stays
-     * ENOENT. Deferred opens keep the name and use O_NOFOLLOW instead. */
-    bool whole = b->follow_final && !b->defer_final;
-    if (whole) {
-        memcpy(b->mapped, rest + base, end - base);
-        b->mapped[end - base] = 0;
-        long node = raw_syscall(__NR_openat, dir, (long)b->mapped, O_PATH | O_NOFOLLOW | O_CLOEXEC,
-                                0, 0, 0);
-        raw_syscall(__NR_close, dir, 0, 0, 0, 0, 0);
-        if (node < 0) return (int)node;
-        /* "." and trailing slashes name the directory itself. */
-        struct stat now;
-        if (raw_syscall(__NR_fstat, node, (long)&now, 0, 0, 0, 0) < 0 ||
-            (now.st_mode & S_IFMT) == S_IFLNK ||
-            (b->final_valid && (now.st_dev != b->final_stat.st_dev ||
-                                now.st_ino != b->final_stat.st_ino))) {
-            raw_syscall(__NR_close, node, 0, 0, 0, 0, 0);
-            return RACED;
-        }
-        dir = node;
-    }
-    /* Held across the guest's call: keep it off the low numbers, which the
-     * call itself may need (open after close(1) must get 1). */
-    long high = raw_syscall(__NR_fcntl, dir, F_DUPFD_CLOEXEC, 256, 0, 0, 0);
-    if (high >= 0) {
-        raw_syscall(__NR_close, dir, 0, 0, 0, 0, 0);
-        dir = high;
-    }
-    char name[40] = "/proc/self/fd/";
-    size_t n = strlen(name);
-    char digits[12];
-    int count = 0;
-    unsigned long v = (unsigned long)dir;
-    do { digits[count++] = '0' + v % 10; v /= 10; } while (v);
-    while (count) name[n++] = digits[--count];
-    if (whole) {
-        name[n] = 0;
-        strcpy(b->host, name);
-        b->walk_fd[b->walk_count++] = (int)dir;
-        return 0;
-    }
-    name[n++] = '/';
-    size_t tail = strlen(rest + base);
-    if (n + tail >= PATH_MAX) { raw_syscall(__NR_close, dir, 0, 0, 0, 0, 0); return -ENAMETOOLONG; }
-    memmove(b->host + n, rest + base, tail + 1);
-    memcpy(b->host, name, n);
-    b->walk_fd[b->walk_count++] = (int)dir;
-    return 0;
-}
-
-/* A deferred final lookup does not know where a final symlink points, and
- * policy decisions may depend on its target: any failure is resolved again
- * with the full lookup before it is reported. */
-/* Without ".." a path resolves lexically exactly when no component is a
- * symlink (a ".." would silently undo a symlink the broker never sees). */
-static bool lexical_path(const char *path)
-{
-    for (const char *p = path; *p;) {
-        while (*p == '/') p++;
-        if (p[0] == '.' && p[1] == '.' && (!p[2] || p[2] == '/')) return false;
-        while (*p && *p != '/') p++;
-    }
-    return true;
-}
-
-/* R6: after a resolution, what the call needs of the merged view: an object
- * it changes is copied up, a name it creates gets its parents in the upper
- * and loses its whiteout. b->host then names the upper's copy. */
-static int union_prepare(Bridge *b)
-{
-    const char *rel = "";
-    b->uv = b->final_view;
-    int layer = b->uv ? union_layer_of(b->uv, b->host, &rel) : -1;
-    if (layer < 0) b->uv = NULL;
-    b->union_layer = layer;
-    if (layer < 0) return 0;
-    if (strlen(rel) >= PATH_MAX) return -ENAMETOOLONG;
-    strcpy(b->union_rel, rel);
-    long rc = 0;
-    switch (b->union_op) {
-    case UOP_OPEN: {
-        long f = b->open_flags;
-        bool tmpfile = (f & O_TMPFILE) == O_TMPFILE;
-        bool writes = (f & O_ACCMODE) != O_RDONLY || (f & O_TRUNC) || tmpfile;
-        if (layer > 0) {
-            /* A layer image's file: its content before the kernel opens it. */
-            if (!writes) return (int)union_lazy_fill(b->uv, b->host);
-            if ((f & O_CREAT) && (f & O_EXCL)) return -EEXIST;
-            rc = union_copy_up(b->uv, b->union_rel, !(f & O_TRUNC) || tmpfile);
-            break;
-        }
-        struct stat st;
-        if (!(f & O_CREAT) || tmpfile ||
-            !raw_syscall(__NR_newfstatat, AT_FDCWD, (long)b->host, (long)&st, AT_SYMLINK_NOFOLLOW, 0, 0))
-            return 0;
-        bool opaque;
-        rc = union_prepare_create(b->uv, b->union_rel, &opaque);
-        if (rc == -EEXIST) rc = 0;
-        break;
-    }
-    case UOP_COPY:
-        if (layer == 0) return 0;
-        rc = union_copy_up(b->uv, b->union_rel, true);
-        break;
-    case UOP_CREATE:
-        /* An existing lower name: the kernel's answer for any name. */
-        if (layer > 0) return -EEXIST;
-        rc = union_prepare_create(b->uv, b->union_rel, &b->union_opaque);
-        if (rc == -EEXIST) rc = 0;
-        break;
-    default:
-        return 0;
-    }
-    if (rc < 0) return (int)rc;
-    b->umemo.valid = false;
-    if (layer > 0) {
-        size_t n = b->uv->length[0];
-        if (n + strlen(b->union_rel) >= PATH_MAX) return -ENAMETOOLONG;
-        memcpy(b->host, b->uv->layer[0], n);
-        strcpy(b->host + n, b->union_rel);
-        b->union_layer = 0;
-        b->final_valid = false;
-    }
-    return 0;
-}
-
-/* The layer of the object a descriptor names (union_rel set), -1 if none. */
-static int union_fd(Bridge *b, int fd)
-{
-    char link[32] = "/proc/self/fd/", digits[12];
-    size_t at = strlen(link);
-    int count = 0;
-    unsigned v = (unsigned)fd;
-    do { digits[count++] = (char)('0' + v % 10); v /= 10; } while (v);
-    while (count) link[at++] = digits[--count];
-    link[at] = 0;
-    int n = pb_host_readlink(b, link, b->fd_host, PATH_MAX - 1);
-    if (n < 0) return n == -ENOENT ? -EBADF : n;
-    b->fd_host[n] = 0;
-    const char *rel;
-    int layer = -1;
-    b->uv = bridge_view(b, b->fd_host, &layer, &rel);
-    if (layer > 0) strcpy(b->union_rel, rel);
-    return layer;
-}
-
-int pb_resolve(Bridge *b, int dirfd, const char *path, bool follow)
-{
-    b->optimistic = b->optimistic_allowed && path && lexical_path(path);
-    if (b->optimistic && !b->optimistic_used) {
-        b->optimistic_used = true;
-        broker_strict(1);
-    }
-    int rc = resolve_once(b, dirfd, path, follow);
-    /* /proc is emulated through lookups (self, fd links): not lexical. */
-    Comparison proc = rc >= 0 && b->optimistic ? compare_paths("/proc", b->guest) : PATHS_ARE_NOT_COMPARABLE;
-    if (proc == PATHS_ARE_EQUAL || proc == PATH1_IS_PREFIX) {
-        /* The whole call again, fully (bridge_run). */
-        b->force_full = true;
-        return -ELOOP;
-    }
-    if (rc < 0 && b->defer_final) {
-        b->defer_final = false;
-        rc = resolve_once(b, dirfd, path, follow);
-    }
-    b->final_match = rc >= 0 && b->final_valid && !strcmp(b->final_host, b->host);
-    /* A race seen by the secure walk is resolved once more, then refused. */
-    for (int attempt = 0; rc >= 0 && attempt < 2; attempt++) {
-        int s = secure_host(b);
-        if (s != RACED) return s < 0 ? s : rc;
-        if (attempt) return -ELOOP;
-        rc = resolve_once(b, dirfd, path, follow);
-        b->final_match = rc >= 0 && b->final_valid && !strcmp(b->final_host, b->host);
-    }
-    return rc;
-}
-
-static int resolve_once(Bridge *b, int dirfd, const char *path, bool follow)
-{
-    if (!path)
-        return -EFAULT;
-    b->umemo.valid = false;
-    b->union_layer = -1;
-    strcpy(b->cwd, "/");
-    if (path[0] != '/' && dirfd == AT_FDCWD) {
-        long ret = guest_cwd(b);
-        if (ret < 0)
-            return (int)ret;
-    }
-    /* Runtime assignments avoid static function-pointer table relocations,
-     * which the current ELF payload loader does not apply. */
-    PathOps ops;
-    ops.lookup = host_lookup;
-    ops.readlink = pb_host_readlink;
-    ops.detranslate = ordinary_link;
-    ops.proc_link = pb_proc_link;
-    ops.respell = respell;
-    PathResolver resolver = {{b, &ops, b->path_frames, BRIDGE_FRAMES, deep_frames}, b->cwd,
-                             host_fd, host_map, b->resolve_scratch};
-    b->follow_final = follow;
-    b->final_valid = false;
-    b->map_view = NULL;
-    int rc = resolve_path_core(&resolver, dirfd, path, follow, b->guest, b->host);
-    b->final_view = b->map_view; /* the final mapping is the last */
-    if (rc >= 0) {
-        int glue = glue_host(b);
-        if (glue < 0) return glue;
-        /* The tree is shared and read-only, even for its owner or root. A
-         * creation over an existing name keeps the kernel's EEXIST. */
-        if (glue && b->mutation) {
-            struct stat st;
-            if (b->attributes) return -EPERM;
-            if (!b->creates || raw_syscall(__NR_newfstatat, AT_FDCWD, (long)b->host, (long)&st,
-                                           AT_SYMLINK_NOFOLLOW, 0, 0) < 0)
-                return -EACCES;
-        }
-    }
-    if (rc >= 0 && b->reads) {
-        /* ".." skips lookup, so the final name is classified again. */
-        int visibility = path_visibility(b, b->guest);
-        if (visibility < 0) return visibility;
-        if (visibility == FS_HIDDEN || (visibility == FS_TRAVERSE && !b->traverse))
-            return -EACCES;
-    }
-    /* (The emulated loop devices are no file of the mount they appear in.) */
-    if (rc >= 0 && b->mutation && g_payload_config.guard >= GUARD_PATHS &&
-        !(mounts_enabled() && pb_loop_device(b->guest) != -1)) {
-        size_t mount;
-        rc = binding_table_mount_id(&b->table, b->guest, &mount);
-        if (rc < 0) return rc;
-        /* Do not turn inferred reverse mappings of imported FDs/cwd into grants. */
-        rc = fd_runtime_check_path_mutation(mount, path[0] == '/' || b->anchor.known);
-        /* The kernel looks the name up before checking a read-only mount:
-         * creating an existing name is EEXIST (mkdir -p walks from "/"). */
-        struct stat st;
-        if (rc == -EROFS && b->creates &&
-            !raw_syscall(__NR_newfstatat, AT_FDCWD, (long)b->host, (long)&st,
-                         AT_SYMLINK_NOFOLLOW, 0, 0))
-            rc = -EEXIST;
-    }
-    /* Last: a refused change must not copy anything up. */
-    if (rc >= 0 && b->union_on) {
-        int u = union_prepare(b);
-        if (u < 0) return u;
-    }
-    return rc;
-}
-
-int proot_handles_syscall(long number)
-{
-    switch (number) {
-    case __NR_mount:
-    case __NR_umount2:
-        return mounts_enabled();
-    case __NR_setxattr: case __NR_lsetxattr:
-    case __NR_getxattr: case __NR_lgetxattr:
-    case __NR_listxattr: case __NR_llistxattr:
-    case __NR_removexattr: case __NR_lremovexattr:
-    case __NR_inotify_add_watch:
-    case __NR_bind: case __NR_connect: case __NR_sendto: case __NR_sendmsg:
-    case __NR_fchmodat:
-    case __NR_fchownat:
-    case __NR_utimensat:
-    case __NR_fchmod:
-    case __NR_fchown:
-    case __NR_statfs:
-    case __NR_fstatfs:
-    case __NR_mknodat:
-    case __NR_truncate:
-    case __NR_ftruncate:
-    case __NR_mkdirat:
-    case __NR_unlinkat:
-    case __NR_symlinkat:
-    case __NR_linkat:
-    case __NR_renameat:
-    case __NR_renameat2:
-    case __NR_openat:
-    case __NR_newfstatat:
-    case __NR_statx:
-    case __NR_readlinkat:
-    case __NR_chdir:
-    case __NR_fchdir:
-    case __NR_getcwd:
-    case __NR_faccessat:
-    case __NR_faccessat2:
-        return 1;
-    default:
-        return 0;
-    }
-}
-
-/* Moving/deleting configured mountpoints (or their ancestors) would leave
- * the immutable map stale. Refuse until mount relocation is modeled. */
-static bool contains_mount(Bridge *b, const char *guest)
-{
-    if (compare_paths("/", guest) == PATHS_ARE_EQUAL)
-        return true;
-    for (size_t i = 0; i < b->table.count; i++) {
-        Comparison c = compare_paths(guest, b->table.entries[i].guest);
-        if (c == PATHS_ARE_EQUAL || c == PATH1_IS_PREFIX)
-            return true;
-    }
-    return false;
-}
-
-/* PRoot fake_id0: a fake root (CAP_CHOWN) may give files away; the kernel's
- * EPERM for the real user is reported as success (ownership itself is
- * unchanged). */
-static long fake_chown(long ret)
-{
-    return ret == -EPERM && fake_ids_capable(0 /* CAP_CHOWN */) ? 0 : ret;
-}
-
-/* --link-copy (opt-in, like PRoot's -l): some storage refuses every hard
- * link (HarmonyOS shared storage and Android FUSE with EPERM, HarmonyOS app
- * storage with EACCES), which breaks dpkg's backups. The new name becomes a
- * copy of a regular file or symlink: same content, mode and times, but NOT
- * the same inode, so later changes to one name do not reach the other. A
- * copy needs the same directory write permission, so a genuine permission
- * error still fails; so does any failed step, leaving no partial copy.
- * Anything else keeps the error. */
-static long copy_link(Bridge *b, long error)
-{
-    struct stat st;
-    if (raw_syscall(__NR_newfstatat, AT_FDCWD, (long)b->first_host, (long)&st,
-                    AT_SYMLINK_NOFOLLOW, 0, 0) < 0)
-        return error;
-    if ((st.st_mode & S_IFMT) == S_IFLNK) {
-        long n = raw_syscall(__NR_readlinkat, AT_FDCWD, (long)b->first_host,
-                             (long)b->proc_data, sizeof(b->proc_data) - 1, 0, 0);
-        if (n < 0 || n >= (long)sizeof(b->proc_data) - 1) return error;
-        b->proc_data[n] = 0;
-        return raw_syscall(__NR_symlinkat, (long)b->proc_data, AT_FDCWD, (long)b->host, 0, 0, 0) < 0 ?
-            error : 0;
-    }
-    if ((st.st_mode & S_IFMT) != S_IFREG) return error;
-    long in = raw_syscall(__NR_openat, AT_FDCWD, (long)b->first_host, O_RDONLY | O_CLOEXEC, 0, 0, 0);
-    if (in < 0) return error;
-    long out = raw_syscall(__NR_openat, AT_FDCWD, (long)b->host,
-                           O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, st.st_mode & 07777, 0, 0);
-    long ret = out < 0 ? out : 0;
-    while (!ret) {
-        long n = raw_syscall(__NR_read, in, (long)b->proc_data, sizeof(b->proc_data), 0, 0, 0);
-        if (n <= 0) { ret = n < 0 ? n : 1; break; }
-        for (long done = 0; done < n && !ret;) {
-            long w = raw_syscall(__NR_write, out, (long)b->proc_data + done, n - done, 0, 0, 0);
-            if (w <= 0) ret = w < 0 ? w : -EIO;
-            else done += w;
-        }
-    }
-    if (ret == 1) {
-        struct { long sec, nsec; } times[2] = {{st.st_atime, st.st_atime_nsec},
-                                               {st.st_mtime, st.st_mtime_nsec}};
-        ret = raw_syscall(__NR_fchmod, out, st.st_mode & 07777, 0, 0, 0, 0);
-        if (!ret) ret = raw_syscall(__NR_utimensat, out, 0, (long)times, 0, 0, 0);
-    }
-    raw_syscall(__NR_close, in, 0, 0, 0, 0, 0);
-    if (out >= 0) raw_syscall(__NR_close, out, 0, 0, 0, 0, 0);
-    if (ret < 0 && out >= 0) raw_syscall(__NR_unlinkat, AT_FDCWD, (long)b->host, 0, 0, 0, 0);
-    /* A name that already exists stays the kernel's answer. */
-    return ret < 0 ? (out == -EEXIST ? -EEXIST : error) : 0;
-}
-
-/* ---- R5: owners and modes the host cannot hold (container_state.h) ---- */
-static long host_stat(const char *host, bool follow, struct stat *st)
-{
-    return raw_syscall(__NR_newfstatat, AT_FDCWD, (long)host, (long)st,
-                       follow ? 0 : AT_SYMLINK_NOFOLLOW, 0, 0);
-}
-
-/* chmod with an owner database: the host keeps owner rw (rwx for a
- * directory); bits the host refuses (setuid, sticky) are dropped there.
- * The guest's mode is recorded when the host's differs. */
-static long owners_apply_mode(long fd, const char *host, const struct stat *st, unsigned mode)
-{
-    long rc = owners_may_chmod(st);
-    if (rc < 0) return rc;
-    unsigned wanted = owners_host_mode(st, mode);
-    static const unsigned drops[] = {0, 06000, 07000};
-    for (size_t i = 0; i < 3; i++) {
-        unsigned applied = wanted & ~drops[i];
-        rc = host ? raw_syscall(__NR_fchmodat, AT_FDCWD, (long)host, applied, 0, 0, 0) :
-            raw_syscall(__NR_fchmod, fd, applied, 0, 0, 0, 0);
-        if (rc == -EPERM && i < 2) continue;
-        if (rc < 0) return rc;
-        owners_chmod_done(st, mode, applied);
-        return 0;
-    }
-    return rc;
-}
-
-/* After a call that made a new name at b->host. */
-static void owners_new_name(Bridge *b)
-{
-    struct stat st;
-    if (owners_enabled() && !host_stat(b->host, false, &st))
-        owners_created(&st);
-}
-
-/* The object an unlink or a replacing rename takes the last name of. */
-static void owners_last_name(const struct stat *st, bool known)
-{
-    if (known && ((st->st_mode & S_IFMT) == S_IFDIR || st->st_nlink <= 1))
-        owners_forget(st);
-}
-
-static long mutate(Bridge *b, long number, long a[6])
-{
-    long ret;
-    if (number == __NR_symlinkat) {
-        if (!a[0])
-            return -EFAULT;
-        /* The target is opaque link data, NOT a path to pb_resolve or rewrite. */
-        ret = pb_resolve(b, (int)a[1], (const char *)a[2], false);
-        if (ret < 0)
-            return ret;
-        ret = raw_syscall(number, a[0], AT_FDCWD, (long)b->host, 0, 0, 0);
-        if (!ret) {
-            owners_new_name(b);
-            return 0;
-        }
-        /* Generic fallback when host sandbox forbids symlink() with EACCES/EPERM
-         * (e.g. HarmonyOS HAP files/temp): if mounts are emulated and the target
-         * resolves to an existing directory or regular file inside the container,
-         * materialize a mountpoint and bind-mount it in this process's mount table. */
-        if ((ret == -EACCES || ret == -EPERM) && mounts_enabled() &&
-            strlen(b->guest) < CONFIG_MAX_PATH && strlen(b->host) < sizeof(b->first_host)) {
-            strcpy(b->first_guest, b->guest);
-            strcpy(b->first_host, b->host);
-            if (pb_resolve(b, (int)a[1], (const char *)a[0], true) == 0 &&
-                strlen(b->host) < CONFIG_MAX_PATH) {
-                struct stat tst;
-                if (raw_syscall(__NR_newfstatat, AT_FDCWD, (long)b->host, (long)&tst, 0, 0, 0) == 0) {
-                    int is_dir = (tst.st_mode & S_IFMT) == S_IFDIR;
-                    int is_reg = (tst.st_mode & S_IFMT) == S_IFREG;
-                    if (is_dir || is_reg) {
-                        long mk = is_dir
-                            ? raw_syscall(__NR_mkdirat, AT_FDCWD, (long)b->first_host, 0755, 0, 0, 0)
-                            : raw_syscall(__NR_openat, AT_FDCWD, (long)b->first_host,
-                                          O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644, 0, 0);
-                        if (!is_dir && mk >= 0) {
-                            raw_syscall(__NR_close, mk, 0, 0, 0, 0, 0);
-                            mk = 0;
-                        }
-                        if (mk == 0 || mk == -EEXIST) {
-                            struct mount_entry me;
-                            memset(&me, 0, sizeof(me));
-                            strcpy(me.host, b->host);
-                            strcpy(me.guest, b->first_guest);
-                            me.kind = MOUNT_BIND;
-                            me.access = 'w';
-                            strcpy(me.source, "/dev/root");
-                            strcpy(me.fstype, "bind");
-                            if (mounts_add(&me) == 0)
-                                return 0;
-                        }
-                    }
-                }
-            }
-        }
-        return ret;
-    }
-    if (number == __NR_mkdirat || number == __NR_unlinkat) {
-        ret = pb_resolve(b, (int)a[0], (const char *)a[1], false);
-        if (ret < 0)
-            return ret;
-        if (number == __NR_unlinkat && contains_mount(b, b->guest))
-            return -EBUSY;
-        if (number == __NR_unlinkat && b->union_layer >= 0)
-            return union_remove(b->uv, b->union_rel, a[2] & AT_REMOVEDIR);
-        struct stat old;
-        bool known = number == __NR_unlinkat && owners_enabled() && !host_stat(b->host, false, &old);
-        ret = raw_syscall(number, AT_FDCWD, (long)b->host, a[2], 0, 0, 0);
-        if (!ret && number == __NR_mkdirat && b->union_layer >= 0 && b->union_opaque)
-            union_make_opaque(b->uv, b->union_rel);
-        if (!ret && number == __NR_mkdirat) owners_new_name(b);
-        if (!ret) owners_last_name(&old, known);
-        return ret;
-    }
-
-    bool hardlink = number == __NR_linkat;
-    if (hardlink) {
-        if (a[4] & ~(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH))
-            return -EINVAL;
-        if (a[1] && !((const char *)a[1])[0] && (a[4] & AT_EMPTY_PATH))
-            return -EOPNOTSUPP; /* Requires source FD mount identity. */
-    }
-    ret = pb_resolve(b, (int)a[0], (const char *)a[1],
-                  hardlink && (a[4] & AT_SYMLINK_FOLLOW));
-    if (ret < 0)
-        return ret;
-    strcpy(b->first_host, b->host);
-    strcpy(b->first_guest, b->guest);
-    b->first_union_layer = b->union_layer;
-    b->first_uv = b->uv;
-    if (b->union_layer >= 0) strcpy(b->first_union_rel, b->union_rel);
-    size_t first_mount, second_mount;
-    ret = binding_table_mount_id(&b->table, b->first_guest, &first_mount);
-    if (ret < 0)
-        return ret;
-    /* The new name of a link is made in the upper. */
-    if (hardlink && b->union_on) b->union_op = UOP_CREATE;
-    ret = pb_resolve(b, (int)a[2], (const char *)a[3], false);
-    if (ret < 0)
-        return ret;
-    ret = binding_table_mount_id(&b->table, b->guest, &second_mount);
-    if (ret < 0)
-        return ret;
-    if (!hardlink && (contains_mount(b, b->first_guest) || contains_mount(b, b->guest)))
-        return -EBUSY;
-    if (first_mount != second_mount)
-        return -EXDEV;
-    if (!hardlink && b->first_union_layer >= 0 && b->union_layer >= 0 && b->first_uv != b->uv)
-        return -EXDEV;
-    if (!hardlink && b->first_union_layer >= 0 && b->union_layer >= 0)
-        return union_rename(b->uv, b->first_union_rel, b->union_rel,
-                            number == __NR_renameat2 ? (unsigned)a[4] : 0);
-    if (!hardlink && (b->first_union_layer >= 0) != (b->union_layer >= 0))
-        return -EXDEV;
-    /* A rename that replaces a name may take its object's last one. */
-    struct stat old, moved;
-    bool known = !hardlink && owners_enabled() && !(a[4] & 2 /* RENAME_EXCHANGE */) &&
-        !host_stat(b->host, false, &old) && !host_stat(b->first_host, false, &moved) &&
-        (old.st_dev != moved.st_dev || old.st_ino != moved.st_ino);
-    ret = raw_syscall(number, AT_FDCWD, (long)b->first_host,
-                      AT_FDCWD, (long)b->host, a[4], 0);
-    if (hardlink && g_payload_config.link_copy && (ret == -EPERM || ret == -EACCES)) {
-        ret = copy_link(b, ret);
-        if (!ret) owners_new_name(b);
-    }
-    if (!ret) owners_last_name(&old, known);
-    return ret;
-}
-
-static bool path_mutation(long number, long a[6])
-{
-    switch (number) {
-    case __NR_faccessat: case __NR_faccessat2:
-        return !!((unsigned int)a[2] & 2); /* W_OK queries mutation permission. */
-    case __NR_openat:
-        /* O_PATH ignores ordinary access/create/truncate flags. */
-        if (a[2] & O_PATH) return false;
-        return (a[2] & (O_ACCMODE | O_CREAT | O_TRUNC)) ||
-               ((a[2] & O_TMPFILE) == O_TMPFILE);
-    case __NR_setxattr: case __NR_lsetxattr:
-    case __NR_removexattr: case __NR_lremovexattr:
-    case __NR_mknodat: case __NR_mkdirat: case __NR_unlinkat: case __NR_symlinkat:
-    case __NR_linkat: case __NR_renameat: case __NR_renameat2:
-    case __NR_fchmodat: case __NR_fchownat: case __NR_utimensat: case __NR_truncate:
-    case __NR_bind: /* Creates the socket inode at the resolved path. */
-        return true;
-    default: return false;
-    }
-}
-
-
-/* Ancestors of exposed binds stay reachable for lookup, listing and cwd only:
- * no content, links, xattrs, watches, execution or namespace changes. */
-static bool path_traversal(long number, long a[6])
-{
-    switch (number) {
-    case __NR_newfstatat: case __NR_statx: case __NR_statfs: case __NR_chdir:
-        return true;
-    case __NR_faccessat: case __NR_faccessat2:
-        return !((unsigned int)a[2] & 2);
-    case __NR_openat:
-        if (a[2] & O_PATH) return true;
-        /* O_DIRECTORY makes the kernel refuse a non-directory host object. */
-        return (a[2] & O_DIRECTORY) && (a[2] & O_TMPFILE) != O_TMPFILE &&
-               !(a[2] & (O_ACCMODE | O_CREAT | O_TRUNC));
-    default: return false;
-    }
-}
-
-/* Translate a pathname AF_UNIX address with guest semantics. bind creates
- * the final name (no follow, mutation policy); connect/sendto/sendmsg reach an
- * existing socket (follow, read visibility). Abstract and non-UNIX addresses,
- * and malformed lengths the kernel will reject, pass through unchanged. A host
- * path longer than sun_path is reached through its parent directory FD. */
-static long socket_address(Bridge *b, long number, long a[6])
-{
-    int sending = number == __NR_sendto, message = number == __NR_sendmsg;
-    const void *name;
-    unsigned long length;
-    if (message) {
-        if (!a[1]) return raw_syscall(number, a[0], a[1], a[2], 0, 0, 0);
-        memcpy(&b->message, (const void *)a[1], sizeof(b->message));
-        name = b->message.name;
-        length = (unsigned int)b->message.name_length;
-    } else {
-        name = (const void *)a[sending ? 4 : 1];
-        length = (unsigned int)a[sending ? 5 : 2];
-    }
-    /* Container networks: an IPv4/IPv6 address moves onto the container's
-     * own loopback address (net_view.h). */
-    uint16_t family = 0;
-    if (name && length >= 2) memcpy(&family, name, 2);
-    if (number == __NR_bind && family == 16 /* AF_NETLINK */ && platform_is_harmonyos()) {
-        long rc = raw_syscall(__NR_bind, a[0], a[1], a[2], 0, 0, 0);
-        if (rc == -EAFNOSUPPORT || rc == -EINVAL || rc == -EACCES || rc == -EPERM)
-            return 0;
-        return rc;
-    }
-    if (net_enabled() && (family == AF_INET || family == AF_INET6)) {
-        unsigned char moved[128];
-        unsigned moved_length;
-        long rc = net_address(number, a[0], name, (unsigned)length, moved, &moved_length);
-        if (rc < 0) return rc;
-        if (message) {
-            b->message.name = moved;
-            b->message.name_length = (int)moved_length;
-            return raw_syscall(number, a[0], (long)&b->message, a[2], 0, 0, 0);
-        }
-        if (sending) return raw_syscall(number, a[0], a[1], a[2], a[3], (long)moved, moved_length);
-        long done = raw_syscall(number, a[0], (long)moved, moved_length, 0, 0, 0);
-        return done == -EADDRINUSE && rc == 1 ? net_v6only_aside(a[0], done) : done;
-    }
-    size_t prefix = offsetof(struct sockaddr_un, sun_path);
-    if (!name || length <= prefix || length > sizeof(b->address))
-        return raw_syscall(number, a[0], a[1], a[2], a[3], a[4], a[5]);
-    memset(&b->address, 0, sizeof(b->address));
-    memcpy(&b->address, name, length);
-    if (b->address.sun_family != AF_UNIX || !b->address.sun_path[0])
-        return raw_syscall(number, a[0], a[1], a[2], a[3], a[4], a[5]);
-    /* Linux accepts an unterminated sun_path filling the given length. */
-    char path[sizeof(b->address.sun_path) + 1];
-    size_t size = strnlen(b->address.sun_path, length - prefix);
-    memcpy(path, b->address.sun_path, size);
-    path[size] = 0;
-    long ret = pb_resolve(b, AT_FDCWD, path, number != __NR_bind);
-    if (ret < 0) return ret;
-    /* Isolation mode: the broker binds or connects the socket to the host
-     * path (any length); the guest has no datagram socket to name. */
-    if (g_payload_config.isolate) {
-        if (sending || message) return -EPERM;
-        return raw_syscall(number == __NR_bind ? BROKER_BIND_PATH : BROKER_CONNECT_PATH,
-                           a[0], (long)b->host, 0, 0, 0, 0);
-    }
-    long directory = -1;
-    size_t host = strlen(b->host);
-    memset(&b->address, 0, sizeof(b->address));
-    b->address.sun_family = AF_UNIX;
-    if (host < sizeof(b->address.sun_path)) {
-        memcpy(b->address.sun_path, b->host, host + 1);
-    } else {
-        size_t slash = host;
-        while (slash && b->host[slash - 1] != '/') slash--;
-        if (!slash) return -ENAMETOOLONG;
-        char *base = b->host + slash;
-        b->host[slash - 1] = 0;
-        directory = raw_syscall(__NR_openat, AT_FDCWD, (long)(slash == 1 ? "/" : b->host),
-                                O_PATH | O_DIRECTORY | O_CLOEXEC, 0, 0, 0);
-        if (directory < 0) return directory;
-        char *out = b->address.sun_path, *end = out + sizeof(b->address.sun_path) - 1;
-        const char *proc = "/proc/self/fd/";
-        while (*proc && out < end) *out++ = *proc++;
-        char digits[16];
-        size_t count = 0;
-        unsigned long value = (unsigned long)directory;
-        do { digits[count++] = '0' + value % 10; value /= 10; } while (value);
-        while (count && out < end) *out++ = digits[--count];
-        if (out < end) *out++ = '/';
-        size_t left = strlen(base);
-        if (count || out + left >= end) {
-            raw_syscall(__NR_close, directory, 0, 0, 0, 0, 0);
-            return -ENAMETOOLONG;
-        }
-        memcpy(out, base, left + 1);
-    }
-    long address_length = (long)(prefix + strlen(b->address.sun_path) + 1);
-    if (message) {
-        b->message.name = &b->address;
-        b->message.name_length = (int)address_length;
-        ret = raw_syscall(number, a[0], (long)&b->message, a[2], 0, 0, 0);
-    } else if (sending) {
-        ret = raw_syscall(number, a[0], a[1], a[2], a[3], (long)&b->address, address_length);
-    } else {
-        ret = raw_syscall(number, a[0], (long)&b->address, address_length, 0, 0, 0);
-    }
-    if (directory >= 0) raw_syscall(__NR_close, directory, 0, 0, 0, 0, 0);
-    return ret;
-}
-
-
-
-
-static long dispatch(Bridge *b, long number, long a[6], struct proot_open_origin *origin)
-{
-    if(number==__NR_faccessat || number==__NR_faccessat2) {
-        /* Match the kernel's int ABI before classifying W_OK. */
-        a[2]=(int)a[2];
-        if((unsigned int)a[2]&~7u)return -EINVAL;
-        if(number==__NR_faccessat2) {
-            a[3]=(int)a[3];
-            if((unsigned int)a[3]&~(AT_EACCESS|AT_SYMLINK_NOFOLLOW|AT_EMPTY_PATH))
-                return -EINVAL;
-        }
-    }
-    b->mutation = path_mutation(number, a);
-    b->attributes = number == __NR_fchmodat || number == __NR_fchownat ||
-        number == __NR_utimensat || number == __NR_truncate || number == __NR_setxattr ||
-        number == __NR_lsetxattr || number == __NR_removexattr || number == __NR_lremovexattr;
-    b->creates = number == __NR_mkdirat || number == __NR_mknodat || number == __NR_symlinkat ||
-        number == __NR_bind;
-    b->traverse = path_traversal(number, a);
-    b->union_op = UOP_READ;
-    b->union_opaque = false;
-    if (b->union_on) switch (number) {
-    case __NR_setxattr: case __NR_lsetxattr: case __NR_removexattr: case __NR_lremovexattr:
-    case __NR_truncate: case __NR_utimensat: case __NR_linkat:
-        b->union_op = UOP_COPY; break;
-    /* With an owner database chown and chmod of a lower object are only
-     * recorded: the shared layer's file is not touched. */
-    case __NR_fchownat: case __NR_fchmodat:
-        b->union_op = owners_enabled() ? UOP_RECORD : UOP_COPY; break;
-    case __NR_mkdirat: case __NR_mknodat: case __NR_symlinkat: case __NR_bind:
-        b->union_op = UOP_CREATE; break;
-    case __NR_openat:
-        if (!(a[2] & O_PATH)) { b->union_op = UOP_OPEN; b->open_flags = a[2]; }
-        break;
-    }
-    if (number == __NR_mount)
-        return pb_mount_call(b, a);
-    if (number == __NR_umount2)
-        return pb_umount_call(b, a);
-    if (number == __NR_bind || number == __NR_connect ||
-        number == __NR_sendto || number == __NR_sendmsg)
-        return socket_address(b, number, a);
-    /* Socket names keep their spelling (bind records it); exec resolves
-     * through proot_resolve_exec_path. Everything dispatched here is safe
-     * to issue through the walked parent directory. */
-    /* In isolation mode the broker walks every path itself. */
-    b->secure = g_payload_config.guard >= GUARD_PATHS && !g_payload_config.isolate;
-    long ret;
-    switch (number) {
-    case __NR_setxattr: case __NR_getxattr:
-    case __NR_listxattr: case __NR_removexattr:
-    case __NR_lsetxattr: case __NR_lgetxattr:
-    case __NR_llistxattr: case __NR_lremovexattr: {
-        /* l* operates on the final symlink itself; intermediate links still
-         * pb_resolve normally. Preserve the native name/value/size/flags ABI. */
-        bool follow = number != __NR_lsetxattr && number != __NR_lgetxattr &&
-                      number != __NR_llistxattr && number != __NR_lremovexattr;
-        ret = pb_resolve(b, AT_FDCWD, (const char *)a[0], follow);
-        if (ret < 0) return ret;
-        ret = raw_syscall(number, (long)b->host, a[1], a[2], a[3], a[4], a[5]);
-        if ((number == __NR_setxattr || number == __NR_lsetxattr) &&
-            (ret == -EACCES || ret == -EPERM || ret == -EOPNOTSUPP) &&
-            g_payload_config.mode == CONFIG_MODE_CONTAINER && a[1] &&
-            !strncmp((const char *)a[1], "security.", 9))
-            return 0;
-        return ret;
-    }
-    }
-    if (number == __NR_inotify_add_watch) {
-        if (!a[1]) return -EFAULT;
-        ret = pb_resolve(b, AT_FDCWD, (const char *)a[1], !(a[2] & IN_DONT_FOLLOW));
-        if (ret < 0) return ret;
-        ret = watch_hides_child(b, b->guest);
-        if (ret < 0) return ret;
-        return raw_syscall(number, a[0], (long)b->host, a[2], 0, 0, 0);
-    }
-    /* R6: a descriptor of a lower object: chmod is recorded with an owner
-     * database; otherwise it, and utimensat(fd, NULL), copy up first and
-     * change the upper's copy (the descriptor keeps reading the lower). */
-    if (b->union_on && (number == __NR_fchmod || (number == __NR_utimensat && !a[1]))) {
-        ret = union_fd(b, (int)a[0]);
-        if (ret < 0) return ret;
-        if (ret > 0 && number == __NR_fchmod && owners_enabled()) {
-            struct stat st;
-            ret = raw_syscall(__NR_fstat, a[0], (long)&st, 0, 0, 0, 0);
-            if (ret < 0) return ret;
-            ret = owners_may_chmod(&st);
-            if (ret < 0) return ret;
-            owners_chmod_done(&st, (unsigned)a[1], st.st_mode & 07777);
-            return 0;
-        }
-        if (ret > 0) {
-            ret = union_copy_up(b->uv, b->union_rel, true);
-            if (ret < 0) return ret;
-            size_t n = b->uv->length[0];
-            if (n + strlen(b->union_rel) >= PATH_MAX) return -ENAMETOOLONG;
-            memcpy(b->host, b->uv->layer[0], n);
-            strcpy(b->host + n, b->union_rel);
-            if (number == __NR_fchmod)
-                return raw_syscall(__NR_fchmodat, AT_FDCWD, (long)b->host, a[1], 0, 0, 0);
-            return raw_syscall(__NR_utimensat, AT_FDCWD, (long)b->host, a[2], AT_SYMLINK_NOFOLLOW, 0, 0);
-        }
-    }
-    /* Descriptor operations retain kernel identity; FD policy is a later layer. */
-    if ((number == __NR_fchown || number == __NR_fchmod) && owners_enabled()) {
-        struct stat st;
-        ret = raw_syscall(__NR_fstat, a[0], (long)&st, 0, 0, 0, 0);
-        if (ret < 0) return ret;
-        return number == __NR_fchown ? owners_chown(&st, (int)a[1], (int)a[2]) :
-            owners_apply_mode(a[0], NULL, &st, (unsigned)a[1]);
-    }
-    if (number == __NR_fchown)
-        return fake_chown(raw_syscall(number, a[0], a[1], a[2], 0, 0, 0));
-    if (number == __NR_fchmod || number == __NR_fstatfs || number == __NR_ftruncate)
-        return raw_syscall(number, a[0], a[1], a[2], a[3], a[4], a[5]);
-    if (number == __NR_statfs || number == __NR_truncate) {
-        if (!a[0]) return -EFAULT;
-        ret = pb_resolve(b, AT_FDCWD, (const char *)a[0], true);
-        if (ret < 0) return ret;
-        return raw_syscall(number, (long)b->host, a[1], a[2], a[3], a[4], a[5]);
-    }
-    if (number == __NR_fchownat || number == __NR_utimensat) {
-        long flags = a[number == __NR_fchownat ? 4 : 3];
-        long allowed = AT_SYMLINK_NOFOLLOW;
-        if (number == __NR_fchownat) allowed |= AT_EMPTY_PATH;
-        if (flags & ~allowed) return -EINVAL;
-        /* Linux utimensat(fd, NULL, ...) is an FD operation. */
-        if (number == __NR_utimensat && !a[1])
-            return raw_syscall(number, a[0], a[1], a[2], a[3], a[4], a[5]);
-        if (!a[1]) return -EFAULT;
-        const char *path = (const char *)a[1];
-        if (number == __NR_fchownat && owners_enabled()) {
-            struct stat st;
-            if (!*path && (flags & AT_EMPTY_PATH)) {
-                ret = a[0] == AT_FDCWD ? host_stat(".", true, &st) :
-                    raw_syscall(__NR_fstat, a[0], (long)&st, 0, 0, 0, 0);
-            } else {
-                ret = pb_resolve(b, (int)a[0], path, !(flags & AT_SYMLINK_NOFOLLOW));
-                if (ret < 0) return ret;
-                ret = host_stat(b->host, !(flags & AT_SYMLINK_NOFOLLOW), &st);
-            }
-            return ret < 0 ? ret : owners_chown(&st, (int)a[2], (int)a[3]);
-        }
-        if (!*path && number == __NR_fchownat && (flags & AT_EMPTY_PATH))
-            ret = raw_syscall(number, a[0], a[1], a[2], a[3], a[4], a[5]);
-        else {
-            ret = pb_resolve(b, (int)a[0], path, !(flags & AT_SYMLINK_NOFOLLOW));
-            if (ret < 0) return ret;
-            ret = raw_syscall(number, AT_FDCWD, (long)b->host, a[2], a[3], a[4], a[5]);
-        }
-        return number == __NR_fchownat ? fake_chown(ret) : ret;
-    }
-    if (number == __NR_mkdirat || number == __NR_unlinkat || number == __NR_symlinkat ||
-        number == __NR_linkat || number == __NR_renameat || number == __NR_renameat2)
-        return mutate(b, number, a);
-    if (number == __NR_fchmodat && owners_enabled()) {
-        if (!a[1]) return -EFAULT;
-        ret = pb_resolve(b, (int)a[0], (const char *)a[1], true);
-        if (ret < 0) return ret;
-        struct stat st;
-        ret = host_stat(b->host, true, &st);
-        if (ret < 0) return ret;
-        if (b->union_layer > 0) {
-            ret = owners_may_chmod(&st);
-            if (ret < 0) return ret;
-            owners_chmod_done(&st, (unsigned)a[2], st.st_mode & 07777);
-            return 0;
-        }
-        return owners_apply_mode(-1, b->host, &st, (unsigned)a[2]);
-    }
-    if (number == __NR_getcwd) {
-        ret = guest_cwd(b);
-        if (ret < 0)
-            return ret;
-        size_t size = strlen(b->cwd) + 1;
-        if ((unsigned long)a[1] < size)
-            return -ERANGE;
-        if (!a[0])
-            return -EFAULT;
-        memcpy((void *)a[0], b->cwd, size);
-        /* Raw Linux getcwd returns bytes INCLUDING the NUL terminator. */
-        return (long)size;
-    }
-    if (number == __NR_fchdir) {
-        ret = host_fd(b, (int)a[0], b->guest);
-        if (ret < 0)
-            return ret;
-        ret = path_visibility(b, b->guest);
-        if (ret < 0) return ret;
-        if (ret == FS_HIDDEN) return -EACCES;
-        ret = raw_syscall(__NR_fchdir, a[0], 0, 0, 0, 0, 0);
-        if (ret >= 0 && origin) *origin = b->anchor;
-        return ret;
-    }
-    if (number == __NR_chdir) {
-        ret = pb_resolve(b, AT_FDCWD, (const char *)a[0], true);
-        if (ret < 0)
-            return ret;
-        bool known = origin && (((const char *)a[0])[0] == '/' || b->anchor.known);
-        size_t id = 0;
-        if (known) {
-            ret = binding_table_mount_id(&b->table, b->guest, &id);
-            if (ret < 0) return ret;
-        }
-        ret = raw_syscall(__NR_chdir, (long)b->host, 0, 0, 0, 0, 0);
-        if (ret >= 0 && known) *origin = (struct proot_open_origin){id, true};
-        return ret;
-    }
-
-    const char *path = (const char *)a[1];
-    if (!path)
-        return -EFAULT;
-    bool follow = true;
-    if (number == __NR_mknodat) {
-        follow = false;
-    } else if (number == __NR_openat) {
-        int flags = (int)a[2];
-        follow = !(flags & O_NOFOLLOW) && !((flags & O_CREAT) && (flags & O_EXCL));
-    } else if (number == __NR_readlinkat) {
-        follow = false;
-        if (a[3] <= 0)
-            return -EINVAL;
-    } else if (number == __NR_newfstatat || number == __NR_faccessat2 || number == __NR_statx) {
-        long flags = number == __NR_statx ? a[2] : a[3];
-        follow = !(flags & AT_SYMLINK_NOFOLLOW);
-        /* No pathname traversal for AT_EMPTY_PATH; preserve the FD operation
-         * and let the kernel validate flags/FD/output, including AT_FDCWD. */
-        if (!path[0] && (flags & AT_EMPTY_PATH)) {
-            if (number == __NR_newfstatat) {
-                if (flags & ~(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT))
-                    return -EINVAL;
-                /* This host's fstatat(empty, symlink-FD) can report the parent
-                 * directory unless NOFOLLOW is set. fstat operates on the FD
-                 * itself and gives the required symlink identity. */
-                if (a[0] != AT_FDCWD)
-                    return raw_syscall(__NR_fstat, a[0], a[2], 0, 0, 0, 0);
-                return raw_syscall(number, AT_FDCWD, (long)".", a[2],
-                                   flags & ~AT_EMPTY_PATH, 0, 0);
-            }
-            if (number == __NR_statx) {
-                /* Empty-path statx likewise refers to the FD itself. */
-                return raw_syscall(number, a[0], a[1], flags | AT_SYMLINK_NOFOLLOW,
-                                   a[3], a[4], a[5]);
-            }
-            return raw_syscall(number, a[0], a[1], a[2], a[3], a[4], a[5]);
-        }
-    }
-    /* readlinkat supports an empty pathname on an O_PATH symlink FD. */
-    if (number == __NR_readlinkat && !path[0])
-        return raw_syscall(number, a[0], a[1], a[2], a[3], 0, 0);
-
-    bool observed_open = number == __NR_openat && origin &&
-        (path[0] == '/' || b->anchor.known);
-    /* A followed open (not O_PATH, which would open the link itself) skips
-     * the final lstat and opens with O_NOFOLLOW; only ELOOP, a final
-     * symlink, needs the full resolution again. Saves one host walk. */
-    size_t length = strnlen(path, PATH_MAX);
-    b->defer_final = number == __NR_openat && follow && !(a[2] & O_PATH) &&
-        length && length < PATH_MAX && path[length - 1] != '/';
-    bool deferred = b->defer_final;
-    /* Generic userspace character-device proxies (--vdev GUEST:SOCK[:TYPE]). */
-    if (vdev_enabled() && path[0] == '/' && vdev_match_path(path) != -1) {
-        b->defer_final = false;
-        return vdev_path_call(number, a, vdev_match_path(path));
-    }
-    /* R6: the emulated loop devices, spelled as such (no resolution: the
-     * name has no host file, which a guarded final lookup refuses). */
-    if (mounts_enabled() && path[0] == '/' && pb_loop_device(path) != -1) {
-        b->defer_final = false;
-        return pb_loop_path_call(number, a, pb_loop_device(path));
-    }
-    /* Virtual /proc/net and /sys/class/net views (--net-sock PATH): serve
-     * directly before host resolution so sandboxed hosts that deny /proc/net
-     * or /sys/class/net still present the container's virtual interfaces. */
-    if (net_stack_enabled() && path[0] == '/' &&
-        (number == __NR_openat || number == __NR_newfstatat || number == __NR_statx ||
-         number == __NR_faccessat || number == __NR_faccessat2)) {
-        long nrc = net_stack_proc_call(number, a, path);
-        if (nrc != -ENOENT) {
-            b->defer_final = false;
-            return nrc;
-        }
-    }
-    /* Virtual /proc & /sys resource views (--cpuset / --mem-mb): serve directly
-     * before host resolution so sandboxed hosts that hide /sys still report the
-     * configured container CPU/memory limits cleanly. */
-    if (number == __NR_openat && !(a[2] & (O_ACCMODE | O_PATH | O_CREAT)) && path[0] == '/') {
-        if (g_payload_config.cpu_mask &&
-            (!strcmp(path, "/proc/cpuinfo") ||
-             !strcmp(path, "/sys/devices/system/cpu/online") ||
-             !strcmp(path, "/sys/devices/system/cpu/present") ||
-             !strcmp(path, "/sys/devices/system/cpu/possible"))) {
-            strcpy(b->guest, path);
-            b->defer_final = false;
-            return pb_proc_cpuinfo(b, (int)a[2]);
-        }
-        if (g_payload_config.mem_limit_mb && !strcmp(path, "/proc/meminfo")) {
-            strcpy(b->guest, path);
-            b->defer_final = false;
-            return pb_proc_meminfo(b, (int)a[2]);
-        }
-    }
-    ret = pb_resolve(b, (int)a[0], path, follow);
-    b->defer_final = false;
-    if (ret < 0)
-        return ret;
-    if (vdev_enabled()) {
-        int vd = vdev_match_path(b->guest);
-        if (vd != -1) return vdev_path_call(number, a, vd);
-    }
-    /* R6: the emulated loop devices. */
-    if (mounts_enabled()) {
-        int device = pb_loop_device(b->guest);
-        if (device != -1) return pb_loop_path_call(number, a, device);
-    }
-    if (number == __NR_readlinkat) {
-        Comparison c = compare_paths("/proc", b->guest);
-        if (c == PATH1_IS_PREFIX)
-            return pb_proc_readlink(b, a);
-        /* Preserve ordinary symlink bytes. Kernel handles truncation, no NUL
-         * and invalid output addresses. Do not rewrite a relative target. */
-    }
-    size_t mount_id = 0;
-    if (observed_open) {
-        ret = binding_table_mount_id(&b->table, b->guest, &mount_id);
-        if (ret < 0) return ret;
-    }
-    /* Without a glue tree (no writable glue base), metadata of a glue
-     * directory is still a directory's: the root's. */
-    if ((number == __NR_newfstatat || number == __NR_statx || number == __NR_faccessat ||
-         number == __NR_faccessat2) && glue_ancestor(b, b->guest)) {
-        struct stat probe;
-        if (raw_syscall(__NR_newfstatat, AT_FDCWD, (long)b->host, (long)&probe,
-                        AT_SYMLINK_NOFOLLOW, 0, 0) == -ENOENT)
-            strcpy(b->host, b->table.root);
-    }
-    /* R5: an O_CREAT open that makes the file records its owner. */
-    bool fresh = false;
-    if (number == __NR_openat && owners_enabled() && ((a[2] & O_CREAT) || (a[2] & O_TMPFILE) == O_TMPFILE)) {
-        struct stat probe;
-        fresh = (a[2] & O_EXCL) || (a[2] & O_TMPFILE) == O_TMPFILE || host_stat(b->host, true, &probe) == -ENOENT;
-    }
-    if (number == __NR_openat && !(a[2] & (O_ACCMODE | O_PATH | O_CREAT))) {
-        ret = pb_proc_cmdline(b, (int)a[2]);
-        if (ret == -ENOENT && mounts_enabled())
-            ret = pb_proc_mounts(b, (int)a[2]);
-        if (ret == -ENOENT && mounts_enabled())
-            ret = pb_proc_filesystems(b, (int)a[2]);
-        if (ret == -ENOENT && g_payload_config.mode == CONFIG_MODE_CONTAINER)
-            ret = pb_proc_status(b, (int)a[2]);
-        if (ret == -ENOENT && g_payload_config.cpu_mask)
-            ret = pb_proc_cpuinfo(b, (int)a[2]);
-        if (ret == -ENOENT && g_payload_config.mem_limit_mb)
-            ret = pb_proc_meminfo(b, (int)a[2]);
-    } else ret = -ENOENT;
-    if (ret == -ENOENT && number == __NR_newfstatat && follow && b->final_match) {
-        /* Copied by the kernel so a bad buffer is still EFAULT. */
-        struct { const void *base; size_t length; } local = {&b->final_stat, sizeof(b->final_stat)},
-            remote = {(void *)a[2], sizeof(b->final_stat)};
-        long pid = raw_syscall(__NR_getpid, 0, 0, 0, 0, 0, 0);
-        long n = raw_syscall(__NR_process_vm_writev, pid, (long)&local, 1, (long)&remote, 1, 0);
-        if (n == (long)sizeof(b->final_stat)) return 0;
-        if (n == -EFAULT) return n;
-    }
-    if (ret == -ENOENT && deferred) {
-        ret = raw_syscall(number, AT_FDCWD, (long)b->host, a[2] | O_NOFOLLOW, a[3], 0, 0);
-        if (ret != -ELOOP) goto opened;
-        /* A final symlink: pb_resolve it in guest terms after all. */
-        ret = pb_resolve(b, (int)a[0], path, follow);
-        if (ret < 0) return ret;
-        if (observed_open) {
-            ret = binding_table_mount_id(&b->table, b->guest, &mount_id);
-            if (ret < 0) return ret;
-        }
-        ret = -ENOENT;
-    }
-    if (ret == -ENOENT) {
-        long arg2 = a[2];
-        if ((number == __NR_faccessat || number == __NR_faccessat2) &&
-            g_payload_config.isolate && b->union_on && b->union_layer > 0 &&
-            (arg2 & 2) && b->uv && b->uv->layer[0] && b->uv->layer[0][0]) {
-            long up = raw_syscall(__NR_faccessat, AT_FDCWD, (long)b->uv->layer[0], 2, 0, 0, 0);
-            if (up < 0)
-                return up;
-            arg2 &= ~2L;
-        }
-        ret = raw_syscall(number, AT_FDCWD, (long)b->host, arg2, a[3], a[4], a[5]);
-    }
- opened:
-    if (ret >= 0 && observed_open)
-        *origin = (struct proot_open_origin){mount_id, true};
-    if (ret >= 0 && fresh) {
-        struct stat st;
-        if (!raw_syscall(__NR_fstat, ret, (long)&st, 0, 0, 0, 0))
-            owners_created(&st);
-    }
-    if (!ret && number == __NR_mknodat)
-        owners_new_name(b);
-    return ret;
-}
-
-/* A few per-process bridges avoid mmap/munmap and page faults on every path
- * call. Slots are claimed atomically, so threads share them safely; every
- * bridge is released before any call that does not return (exec runs from
- * its own scratch). An experimental vfork child keeps its reserved scratch. */
 #define BRIDGE_POOL 4
 static Bridge *bridge_pool[BRIDGE_POOL];
 static int bridge_used[BRIDGE_POOL];
+
 static long bridge_acquire(void)
 {
     if (g_payload_config.guard != GUARD_NONE && !fd_runtime_shared_scratch())
@@ -1880,6 +38,7 @@ static long bridge_acquire(void)
     }
     return proot_scratch_alloc(sizeof(Bridge));
 }
+
 static void bridge_release(Bridge *b)
 {
     for (int i = 0; i < b->walk_count; i++)
@@ -1914,80 +73,96 @@ static long bridge_create(Bridge **out)
     b->walk_count = 0;
     b->defer_final = false;
     b->final_valid = false;
+    b->last_map_valid = false;
     b->traverse = false;
     b->optimistic_allowed = b->optimistic = b->optimistic_used = b->force_full = false;
     b->hints = NULL;
-    b->view_count = 0;
-    b->union_on = false;
     b->uv = b->first_uv = NULL;
+    b->map_view = b->final_view = NULL;
     b->union_op = UOP_READ;
     b->union_layer = b->first_union_layer = -1;
     b->umemo.valid = false;
     b->anchor_fd = AT_FDCWD;
     b->anchor = (struct proot_open_origin){0, false};
+
+    /* Reuse validated binding/mount/view tables across calls when the container
+     * mount table version has not changed (and read-guard access policy is off). */
+    bool m_on = mounts_enabled() != 0;
+    uint64_t mver = m_on ? mounts_version() : 0;
+    if (b->table_ready && cfg->guard != GUARD_READS && (!m_on || (!(mver & 1ULL) && mver == b->cached_mount_ver))) {
+        *out = b;
+        return 0;
+    }
+
+    b->view_count = 0;
+    b->union_on = false;
     size_t count = (size_t)cfg->bind_count;
-    b->mount_count = mounts_enabled() ? mounts_snapshot(b->mounts, CONFIG_MAX_MOUNTS) : 0;
+    b->mount_count = m_on ? mounts_snapshot(b->mounts, CONFIG_MAX_MOUNTS) : 0;
+    /* Re-read mount version after snapshot so a concurrent write is never cached. */
+    uint64_t mver_after = m_on ? mounts_version() : 0;
     for (int i = 0; i < cfg->bind_count; i++)
         b->bindings[i] = b->mount_count && mounts_bind_hidden(b->mounts, b->mount_count, cfg->binds[i].src) ?
             (PathBinding){UNMOUNTED, UNMOUNTED} : (PathBinding){cfg->binds[i].src, cfg->binds[i].dst};
-    /* R4: slot i is mount id bind_count + 1 + i; a free or hidden slot
-     * keeps its id but matches nothing. */
     for (int i = 0; i < b->mount_count; i++)
         b->bindings[count++] = mounts_hidden(b->mounts, b->mount_count, i) ?
             (PathBinding){UNMOUNTED, UNMOUNTED} : (PathBinding){b->mounts[i].guest, b->mounts[i].host};
     b->table = (BindingTable){cfg->root[0] ? cfg->root : "/", b->bindings, count};
-    /* R6: the root's merged view and those of overlay mounts. */
     if (union_enabled())
         b->view_count = union_views(b->views, 1 + MOUNT_OVERLAYS, b->overlay_lowers, b->mounts, b->mount_count);
     b->union_on = b->view_count > 0;
     b->root_union = b->union_on && cfg->lower_count > 0 && cfg->root[0];
-    b->map_view = b->final_view = NULL;
     long ret = binding_table_validate(&b->table);
     b->reads = false;
     if (ret >= 0 && cfg->guard == GUARD_READS) {
-        size_t count;
-        ret = fd_runtime_mount_access(b->access, &count);
-        b->policy = (struct fs_policy){b->access, count};
+        size_t mcnt;
+        ret = fd_runtime_mount_access(b->access, &mcnt);
+        b->policy = (struct fs_policy){b->access, mcnt};
         b->exposed_count = 0;
         for (size_t i = 0; ret >= 0 && i < b->table.count; i++) {
             size_t id;
             ret = binding_table_mount_id(&b->table, b->bindings[i].guest, &id);
-            /* Shadowed duplicate destinations expose nothing. */
             if (ret >= 0 && id == i + 1 && b->access[id] != FS_DENY && b->bindings[i].guest != UNMOUNTED)
                 b->exposed[b->exposed_count++] = b->bindings[i].guest;
         }
         b->reads = ret >= 0;
     }
     if (ret < 0) {
+        b->table_ready = false;
         bridge_release(b);
         return ret;
+    }
+    if (cfg->guard != GUARD_READS && (!m_on || (!(mver_after & 1ULL) && mver_after == mver))) {
+        b->cached_mount_ver = mver_after;
+        b->table_ready = true;
+    } else {
+        b->table_ready = false;
     }
     *out = b;
     return 0;
 }
 
-/* Exactly one retained mount must faithfully name this host path. Under the
- * read guard a hidden name cannot reach the object, so it is not a competing
- * view; two visible aliases (e.g. ro and rw) remain ambiguous. */
+/* ---- Mount Revalidation & FD Introspection ---- */
+
 static int unique_mount(Bridge *b, const char *host, size_t *selected)
 {
-    size_t matches=0;
-    /* The glue tree belongs to the root mount alone. */
-    if(glue_guest(host,b->guest)) {
-        int visibility=path_visibility(b,b->guest);
-        if(visibility<0)return visibility;
-        if(visibility==FS_HIDDEN)return -EXDEV;
-        *selected=0;return 0;
+    size_t matches = 0;
+    if (pb_glue_guest(host, b->guest)) {
+        int visibility = pb_path_visibility(b, b->guest);
+        if (visibility < 0) return visibility;
+        if (visibility == FS_HIDDEN) return -EXDEV;
+        *selected = 0;
+        return 0;
     }
-    for(size_t id=0;id<=b->table.count;id++) {
-        b->anchor=(struct proot_open_origin){id,true};
-        if(observed_guest_path(b,host,b->guest))continue;
-        int visibility=path_visibility(b,b->guest);
-        if(visibility<0)return visibility;
-        if(visibility==FS_HIDDEN)continue;
-        *selected=id;matches++;
+    for (size_t id = 0; id <= b->table.count; id++) {
+        b->anchor = (struct proot_open_origin){id, true};
+        if (pb_observed_guest_path(b, host, b->guest)) continue;
+        int visibility = pb_path_visibility(b, b->guest);
+        if (visibility < 0) return visibility;
+        if (visibility == FS_HIDDEN) continue;
+        *selected = id;
+        matches++;
     }
-    return matches==1 ? 0 : -EXDEV;
+    return matches == 1 ? 0 : -EXDEV;
 }
 
 int proot_fd_guest_path(int fd, char *guest, size_t capacity)
@@ -2009,11 +184,10 @@ int proot_fd_guest_path(int fd, char *guest, size_t capacity)
     if (ret >= 0) {
         b->proc_host[ret] = 0;
         size_t length = (size_t)ret;
-        /* Deleted files, memfds and other non-path objects have no guest name. */
         if (b->proc_host[0] != '/' ||
             (length >= 10 && !strcmp(b->proc_host + length - 10, " (deleted)")))
             ret = -EOPNOTSUPP;
-        else if (preferred_guest_path(b, b->proc_host, b->proc_guest) < 0)
+        else if (pb_preferred_guest_path(b, b->proc_host, b->proc_guest) < 0)
             ret = -EACCES;
         else if (strlen(b->proc_guest) >= capacity)
             ret = -ENAMETOOLONG;
@@ -2031,12 +205,10 @@ void proot_socket_name(long number, long fd, void *address, unsigned *length,
 {
     size_t prefix = offsetof(struct sockaddr_un, sun_path);
     if (!address || !length || *length <= prefix + 1 || *length > sizeof(struct sockaddr_un))
-        return; /* Unnamed or not a pathname address: nothing to rewrite. */
+        return;
     Bridge *b;
     if (bridge_create(&b) < 0) return;
     if (*length > capacity) {
-        /* The guest buffer holds a truncated host name: query it privately.
-         * accept reports the peer, so ask the new connection for its peer. */
         unsigned full = sizeof(b->address);
         long query = number == __NR_getsockname ? __NR_getsockname : __NR_getpeername;
         if (raw_syscall(query, fd, (long)&b->address, (long)&full, 0, 0, 0) < 0 ||
@@ -2049,7 +221,7 @@ void proot_socket_name(long number, long fd, void *address, unsigned *length,
         size_t size = strnlen(b->address.sun_path, *length - prefix);
         memcpy(b->proc_host, b->address.sun_path, size);
         b->proc_host[size] = 0;
-        int rc = preferred_guest_path(b, b->proc_host, b->proc_guest);
+        int rc = pb_preferred_guest_path(b, b->proc_host, b->proc_guest);
         if (rc < 0 && g_payload_config.guard == GUARD_READS) {
             *length = (unsigned)sizeof(b->address.sun_family);
             bridge_release(b);
@@ -2069,70 +241,75 @@ void proot_socket_name(long number, long fd, void *address, unsigned *length,
 
 int proot_revalidate_cwd(struct proot_open_origin *origin)
 {
-    if(!origin)return -EINVAL;
-    *origin=(struct proot_open_origin){0,false};
+    if (!origin) return -EINVAL;
+    *origin = (struct proot_open_origin){0, false};
     Bridge *b;
-    long ret=bridge_create(&b);if(ret<0)return ret;
-    ret=raw_syscall(__NR_getcwd,(long)b->first_host,sizeof(b->first_host),0,0,0,0);
-    if(ret>=0) {
+    long ret = bridge_create(&b);
+    if (ret < 0) return (int)ret;
+    ret = raw_syscall(__NR_getcwd, (long)b->first_host, sizeof(b->first_host), 0, 0, 0, 0);
+    if (ret >= 0) {
         size_t selected;
-        /* Unreachable or ambiguous (aliased) directories stay unknown. */
-        ret=unique_mount(b,b->first_host,&selected);
-        if(!ret)*origin=(struct proot_open_origin){selected,true};
+        ret = unique_mount(b, b->first_host, &selected);
+        if (!ret) *origin = (struct proot_open_origin){selected, true};
     }
-    bridge_release(b);return (int)ret;
+    bridge_release(b);
+    return (int)ret;
 }
 
 int proot_revalidate_regular_fd(int fd, struct proot_open_origin *origin)
 {
-    if(!origin)return -EINVAL;
-    *origin=(struct proot_open_origin){0,false};
+    if (!origin) return -EINVAL;
+    *origin = (struct proot_open_origin){0, false};
     struct stat live, named, again;
-    long ret=raw_syscall(__NR_fstat,fd,(long)&live,0,0,0,0);
-    if(ret<0)return ret;
-    if((live.st_mode&S_IFMT)!=S_IFREG || !live.st_nlink)return -EOPNOTSUPP;
+    long ret = raw_syscall(__NR_fstat, fd, (long)&live, 0, 0, 0, 0);
+    if (ret < 0) return (int)ret;
+    if ((live.st_mode & S_IFMT) != S_IFREG || !live.st_nlink) return -EOPNOTSUPP;
     Bridge *b;
-    ret=bridge_create(&b);if(ret<0)return ret;
-    char link[64]="/proc/self/fd/",digits[16];
-    unsigned value=(unsigned)fd;size_t count=0,pos=strlen(link);
-    do { digits[count++]='0'+value%10;value/=10; } while(value);
-    while(count)link[pos++]=digits[--count];link[pos]=0;
-    ret=pb_host_readlink(b,link,b->first_host,sizeof(b->first_host));
-    if(ret<0)goto done;
-    if(ret>=PATH_MAX) { ret=-ENAMETOOLONG;goto done; }
-    b->first_host[ret]=0;
-    if(!ret || b->first_host[0]!='/' ||
-       (ret>=10 && !strcmp(b->first_host+ret-10," (deleted)"))) {
-        ret=-EXDEV;goto done;
+    ret = bridge_create(&b);
+    if (ret < 0) return (int)ret;
+    char link[64] = "/proc/self/fd/", digits[16];
+    unsigned value = (unsigned)fd;
+    size_t count = 0, pos = strlen(link);
+    do { digits[count++] = '0' + value % 10; value /= 10; } while (value);
+    while (count) link[pos++] = digits[--count];
+    link[pos] = 0;
+    ret = pb_host_readlink(b, link, b->first_host, sizeof(b->first_host));
+    if (ret < 0) goto done;
+    if (ret >= PATH_MAX) { ret = -ENAMETOOLONG; goto done; }
+    b->first_host[ret] = 0;
+    if (!ret || b->first_host[0] != '/' ||
+        (ret >= 10 && !strcmp(b->first_host + ret - 10, " (deleted)"))) {
+        ret = -EXDEV;
+        goto done;
     }
-    ret=raw_syscall(__NR_newfstatat,AT_FDCWD,(long)b->first_host,(long)&named,
-                    AT_SYMLINK_NOFOLLOW,0,0);
-    if(ret<0)goto done;
-    if((named.st_mode&S_IFMT)!=S_IFREG || named.st_dev!=live.st_dev || named.st_ino!=live.st_ino) {
-        ret=-ESTALE;goto done;
+    ret = raw_syscall(__NR_newfstatat, AT_FDCWD, (long)b->first_host, (long)&named,
+                      AT_SYMLINK_NOFOLLOW, 0, 0);
+    if (ret < 0) goto done;
+    if ((named.st_mode & S_IFMT) != S_IFREG || named.st_dev != live.st_dev || named.st_ino != live.st_ino) {
+        ret = -ESTALE;
+        goto done;
     }
     size_t selected;
-    ret=unique_mount(b,b->first_host,&selected);
-    if(ret<0)goto done;
-    ret=raw_syscall(__NR_fstat,fd,(long)&again,0,0,0,0);
-    if(ret<0)goto done;
-    if(again.st_dev!=live.st_dev || again.st_ino!=live.st_ino || !again.st_nlink) {
-        ret=-ESTALE;goto done;
+    ret = unique_mount(b, b->first_host, &selected);
+    if (ret < 0) goto done;
+    ret = raw_syscall(__NR_fstat, fd, (long)&again, 0, 0, 0, 0);
+    if (ret < 0) goto done;
+    if (again.st_dev != live.st_dev || again.st_ino != live.st_ino || !again.st_nlink) {
+        ret = -ESTALE;
+        goto done;
     }
-    *origin=(struct proot_open_origin){selected,true};ret=0;
- done:
-    bridge_release(b);return ret;
+    *origin = (struct proot_open_origin){selected, true};
+    ret = 0;
+done:
+    bridge_release(b);
+    return (int)ret;
 }
 
-/* Kernel getdents64 record: ino, next offset, reclen, type, NUL-terminated name. */
+/* ---- getdents64 Visibility Filter ---- */
+
 #define DIRENT_OFFSET 8
 #define DIRENT_RECLEN 16
 #define DIRENT_NAME 19
-/* Isolation mode: naming a directory FD is a round trip to the broker, and
- * a listing takes several getdents calls. The guest name found for an open
- * directory is kept per FD while the FD still refers to the same directory
- * (dev/ino): it only selects names to hide here (the broker decides every
- * access), so a rename of the open directory leaves it merely stale. */
 #define DIR_NAMES 4
 static struct dir_name {
     long pid;
@@ -2186,29 +363,22 @@ long proot_getdents_visible(int fd, void *buffer, unsigned long count,
     if (cacheable && cached_dir_name(fd, b->first_guest, &dir, false))
         ret = 0;
     else {
-        ret = host_fd(b, fd, b->first_guest);
+        ret = pb_host_fd(b, fd, b->first_guest);
         if (ret >= 0 && cacheable && strlen(b->first_guest) < PATH_MAX)
             cached_dir_name(fd, b->first_guest, &dir, true);
     }
     if (ret == -ENOTDIR) {
-        /* Not a directory: the kernel reports its own error, no names. */
         ret = raw_syscall(__NR_getdents64, fd, (long)buffer, (long)count, 0, 0, 0);
         goto done;
     }
-    /* A directory without a faithful guest name cannot be filtered. */
     if (ret == -EXDEV) ret = -EACCES;
     if (ret < 0) goto done;
-    ret = path_visibility(b, b->first_guest);
+    ret = pb_path_visibility(b, b->first_guest);
     if (ret == FS_HIDDEN) ret = -EACCES;
     if (ret < 0) goto done;
     if (!buffer) { ret = -EFAULT; goto done; }
     size_t base = strlen(b->first_guest);
     for (;;) {
-        /* Read a full private batch so a hidden record never makes a small
-         * guest buffer fail. Visible records are copied out while they fit;
-         * the directory cursor is then moved back to the first record not
-         * returned. Hidden names never touch guest memory, a batch hiding
-         * every entry is retried, and zero still means end of directory. */
         long position = raw_syscall(__NR_lseek, fd, 0, 1 /* SEEK_CUR */, 0, 0, 0);
         if (position < 0) { ret = position; goto done; }
         ret = raw_syscall(__NR_getdents64, fd, (long)b->dirents, sizeof(b->dirents), 0, 0, 0);
@@ -2231,14 +401,12 @@ long proot_getdents_visible(int fd, void *buffer, unsigned long count,
                 if (base != 1) b->guest[at++] = '/';
                 memcpy(b->guest + at, name, size);
                 b->guest[at + size] = 0;
-                int visibility = path_visibility(b, b->guest);
+                int visibility = pb_path_visibility(b, b->guest);
                 if (visibility < 0) { ret = visibility; goto done; }
                 keep = visibility != FS_HIDDEN;
             }
             if (keep) {
                 if (kept + length > count) {
-                    /* Like the kernel: the record stays for the next call,
-                     * and a first visible record that cannot fit is EINVAL. */
                     long sought = raw_syscall(__NR_lseek, fd, position, 0 /* SEEK_SET */, 0, 0, 0);
                     ret = sought < 0 ? sought : kept ? (long)kept : -EINVAL;
                     goto done;
@@ -2256,26 +424,20 @@ done:
     return ret;
 }
 
-/* A link target spliced in optimistically may only climb ("../" first):
- * those components were walked by the broker; a later ".." would undo an
- * unchecked one. */
+/* ---- Isolation Optimistic Execution & Public Entry Points ---- */
+
 static bool climbing_target(const char *target)
 {
     const char *p = target;
     while (p[0] == '.' && p[1] == '.' && (p[2] == '/' || !p[2]))
         for (p += 2; *p == '/'; p++)
             ;
-    return lexical_path(p);
+    return pb_lexical_path(p);
 }
 
-/* Optimistic attempts of one call (isolation mode, see Bridge): each
- * symlink the broker refuses is reported and the call runs again with it
- * known, still optimistic; after LINK_HINTS of them, or a target that is
- * not lexical, with full resolution. A refused attempt has no effect: the
- * broker acts on nothing. */
 struct optimism {
     bool on;
-    struct link_hints *hints; /* mapped on the first refusal */
+    struct link_hints *hints;
 };
 
 static void optimism_begin(Bridge *b, struct optimism *o)
@@ -2284,7 +446,6 @@ static void optimism_begin(Bridge *b, struct optimism *o)
     b->hints = o->hints;
 }
 
-/* After an attempt that returned ret: whether to run it again. */
 static bool optimism_retry(Bridge *b, struct optimism *o, long ret)
 {
     if (!b->optimistic_used)
@@ -2310,14 +471,11 @@ static void optimism_end(struct optimism *o)
     if (o->hints) raw_syscall(__NR_munmap, (long)o->hints, sizeof(*o->hints), 0, 0, 0, 0);
 }
 
-/* One call through the bridge, optimistically first in isolation mode. */
 static long bridge_run(long number, long args[6], const struct proot_open_origin *anchor,
                        struct proot_open_origin *origin, const struct proot_path_context *context)
 {
     long saved[6];
     memcpy(saved, args, sizeof(saved));
-    /* The merged view looks names up itself (and may copy up): never
-     * optimistic. */
     struct optimism o = {g_payload_config.isolate && !union_enabled(), NULL};
     for (;;) {
         Bridge *b;
@@ -2332,11 +490,7 @@ static long bridge_run(long number, long args[6], const struct proot_open_origin
             b->anchor_fd = (number == __NR_chdir || number == __NR_getcwd) ? AT_FDCWD : (int)args[0];
         }
         optimism_begin(b, &o);
-        ret = dispatch(b, number, args, origin);
-        /* Isolation: a directory opened here keeps the guest name it was
-         * opened by, for the listing filter. What the broker hands out
-         * need not name it on the host (a denied root's traversable
-         * directories are synthesized, see broker.c). */
+        ret = pb_dispatch(b, number, args, origin);
         if (g_payload_config.guard == GUARD_READS && number == __NR_openat && ret >= 0 &&
             g_payload_config.isolate && b->guest[0] == '/') {
             struct stat dir;
@@ -2407,7 +561,6 @@ int proot_resolve_exec_path(int dirfd, const char *path, bool follow,
         else {
             strcpy(guest, b->guest);
             strcpy(host, b->host);
-            /* A layer image's file: its content before it is read. */
             ret = union_lazy_fill(b->final_view, b->host);
         }
     }
@@ -2415,9 +568,6 @@ int proot_resolve_exec_path(int dirfd, const char *path, bool follow,
     return (int)ret;
 }
 
-/* Isolation mode: pb_resolve an exec path and open it read-only (not
- * close-on-exec) through the broker, optimistically like bridge_run, so a
- * plain path costs one round trip. Returns the FD. */
 long proot_open_exec_path(int dirfd, const char *path, bool follow,
                           char *guest, char *host, size_t capacity,
                           const struct proot_path_context *context)
@@ -2454,12 +604,8 @@ long proot_open_exec_path(int dirfd, const char *path, bool follow,
     }
 }
 
-/* This deliberately does not emulate general openat2 resolution. Holding the
- * directory FD and opening one non-followed component keeps the actual lookup
- * in the kernel; canonicalizing then opening an absolute path would lose the
- * BENEATH constraint. Cross-bind targets require retained mount identities. */
 long proot_open_beneath(int dirfd, const char *path, unsigned long flags,
-                       const struct proot_open_origin *hint, struct proot_open_origin *origin)
+                        const struct proot_open_origin *hint, struct proot_open_origin *origin)
 {
     if (!origin) return -EINVAL;
     *origin = (struct proot_open_origin){0, false};
@@ -2470,9 +616,6 @@ long proot_open_beneath(int dirfd, const char *path, unsigned long flags,
     memcpy(name, path, length + 1);
     if (!length) return -ENOENT;
     if (name[0] == '/' || !strcmp(name, "..")) return -EXDEV;
-    /* Trailing separators require directory resolution. Only accept them
-     * with explicit O_DIRECTORY; keep NOFOLLOW at the actual kernel lookup.
-     * Following a trailing symlink is outside this restricted subset. */
     int trailing = name[length - 1] == '/';
     if (trailing) {
         if (!(flags & O_DIRECTORY)) return -EOPNOTSUPP;
@@ -2490,8 +633,8 @@ long proot_open_beneath(int dirfd, const char *path, unsigned long flags,
         if (anchor < 0) { ret = anchor; goto out; }
     }
     if (hint) { b->anchor = *hint; b->anchor_fd = (int)anchor; }
-    b->traverse = true; /* This subset always opens O_PATH. */
-    ret = host_fd(b, (int)anchor, b->first_guest);
+    b->traverse = true;
+    ret = pb_host_fd(b, (int)anchor, b->first_guest);
     if (ret < 0) goto close_anchor;
     size_t base_mount, target_mount;
     ret = binding_table_mount_id(&b->table, b->first_guest, &base_mount);

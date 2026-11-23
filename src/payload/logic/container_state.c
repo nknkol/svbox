@@ -107,6 +107,7 @@ static int path_under(const char *prefix, const char *path, int strict)
 /* ---------------------------------------------------------------- mounts */
 static int table_state;
 static void *table_slot;
+static uint32_t g_mounts_unshare_gen = 0;
 
 static struct mount_table *table(void)
 {
@@ -116,6 +117,15 @@ static struct mount_table *table(void)
 }
 
 int mounts_enabled(void) { return g_payload_config.mount_table_fd >= 0; }
+
+uint64_t mounts_version(void)
+{
+    uint64_t ug = (uint64_t)__atomic_load_n(&g_mounts_unshare_gen, __ATOMIC_ACQUIRE);
+    struct mount_table *t = table();
+    if (!t)
+        return ug << 32;
+    return (ug << 32) | (uint64_t)__atomic_load_n(&t->version, __ATOMIC_ACQUIRE);
+}
 
 int mounts_unshare(void)
 {
@@ -149,6 +159,7 @@ int mounts_unshare(void)
     raw_syscall(__NR_close, mfd, 0, 0, 0, 0, 0);
     void *prev = __atomic_exchange_n(&table_slot, new_t, __ATOMIC_ACQ_REL);
     __atomic_store_n(&table_state, 2, __ATOMIC_RELEASE);
+    __atomic_add_fetch(&g_mounts_unshare_gen, 1u, __ATOMIC_RELEASE);
     if (prev)
         raw_syscall(__NR_munmap, (long)prev, (long)MOUNT_TABLE_SIZE, 0, 0, 0, 0);
     return 0;
