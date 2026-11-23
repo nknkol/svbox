@@ -80,6 +80,21 @@ int main(void) {
         return 11;
     }
     close(rfd);
+
+    /* 4. Reverse /proc/self/fd path on a bind of a --lower subdir (even when upper path is longer) */
+    int afd = open("/mnt/alias/data.txt", O_RDONLY);
+    if (afd < 0) { fprintf(stderr, "open /mnt/alias/data.txt: %d\n", errno); return 12; }
+    char proc_fd[64], link_buf[256];
+    snprintf(proc_fd, sizeof(proc_fd), "/proc/self/fd/%d", afd);
+    ssize_t lr = readlink(proc_fd, link_buf, sizeof(link_buf) - 1);
+    close(afd);
+    if (lr <= 0) { fprintf(stderr, "readlink %s: %d\n", proc_fd, errno); return 13; }
+    link_buf[lr] = '\0';
+    if (strcmp(link_buf, "/mnt/alias/data.txt") != 0) {
+        fprintf(stderr, "reverse fd path mismatch: got '%s', want '/mnt/alias/data.txt'\n", link_buf);
+        return 14;
+    }
+
     printf("RESOURCE_LIMITS_OK\n");
     return 0;
 }
@@ -87,9 +102,10 @@ int main(void) {
 
 with tempfile.TemporaryDirectory(prefix='reslim-', dir=build) as temp:
     td = Path(temp)
-    lower = td / 'lower'
-    upper = td / 'upper'
-    lower.mkdir()
+    lower = td / 'l'
+    upper = td / 'very_long_upper_directory_name_longer_than_bind'
+    (lower / 'sub').mkdir(parents=True)
+    (lower / 'sub' / 'data.txt').write_text('hello-alias\n')
     upper.mkdir()
     src = td / 'probe.c'
     bin_path = lower / 'probe'
@@ -103,7 +119,8 @@ with tempfile.TemporaryDirectory(prefix='reslim-', dir=build) as temp:
         '--mem-mb', '2048',
         '--disk-mb', '4096',
         '-v', '/proc:/proc',
+        '-v', f'{lower / "sub"}:/mnt/alias',
         '--', 'probe',
     ], capture_output=True, text=True, timeout=15)
     assert p.returncode == 0 and 'RESOURCE_LIMITS_OK\n' in p.stdout, (p.returncode, p.stdout, p.stderr)
-    print('PASS: --mem-mb, --disk-mb, memfd fstat/fstatat/statx, and RO --lower')
+    print('PASS: --mem-mb, --disk-mb, memfd fstat/fstatat/statx, RO --lower, and lower-bind /proc/self/fd')

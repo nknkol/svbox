@@ -182,7 +182,13 @@ int union_alias(const struct union_view *u, const char *host, char out[PATH_MAX]
     const char *rel;
     int i = union_layer_of(u, host, &rel);
     if (i <= 0) return 0;
-    return join(out, u->layer[0], u->length[0], rel, strlen(rel), NULL) < 0 ? 0 : 1;
+    size_t al = u->length[0];
+    size_t rlen = strlen(rel);
+    if (al + rlen >= PATH_MAX) return 0;
+    /* Overlap-safe when out == host (e.g. in-place aliasing in host_map). */
+    memmove(out + al, rel, rlen + 1);
+    memcpy(out, u->layer[0], al);
+    return 1;
 }
 
 /* ---------------------------------------------------------------- images */

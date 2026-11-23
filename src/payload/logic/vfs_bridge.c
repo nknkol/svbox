@@ -80,7 +80,7 @@ static int host_map(void *opaque, const char *guest, char *host)
     /* R6: a name in the root's layers (through the root or a bind made of
      * it) is shown by the topmost layer that has it. */
     if (rc >= 0 && b->union_on) {
-        if (pb_bridge_alias(b, host, b->mapped)) strcpy(host, b->mapped);
+        pb_bridge_alias(b, host, host);
         const struct union_view *view = upper_view(b, host);
         b->map_view = view;
         int u = view ? union_map(view, host, NULL, &b->umemo) : 0;
@@ -509,9 +509,18 @@ static int visible_guest_path(Bridge *b, const char *host, char *guest)
 {
     char *mapped = b->mapped;
     if (glue_guest(host, guest)) return 0;
+    /* Prefer a direct bind/root reverse match on the real host path before
+     * falling back to root-union lower->upper aliasing (e.g. when a bind's
+     * host directory lives inside a --lower tree). */
+    const char *alias = NULL;
+    if (b->union_on && pb_bridge_alias(b, host, b->union_named))
+        alias = b->union_named;
+    if (binding_table_map(&b->table, HOST, host, guest) >= 0 &&
+        host_map(b, guest, mapped) >= 0 &&
+        (!strcmp(host, mapped) || (alias && union_same(b, alias, mapped))))
+        return 0;
     /* R6: a lower layer's object, named as the upper names its path. */
-    const char *named = host;
-    if (b->union_on && pb_bridge_alias(b, host, b->union_named)) named = b->union_named;
+    const char *named = alias ? alias : host;
     int rc = binding_table_map(&b->table, HOST, named, guest);
     if (rc < 0) return rc;
     rc = host_map(b, guest, mapped);
@@ -519,10 +528,13 @@ static int visible_guest_path(Bridge *b, const char *host, char *guest)
     return strcmp(host, mapped) && !union_same(b, named, mapped) ? -EXDEV : 0;
 }
 
-static int observed_guest_path(Bridge *b, const char *host, char *guest)
+static int observed_guest_path_len(Bridge *b, const char *host, char *guest, size_t *matched_out)
 {
     int rc;
-    if (glue_guest(host, guest)) return 0;
+    if (glue_guest(host, guest)) {
+        if (matched_out) *matched_out = 0;
+        return 0;
+    }
     /* Reverse through the retained mount, never whichever host alias
      * happens to win the global reverse map. Refuse a moved/overmounted
      * object when this immutable mount can no longer name it faithfully. */
@@ -531,8 +543,15 @@ static int observed_guest_path(Bridge *b, const char *host, char *guest)
     const char *host_prefix = id ? b->table.entries[id-1].host : b->table.root;
     const char *guest_prefix = id ? b->table.entries[id-1].guest : "/";
     const char *named = host;
-    if (b->union_on && pb_bridge_alias(b, host, b->union_named)) named = b->union_named;
+    bool aliased = false;
     Comparison prefix_match = compare_paths(host_prefix, named);
+    if (prefix_match != PATHS_ARE_EQUAL && prefix_match != PATH1_IS_PREFIX) {
+        if (b->union_on && pb_bridge_alias(b, host, b->union_named)) {
+            named = b->union_named;
+            aliased = true;
+            prefix_match = compare_paths(host_prefix, named);
+        }
+    }
     if (prefix_match != PATHS_ARE_EQUAL && prefix_match != PATH1_IS_PREFIX)
         return -EXDEV;
     strcpy(guest, named);
@@ -544,7 +563,32 @@ static int observed_guest_path(Bridge *b, const char *host, char *guest)
     char *mapped = b->mapped;
     rc = host_map(b, guest, mapped);
     if (rc < 0) return rc;
-    return strcmp(host, mapped) && !union_same(b, named, mapped) ? -EXDEV : 0;
+    if (strcmp(host, mapped)) {
+        const char *upper_form = aliased ? named : host;
+        if (!aliased && b->union_on && pb_bridge_alias(b, host, b->union_named))
+            upper_form = b->union_named;
+        if (!union_same(b, upper_form, mapped))
+            return -EXDEV;
+    }
+    if (matched_out) {
+        size_t plen = strlen(host_prefix);
+        if (aliased && b->root_union) {
+            const char *rel = NULL;
+            int layer = union_layer_of(&b->views[0], host, &rel);
+            if (layer > 0) {
+                size_t ulen = b->views[0].length[0];
+                size_t llen = b->views[0].length[layer];
+                plen = (plen >= ulen) ? (llen + (plen - ulen)) : llen;
+            }
+        }
+        *matched_out = plen;
+    }
+    return 0;
+}
+
+static int observed_guest_path(Bridge *b, const char *host, char *guest)
+{
+    return observed_guest_path_len(b, host, guest, NULL);
 }
 
 /* A host object can have several faithful guest names when a bind's host
@@ -557,13 +601,13 @@ static int preferred_guest_path(Bridge *b, const char *host, char *guest)
     size_t best = 0;
     int found = 0;
     for (size_t id = 0; id <= b->table.count; id++) {
-        size_t length = strlen(id ? b->table.entries[id - 1].host : b->table.root);
-        if (found && length <= best) continue;
         b->anchor = (struct proot_open_origin){id, true};
-        if (observed_guest_path(b, host, b->proc_candidate)) continue;
+        size_t matched = 0;
+        if (observed_guest_path_len(b, host, b->proc_candidate, &matched)) continue;
+        if (found && matched <= best) continue;
         if (path_visibility(b, b->proc_candidate) == FS_HIDDEN) continue;
         strcpy(guest, b->proc_candidate);
-        best = length;
+        best = matched;
         found = 1;
     }
     b->anchor = saved;
