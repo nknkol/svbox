@@ -55,6 +55,7 @@ check: build
 	$(PYTHON) test/vfs/test_go.py
 	$(PYTHON) test/vfs/test_async_io.py
 	$(PYTHON) test/vfs/test_auxv.py
+	$(PYTHON) test/vfs/test_resource_limits.py
 	$(PYTHON) test/vfs/test_jit.py
 	$(PYTHON) test/syscalls/check_dispatch.py
 	$(PYTHON) test/syscalls/newer_paths.py

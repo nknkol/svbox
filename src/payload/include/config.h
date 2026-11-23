@@ -177,11 +177,13 @@ typedef struct payload_config {
     /* Generic container resource governance & signal guard:
      * cpu_mask: allowed host CPU bitmask (0 = unrestricted, up to 64 CPUs).
      * mem_limit_mb: virtual /proc/meminfo MemTotal cap in MiB (0 = unrestricted).
+     * disk_limit_mb: virtual statfs/fstatfs filesystem capacity cap in MiB (0 = unrestricted).
      * nice_val: initial setpriority() nice value (0x7fffffff = unset).
      * sched_policy: initial sched_setscheduler() policy (-1 = unset).
      * trap_sigsys: install zero-stack SIGSYS(SYS_SECCOMP) -> -ENOSYS guard. */
     uint64_t cpu_mask;
     uint32_t mem_limit_mb;
+    uint32_t disk_limit_mb;
     int32_t nice_val;
     int32_t sched_policy;
     int32_t trap_sigsys;

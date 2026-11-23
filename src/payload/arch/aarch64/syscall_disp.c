@@ -80,6 +80,74 @@ long syscall_dispatcher(long sys_no, pt_regs *regs)
             ret = fill;
         }
     }
+    /* Some SELinux-hardened hosts deny getattr/fstat on memfd inodes (-EACCES),
+     * breaking virtual /proc files and guest memfds. Identify genuine memfds via
+     * F_GET_SEALS and synthesize POSIX stat/statx using lseek(SEEK_END) size. */
+    if (ret == -EACCES || (sys_no == __NR_statx && ret == -EFAULT)) {
+        int mfd = -1;
+        int is_stat = 0, is_statx = 0;
+        void *out_buf = NULL;
+        if (sys_no == __NR_fstat && a[1]) {
+            mfd = (int)a[0];
+            is_stat = 1;
+            out_buf = (void *)a[1];
+        } else if (sys_no == __NR_newfstatat && a[1] && !((const char *)a[1])[0] &&
+                   (a[3] & 0x1000 /* AT_EMPTY_PATH */) && a[0] != -100 /* AT_FDCWD */ && a[2]) {
+            mfd = (int)a[0];
+            is_stat = 1;
+            out_buf = (void *)a[2];
+        } else if (sys_no == __NR_statx && a[1] && !((const char *)a[1])[0] &&
+                   (a[2] & 0x1000 /* AT_EMPTY_PATH */) && a[0] != -100 /* AT_FDCWD */ && a[4]) {
+            mfd = (int)a[0];
+            is_statx = 1;
+            out_buf = (void *)a[4];
+        }
+        if (mfd >= 0 && raw_syscall(__NR_fcntl, mfd, 1034 /* F_GET_SEALS */, 0, 0, 0, 0) >= 0) {
+            long cur = raw_syscall(__NR_lseek, mfd, 0, 1 /* SEEK_CUR */, 0, 0, 0);
+            long sz = 0;
+            if (cur >= 0) {
+                long end = raw_syscall(__NR_lseek, mfd, 0, 2 /* SEEK_END */, 0, 0, 0);
+                if (end >= 0) sz = end;
+                raw_syscall(__NR_lseek, mfd, cur, 0 /* SEEK_SET */, 0, 0, 0);
+            }
+            uint64_t ino = 0x4d46440000000000ULL | (uint32_t)mfd;
+            uint64_t usz = sz > 0 ? (uint64_t)sz : 0ULL;
+            uint64_t blocks = (usz + 511ULL) / 512ULL;
+            if (is_stat) {
+                unsigned char *sb = (unsigned char *)out_buf;
+                memset(sb, 0, 128);
+                uint64_t dev = 1;
+                uint32_t mode = 0100644; /* S_IFREG | 0644 */
+                uint32_t nlink = 1;
+                uint32_t blksize = 4096;
+                memcpy(sb + 0, &dev, 8);
+                memcpy(sb + 8, &ino, 8);
+                memcpy(sb + 16, &mode, 4);
+                memcpy(sb + 20, &nlink, 4);
+                memcpy(sb + 48, &usz, 8);
+                memcpy(sb + 56, &blksize, 4);
+                memcpy(sb + 64, &blocks, 8);
+                ret = 0;
+            } else if (is_statx) {
+                unsigned char *sx = (unsigned char *)out_buf;
+                memset(sx, 0, 256);
+                uint32_t mask = 0x07ffu; /* STATX_BASIC_STATS */
+                uint32_t blksize = 4096;
+                uint32_t nlink = 1;
+                uint16_t mode = 0100644;
+                uint32_t dmin = 1;
+                memcpy(sx + 0, &mask, 4);
+                memcpy(sx + 4, &blksize, 4);
+                memcpy(sx + 16, &nlink, 4);
+                memcpy(sx + 28, &mode, 2);
+                memcpy(sx + 32, &ino, 8);
+                memcpy(sx + 40, &usz, 8);
+                memcpy(sx + 48, &blocks, 8);
+                memcpy(sx + 140, &dmin, 4);
+                ret = 0;
+            }
+        }
+    }
     if (!ret) {
         fake_ids_stat_owner(sys_no, a);
         owners_stat(sys_no, a); /* R5: recorded owners and modes */
@@ -95,6 +163,32 @@ long syscall_dispatcher(long sys_no, pt_regs *regs)
             uint32_t *dmin = (uint32_t *)((unsigned char *)a[4] + 140);
             if (*dmaj == 0 && *dmin == 0)
                 *dmin = 1;
+        }
+        /* Virtual filesystem capacity cap (--disk-mb): clamp non-pseudo
+         * statfs/fstatfs reports without over-reporting host free space. */
+        if (g_payload_config.disk_limit_mb > 0 &&
+            (sys_no == __NR_statfs || sys_no == __NR_fstatfs) && a[1]) {
+            unsigned char *sf = (unsigned char *)a[1];
+            uint64_t f_type = 0, f_bsize = 0, f_blocks = 0, f_bfree = 0, f_bavail = 0, f_frsize = 0;
+            memcpy(&f_type, sf + 0, 8);
+            if (f_type != 0x9fa0ULL && f_type != 0x62656572ULL && f_type != 0x1cd1ULL &&
+                f_type != 0x27e0ebULL && f_type != 0x63677270ULL &&
+                f_type != 0x50495045ULL && f_type != 0x534f434bULL) {
+                memcpy(&f_bsize, sf + 8, 8);
+                memcpy(&f_blocks, sf + 16, 8);
+                memcpy(&f_bfree, sf + 24, 8);
+                memcpy(&f_bavail, sf + 32, 8);
+                memcpy(&f_frsize, sf + 72, 8);
+                uint64_t unit = f_frsize ? f_frsize : (f_bsize ? f_bsize : 4096ULL);
+                uint64_t cap_blocks = ((uint64_t)g_payload_config.disk_limit_mb * 1024ULL * 1024ULL) / unit;
+                if (cap_blocks > 0 && f_blocks > cap_blocks) {
+                    uint64_t new_bfree = f_bfree > cap_blocks ? cap_blocks : f_bfree;
+                    uint64_t new_bavail = f_bavail > new_bfree ? new_bfree : f_bavail;
+                    memcpy(sf + 16, &cap_blocks, 8);
+                    memcpy(sf + 24, &new_bfree, 8);
+                    memcpy(sf + 32, &new_bavail, 8);
+                }
+            }
         }
     }
     /* struct utsname: six 65-byte fields; sysname, nodename, release. */

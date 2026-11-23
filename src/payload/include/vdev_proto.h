@@ -100,8 +100,8 @@ struct vdev_ioctl_req {
 #define SV_BC_REGISTER_LOOPER             0x0000630bu
 #define SV_BC_ENTER_LOOPER                0x0000630cu
 #define SV_BC_EXIT_LOOPER                 0x0000630du
-#define SV_BC_REQUEST_DEATH_NOTIFICATION  0x4010630eu
-#define SV_BC_CLEAR_DEATH_NOTIFICATION    0x4010630fu
+#define SV_BC_REQUEST_DEATH_NOTIFICATION  0x400c630eu
+#define SV_BC_CLEAR_DEATH_NOTIFICATION    0x400c630fu
 #define SV_BC_DEAD_BINDER_DONE            0x40086310u
 #define SV_BC_TRANSACTION_SG              0x40486311u
 #define SV_BC_REPLY_SG                    0x40486312u
@@ -195,9 +195,8 @@ struct sv_binder_ptr_cookie {
 
 struct sv_binder_handle_cookie {
     uint32_t handle;
-    uint32_t pad;
     uint64_t cookie;
-};
+} __attribute__((packed));
 
 #define SV_BINDER_BUFFER_FLAG_HAS_PARENT 0x01u
 
