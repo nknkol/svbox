@@ -64,6 +64,8 @@
 #define NL_IFA_LOCAL      2u
 #define NL_IFA_LABEL      3u
 #define NL_IFA_BROADCAST  4u
+#define NL_IFA_CACHEINFO  6u
+#define NL_IFA_FLAGS      8u
 
 #define NL_RTA_DST        1u
 #define NL_RTA_OIF        4u
@@ -502,6 +504,10 @@ static size_t nl_build_addr4_msg(uint8_t *buf, size_t cap, uint16_t msg_type,
         off = nl_put_rta(buf, off, cap, NL_IFA_BROADCAST, &bcast, 4);
     }
     off = nl_put_rta(buf, off, cap, NL_IFA_LABEL, f->name, strlen(f->name) + 1);
+    uint32_t ifa_flags32 = 0x80u; /* IFA_F_PERMANENT */
+    off = nl_put_rta(buf, off, cap, NL_IFA_FLAGS, &ifa_flags32, 4);
+    uint32_t cacheinfo[4] = { 0xffffffffu, 0xffffffffu, 1u, 1u };
+    off = nl_put_rta(buf, off, cap, NL_IFA_CACHEINFO, cacheinfo, sizeof(cacheinfo));
 
     struct nl_hdr nh = { (uint32_t)off, msg_type, flags, seq, pid };
     memcpy(buf, &nh, sizeof(nh));
@@ -525,6 +531,10 @@ static size_t nl_build_addr6_msg(uint8_t *buf, size_t cap, uint16_t msg_type,
     off += sizeof(ia);
 
     off = nl_put_rta(buf, off, cap, NL_IFA_ADDRESS, f->ipv6_addr, 16);
+    uint32_t ifa_flags32 = 0x80u;
+    off = nl_put_rta(buf, off, cap, NL_IFA_FLAGS, &ifa_flags32, 4);
+    uint32_t cacheinfo[4] = { 0xffffffffu, 0xffffffffu, 1u, 1u };
+    off = nl_put_rta(buf, off, cap, NL_IFA_CACHEINFO, cacheinfo, sizeof(cacheinfo));
     struct nl_hdr nh = { (uint32_t)off, msg_type, flags, seq, pid };
     memcpy(buf, &nh, sizeof(nh));
     return NL_ALIGN(off);
@@ -597,6 +607,30 @@ static void nl_broadcast_link(struct net_daemon *d, uint16_t msg_type, const str
     if (!len) return;
     for (int i = 0; i < NET_MAX_NLS; i++) {
         if (d->nls[i].active && (d->nls[i].groups & NL_RTMGRP_LINK) && d->nls[i].fd >= 0)
+            (void)send(d->nls[i].fd, msg, len, MSG_NOSIGNAL | MSG_DONTWAIT);
+    }
+}
+
+static void nl_broadcast_addr4(struct net_daemon *d, uint16_t msg_type, const struct sv_net_iface *f)
+{
+    if (!f || !f->ipv4_addr) return;
+    uint8_t msg[256];
+    size_t len = nl_build_addr4_msg(msg, sizeof(msg), msg_type, 0, 0, 0, f);
+    if (!len) return;
+    for (int i = 0; i < NET_MAX_NLS; i++) {
+        if (d->nls[i].active && (d->nls[i].groups & NL_RTMGRP_IPV4_IFADDR) && d->nls[i].fd >= 0)
+            (void)send(d->nls[i].fd, msg, len, MSG_NOSIGNAL | MSG_DONTWAIT);
+    }
+}
+
+static void nl_broadcast_addr6(struct net_daemon *d, uint16_t msg_type, const struct sv_net_iface *f)
+{
+    if (!f || !f->has_v6) return;
+    uint8_t msg[256];
+    size_t len = nl_build_addr6_msg(msg, sizeof(msg), msg_type, 0, 0, 0, f);
+    if (!len) return;
+    for (int i = 0; i < NET_MAX_NLS; i++) {
+        if (d->nls[i].active && (d->nls[i].groups & NL_RTMGRP_IPV6_IFADDR) && d->nls[i].fd >= 0)
             (void)send(d->nls[i].fd, msg, len, MSG_NOSIGNAL | MSG_DONTWAIT);
     }
 }
@@ -1194,6 +1228,7 @@ static int handle_sioc(struct net_daemon *d, const struct sv_net_sioc_req *sreq,
         if (f->ipv4_prefix > 0 && f->ipv4_prefix < 32)
             route4_add(d, f->ipv4_addr, f->ipv4_prefix, 0, f->ifindex, 0, 254u);
         net_recompute_tun_active(d);
+        nl_broadcast_addr4(d, NL_RTM_NEWADDR, f);
         break;
     }
     case SV_SIOCSIFDSTADDR:
@@ -1536,11 +1571,16 @@ static void handle_ctl_client(struct net_daemon *d, int cfd)
             if (f->ipv4_prefix > 0 && f->ipv4_prefix < 32)
                 route4_add(d, f->ipv4_addr, f->ipv4_prefix, 0, f->ifindex, 0, 254u);
             net_recompute_tun_active(d);
+            nl_broadcast_addr4(d, NL_RTM_NEWADDR, f);
         } else if (r.action == SV_IFCFG_DEL_ADDR4 || r.action == SV_IFCFG_CLEAR_ADDRS) {
+            if (f->ipv4_addr)
+                nl_broadcast_addr4(d, NL_RTM_DELADDR, f);
             if (f->ipv4_addr && f->ipv4_prefix > 0 && f->ipv4_prefix < 32)
                 route4_del(d, f->ipv4_addr, f->ipv4_prefix, f->ifindex);
             f->ipv4_addr = 0; f->ipv4_mask = 0; f->ipv4_prefix = 0;
             if (r.action == SV_IFCFG_CLEAR_ADDRS) {
+                if (f->has_v6)
+                    nl_broadcast_addr6(d, NL_RTM_DELADDR, f);
                 f->has_v6 = 0; memset(f->ipv6_addr, 0, 16); f->ipv6_prefix = 0;
             }
             net_recompute_tun_active(d);
@@ -1548,6 +1588,7 @@ static void handle_ctl_client(struct net_daemon *d, int cfd)
             memcpy(f->ipv6_addr, r.ipv6_addr, 16);
             f->ipv6_prefix = r.prefix <= 128 ? r.prefix : 128;
             f->has_v6 = 1;
+            nl_broadcast_addr6(d, NL_RTM_NEWADDR, f);
             net_recompute_tun_active(d);
         } else if (r.action == SV_IFCFG_DEL_ADDR6) {
             f->has_v6 = 0; memset(f->ipv6_addr, 0, 16); f->ipv6_prefix = 0;

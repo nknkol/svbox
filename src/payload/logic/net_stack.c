@@ -904,8 +904,10 @@ int net_stack_pre_syscall(long number, long a[6], long *out)
 
     /* 3. Virtual Netlink FD operations. */
     if (__atomic_load_n(&g_nl_active_count, __ATOMIC_RELAXED) > 0 &&
-        (number == __NR_bind || number == __NR_getsockname || number == __NR_sendto ||
-         number == __NR_sendmsg || number == __NR_setsockopt ||
+        (number == __NR_bind || number == __NR_connect ||
+         number == __NR_getsockname || number == __NR_getpeername ||
+         number == __NR_sendto || number == __NR_sendmsg ||
+         number == __NR_setsockopt ||
          number == __NR_recvfrom || number == __NR_recvmsg)) {
         ns_lock();
         struct ns_nl_slot *nls = nl_find((int)a[0]);
@@ -932,6 +934,30 @@ int net_stack_pre_syscall(long number, long a[6], long *out)
                 if (groups != 0 || bound_pid != nl_copy.nl_pid)
                     ns_rpc(NET_OP_NL_BIND, nl_copy.nl_id, groups, bound_pid,
                            NULL, 0, NULL, 0, NULL, NULL, NULL);
+                *out = 0;
+                return 1;
+            }
+            if (number == __NR_connect) {
+                if (!a[1] || (unsigned long)a[2] < sizeof(struct ns_sockaddr_nl)) {
+                    *out = -EINVAL;
+                    return 1;
+                }
+                struct ns_sockaddr_nl sa;
+                memcpy(&sa, (const void *)a[1], sizeof(sa));
+                if (sa.nl_family != AF_NETLINK_ && sa.nl_family != 0) {
+                    *out = -EAFNOSUPPORT;
+                    return 1;
+                }
+                *out = 0;
+                return 1;
+            }
+            if (number == __NR_getpeername) {
+                if (!a[1] || !a[2]) { *out = -EFAULT; return 1; }
+                struct ns_sockaddr_nl sa = { AF_NETLINK_, 0, 0, 0 };
+                unsigned cap = *(unsigned *)a[2];
+                unsigned cp = cap < sizeof(sa) ? cap : (unsigned)sizeof(sa);
+                memcpy((void *)a[1], &sa, cp);
+                *(unsigned *)a[2] = sizeof(sa);
                 *out = 0;
                 return 1;
             }

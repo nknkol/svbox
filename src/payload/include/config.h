@@ -189,6 +189,7 @@ typedef struct payload_config {
     int32_t nice_val;
     int32_t sched_policy;
     int32_t trap_sigsys;
+    int32_t emulate_bpf;
     uint64_t guest_auxv_bytes;
     uint64_t guest_auxv[CONFIG_AUXV_PAIRS * 2];
 } payload_config_t;

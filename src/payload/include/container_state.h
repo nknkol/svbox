@@ -170,5 +170,7 @@ void owners_forget(const struct stat *st);
 void owners_copied(const struct stat *from, const struct stat *to);
 /* Reported owner (no record: root for the user's own files). */
 void owners_lookup(const struct stat *st, uint32_t *uid, uint32_t *gid, uint32_t *mode);
+/* POSIX DAC check for faccessat/faccessat2 against virtual owner & mode. */
+long owners_check_access(const struct stat *st, unsigned mode, int use_effective);
 
 #endif

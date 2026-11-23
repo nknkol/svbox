@@ -498,6 +498,14 @@ long pb_dispatch(Bridge *b, long number, long a[6], struct proot_open_origin *or
         if (ret < 0) return ret;
         return raw_syscall(number, a[0], (long)b->host, a[2], 0, 0, 0);
     }
+    if (number == __NR_fchmod || number == __NR_fchown) {
+        /* Linux open(2): fchmod/fchown on an O_PATH fd must fail with -EBADF so
+         * callers (e.g. libc fchmodat(..., AT_SYMLINK_NOFOLLOW)) can fall back
+         * to /proc/self/fd/<fd> consistently across host kernels/LSMs. */
+        long fl = raw_syscall(__NR_fcntl, a[0], F_GETFL, 0, 0, 0, 0);
+        if (fl >= 0 && (fl & O_PATH))
+            return -EBADF;
+    }
     if (b->union_on && (number == __NR_fchmod || (number == __NR_utimensat && !a[1]))) {
         ret = pb_union_fd(b, (int)a[0]);
         if (ret < 0) return ret;
@@ -786,6 +794,16 @@ long pb_dispatch(Bridge *b, long number, long a[6], struct proot_open_origin *or
     }
     if (ret == -ENOENT) {
         long arg2 = a[2];
+        if ((number == __NR_faccessat || number == __NR_faccessat2) &&
+            owners_enabled() && (arg2 & 7L)) {
+            struct stat ast;
+            int follow_acc = (number == __NR_faccessat2) ? !(a[3] & AT_SYMLINK_NOFOLLOW) : 1;
+            long sret = host_stat(b->host, follow_acc, &ast);
+            if (sret < 0)
+                return sret;
+            int use_eff = (number == __NR_faccessat2) && (a[3] & AT_EACCESS);
+            return owners_check_access(&ast, (unsigned)arg2, use_eff);
+        }
         if ((number == __NR_faccessat || number == __NR_faccessat2) &&
             g_payload_config.isolate && b->union_on && b->union_layer > 0 &&
             (arg2 & 2) && b->uv && b->uv->layer[0] && b->uv->layer[0][0]) {

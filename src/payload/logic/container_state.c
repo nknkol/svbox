@@ -901,3 +901,46 @@ void owners_copied(const struct stat *from, const struct stat *to)
     else
         update(to, 0, OWNER_IDS | OWNER_MODE, 0, 0, 0);
 }
+
+long owners_check_access(const struct stat *st, unsigned mode, int use_effective)
+{
+    unsigned req = mode & 7u; /* R_OK=4, W_OK=2, X_OK=1 */
+    if (!req)
+        return 0;
+    struct owner_record rec;
+    int hit = find(st, &rec);
+    int mode_from_db = hit && (rec.flags & OWNER_MODE);
+    uint32_t fuid = (hit && (rec.flags & OWNER_IDS)) ? rec.uid
+                  : (fake_ids_host_owned(st->st_uid, 0) ? 0u : (uint32_t)st->st_uid);
+    uint32_t fgid = (hit && (rec.flags & OWNER_IDS)) ? rec.gid
+                  : (fake_ids_host_owned(st->st_gid, 1) ? 0u : (uint32_t)st->st_gid);
+    uint32_t fmode = mode_from_db ? rec.mode : (uint32_t)(st->st_mode & 07777u);
+
+    uint32_t ids[8];
+    fake_ids_current(ids);
+    uint32_t cuid = use_effective ? ids[1] : ids[0];
+    uint32_t cgid = use_effective ? ids[5] : ids[4];
+
+    if (cuid == 0 || fake_ids_capable(1 /* CAP_DAC_OVERRIDE */)) {
+        /* Linux: root/CAP_DAC_OVERRIDE bypasses R_OK/W_OK; X_OK on a regular
+         * file still requires at least one execute bit. */
+        if ((req & 1u) && (st->st_mode & S_IFMT_) != S_IFDIR_ && !(fmode & 0111u))
+            return -EACCES;
+        return 0;
+    }
+
+    unsigned perm;
+    if (cuid == fuid) {
+        perm = (fmode >> 6) & 7u;
+    } else if (cgid == fgid || in_groups(fgid)) {
+        perm = (fmode >> 3) & 7u;
+    } else {
+        perm = fmode & 7u;
+        /* Unrecorded files on host filesystems whose mount masks 'other' bits
+         * (e.g. 0660/0771 shared mounts): preserve read/exec visibility from
+         * the owner bits while still strictly denying unprivileged W_OK. */
+        if (!mode_from_db)
+            perm |= ((fmode >> 6) & 5u);
+    }
+    return ((req & ~perm) == 0) ? 0 : -EACCES;
+}
