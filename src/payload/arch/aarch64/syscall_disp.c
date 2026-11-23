@@ -150,6 +150,8 @@ long syscall_dispatcher(long sys_no, pt_regs *regs)
     }
     if (!ret) {
         fake_ids_stat_owner(sys_no, a);
+        if (sys_no == __NR_getsockopt)
+            fake_ids_peercred(a);
         owners_stat(sys_no, a); /* R5: recorded owners and modes */
         union_lazy_stat(sys_no, a); /* R6: layer image placeholders */
         /* HarmonyOS hmdfs reports st_dev == 0, breaking POSIX (st_dev, st_ino)

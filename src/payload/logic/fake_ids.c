@@ -461,3 +461,42 @@ void fake_ids_stat_owner(long sys_no, const long *a)
     if (gid_hit) owner[1] = own_files_owner(1);
 }
 
+void fake_ids_peercred(const long *a)
+{
+    /* Linux AArch64: SOL_SOCKET = 1, SO_PEERCRED = 17, struct ucred { int32 pid; uint32 uid, gid; }. */
+    if (a[1] != 1 || a[2] != 17 || !a[3] || !a[4]) return;
+    if (*(const uint32_t *)a[4] < 12u) return;
+    struct {
+        int32_t pid;
+        uint32_t uid;
+        uint32_t gid;
+    } *cred = (void *)a[3];
+    if (cred->pid > 0 && g_payload_config.mount_scratch[0]) {
+        const char *base = g_payload_config.mount_scratch;
+        char path[CONFIG_MAX_PATH + 32];
+        size_t n = 0;
+        while (base[n] && n < CONFIG_MAX_PATH - 1) { path[n] = base[n]; n++; }
+        const char *sub = "/.pid_ids/";
+        for (size_t i = 0; sub[i]; i++) path[n++] = sub[i];
+        char digits[24];
+        int d = 0;
+        unsigned long v = (unsigned long)cred->pid;
+        do { digits[d++] = (char)('0' + (v % 10)); v /= 10; } while (v);
+        while (d > 0) path[n++] = digits[--d];
+        path[n] = '\0';
+        long fd = raw_syscall(__NR_openat, AT_FDCWD, (long)path, O_RDONLY | O_CLOEXEC, 0, 0, 0);
+        if (fd >= 0) {
+            uint32_t peer_ids[8];
+            long r = raw_syscall(__NR_read, fd, (long)peer_ids, sizeof(peer_ids), 0, 0, 0);
+            raw_syscall(__NR_close, fd, 0, 0, 0, 0, 0);
+            if (r == (long)sizeof(peer_ids)) {
+                cred->uid = peer_ids[1];
+                cred->gid = peer_ids[5];
+                return;
+            }
+        }
+    }
+    if (fake_ids_host_owned(cred->uid, 0)) cred->uid = g_payload_config.fake_ids[1];
+    if (fake_ids_host_owned(cred->gid, 1)) cred->gid = g_payload_config.fake_ids[5];
+}
+

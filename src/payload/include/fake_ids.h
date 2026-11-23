@@ -17,6 +17,9 @@ uint32_t fake_ids_reported_owner(uint32_t id, int group);
 /* stat/fstat/newfstatat/statx result: the caller's own files (its real ids
  * and the owners of the root and bind directories) show the fake owner. */
 void fake_ids_stat_owner(long number, const long *args);
+/* getsockopt(SOL_SOCKET, SO_PEERCRED) result: remap peer host uid/gid to the
+ * peer's container fake euid/egid (via mount_scratch/.pid_ids/<pid> or default). */
+void fake_ids_peercred(const long *args);
 /* Whether a host uid (group 0) or gid is one of the user's own. */
 int fake_ids_host_owned(uint32_t id, int group);
 /* Effective and file-system ids (group 0: uid, 1: gid). */

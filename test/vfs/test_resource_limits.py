@@ -18,6 +18,7 @@ PROBE_C = r"""
 #include <linux/stat.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/syscall.h>
@@ -95,6 +96,25 @@ int main(void) {
         return 14;
     }
 
+    /* 5. getsockopt(SOL_SOCKET, SO_PEERCRED) remaps host UID/GID to container fake UID/GID */
+    int sp[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sp) != 0) {
+        fprintf(stderr, "socketpair: %d\n", errno);
+        return 15;
+    }
+    struct ucred uc = { -1, 999999u, 999999u };
+    socklen_t uclen = sizeof(uc);
+    if (getsockopt(sp[0], SOL_SOCKET, SO_PEERCRED, &uc, &uclen) != 0) {
+        fprintf(stderr, "SO_PEERCRED: %d\n", errno);
+        close(sp[0]); close(sp[1]);
+        return 16;
+    }
+    close(sp[0]); close(sp[1]);
+    if (uc.uid != 0 || uc.gid != 0) {
+        fprintf(stderr, "SO_PEERCRED mismatch: pid=%d uid=%u gid=%u (expected 0:0)\n", uc.pid, uc.uid, uc.gid);
+        return 17;
+    }
+
     printf("RESOURCE_LIMITS_OK\n");
     return 0;
 }
@@ -116,6 +136,7 @@ with tempfile.TemporaryDirectory(prefix='reslim-', dir=build) as temp:
         str(loader),
         '--root', str(upper),
         '--lower', str(lower),
+        '-u', '0:0',
         '--mem-mb', '2048',
         '--disk-mb', '4096',
         '-v', '/proc:/proc',
