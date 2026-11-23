@@ -1246,6 +1246,17 @@ static int handle_sioc(struct net_daemon *d, const struct sv_net_sioc_req *sreq,
         memcpy(ifr + 16, &idx, 4);
         break;
     }
+    case SV_SIOCGIFTXQLEN: {
+        int32_t qlen = 1000;
+        memcpy(ifr + 16, &qlen, 4);
+        break;
+    }
+    case SV_SIOCSIFTXQLEN: {
+        int32_t qlen = 0;
+        memcpy(&qlen, ifr + 16, 4);
+        if (qlen < 0) return -EINVAL;
+        break;
+    }
     default:
         return -ENOTTY;
     }

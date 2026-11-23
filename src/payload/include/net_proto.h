@@ -80,6 +80,8 @@ enum sv_net_op {
 #define SV_SIOCSIFMTU        0x8922u
 #define SV_SIOCGIFHWADDR     0x8927u
 #define SV_SIOCGIFINDEX      0x8933u
+#define SV_SIOCGIFTXQLEN     0x8942u
+#define SV_SIOCSIFTXQLEN     0x8943u
 
 struct sv_net_iface {
     uint32_t active;

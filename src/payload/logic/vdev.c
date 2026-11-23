@@ -452,7 +452,10 @@ static void fill_chr_stat(struct stat *st, uint32_t major, uint32_t minor)
     memset(st, 0, sizeof(*st));
     st->st_mode = 0020666; /* S_IFCHR | 0666 */
     st->st_nlink = 1;
-    st->st_rdev = ((uint64_t)major << 8) | minor;
+    st->st_rdev = ((uint64_t)(minor & 0xffu)) |
+                  ((uint64_t)(major & 0xfffu) << 8) |
+                  ((uint64_t)(minor & ~0xffu) << 12) |
+                  ((uint64_t)(major & ~0xfffu) << 32);
     st->st_blksize = 4096;
 }
 
@@ -462,7 +465,7 @@ long vdev_path_call(long number, long a[6], int vdev_idx)
         return -ENOENT;
     const struct vdev_entry *ve = &g_payload_config.vdevs[vdev_idx];
     uint32_t major = 10;
-    uint32_t minor = (ve->type == VDEV_TYPE_TUN) ? 200u : (250u + (uint32_t)vdev_idx);
+    uint32_t minor = (ve->type == VDEV_TYPE_TUN) ? 200u : (220u + (uint32_t)vdev_idx);
 
     switch (number) {
     case __NR_openat: {
@@ -869,44 +872,200 @@ static long binder_ioctl(struct vdev_open_slot *slot, unsigned long cmd, unsigne
     return -ENOTTY;
 }
 
-static long generic_chr_ioctl(struct vdev_open_slot *slot, unsigned long cmd, unsigned long arg)
+#define SV_FIONREAD                0x541bu
+#define SV_FIONBIO                 0x5421u
+#define SV_TCGETS                  0x5401u
+#define SV_TCSETS                  0x5402u
+#define SV_TCSETSW                 0x5403u
+#define SV_TCSETSF                 0x5404u
+#define SV_TIOCGWINSZ              0x5413u
+#define SV_TIOCSWINSZ              0x5414u
+#define SV_TIOCMGET                0x5415u
+#define SV_TIOCMBIS                0x5416u
+#define SV_TIOCMBIC                0x5417u
+#define SV_TIOCMSET                0x5418u
+#define SV_USBDEVFS_CONTROL        0xc0185500u
+#define SV_USBDEVFS_BULK           0xc0185502u
+#define SV_USBDEVFS_SETINTERFACE   0x80085504u
+#define SV_USBDEVFS_SETCONFIG      0x80045505u
+#define SV_USBDEVFS_GETDRIVER      0x41045508u
+#define SV_USBDEVFS_CLAIMIFACE     0x8004550fu
+#define SV_USBDEVFS_RELEASEIFACE   0x80045510u
+#define SV_USBDEVFS_CONNECTINFO    0x40085511u
+#define SV_USBDEVFS_CLEAR_HALT     0x80045515u
+
+struct sv_usbdevfs_ctrl {
+    uint8_t  bRequestType;
+    uint8_t  bRequest;
+    uint16_t wValue;
+    uint16_t wIndex;
+    uint16_t wLength;
+    uint32_t timeout;
+    uint32_t _pad;
+    uint64_t data;
+};
+
+struct sv_usbdevfs_bulk {
+    uint32_t ep;
+    uint32_t len;
+    uint32_t timeout;
+    uint32_t _pad;
+    uint64_t data;
+};
+
+static int generic_chr_ioctl(struct vdev_open_slot *slot, unsigned long cmd, unsigned long arg, long *out)
 {
-    uint32_t dir = (uint32_t)((cmd >> 30) & 3u);
-    uint32_t sz = (uint32_t)((cmd >> 16) & 0x3fffu);
-    if (sz > 4096)
-        return -EINVAL;
+    uint32_t c32 = (uint32_t)cmd;
+    if (c32 == SV_FIONBIO || c32 == SV_FIONREAD)
+        return 0; /* Let kernel run FIONBIO/FIONREAD directly on the stream socket FD. */
+
     int rpc_fd = get_thread_rpc_fd(slot);
-    if (rpc_fd < 0)
-        return rpc_fd;
+    if (rpc_fd < 0) {
+        *out = rpc_fd;
+        return 1;
+    }
+
+    /* Special-case Linux usbfs transfers carrying an embedded userspace data pointer. */
+    if (c32 == SV_USBDEVFS_CONTROL || c32 == SV_USBDEVFS_BULK) {
+        if (!arg) {
+            *out = -EFAULT;
+            return 1;
+        }
+        uint64_t data_ptr = 0;
+        uint32_t xfer_len = 0;
+        int is_in = 0;
+        uint8_t xhdr[24];
+        memcpy(xhdr, (const void *)arg, 24);
+        if (c32 == SV_USBDEVFS_CONTROL) {
+            struct sv_usbdevfs_ctrl ct;
+            memcpy(&ct, xhdr, sizeof(ct));
+            is_in = (ct.bRequestType & 0x80u) != 0;
+            xfer_len = ct.wLength;
+            data_ptr = ct.data;
+        } else {
+            struct sv_usbdevfs_bulk bt;
+            memcpy(&bt, xhdr, sizeof(bt));
+            is_in = (bt.ep & 0x80u) != 0;
+            xfer_len = bt.len;
+            data_ptr = bt.data;
+        }
+        if (xfer_len > 4096u) {
+            *out = -EINVAL;
+            return 1;
+        }
+        if (xfer_len > 0 && !data_ptr) {
+            *out = -EFAULT;
+            return 1;
+        }
+        uint8_t buf[sizeof(struct vdev_ioctl_req) + 24 + 4096];
+        struct vdev_ioctl_req *req = (struct vdev_ioctl_req *)buf;
+        req->cmd = c32;
+        req->arg = arg;
+        req->in_len = 24u + (is_in ? 0u : xfer_len);
+        req->out_len = is_in ? xfer_len : 0u;
+        memcpy(buf + sizeof(*req), xhdr, 24);
+        if (!is_in && xfer_len > 0)
+            memcpy(buf + sizeof(*req) + 24, (const void *)(uintptr_t)data_ptr, xfer_len);
+        long rc = send_msg(rpc_fd, VDEV_OP_IOCTL, slot->proc_id, 0, 0,
+                           buf, (uint32_t)(sizeof(*req) + req->in_len), NULL, 0);
+        struct vdev_hdr rep;
+        if (rc == 0)
+            rc = recv_msg(rpc_fd, &rep, buf, sizeof(buf), NULL, 0, NULL);
+        if (rc < 0) {
+            *out = rc;
+            return 1;
+        }
+        if (rep.status < 0) {
+            *out = rep.status;
+            return 1;
+        }
+        if (is_in && xfer_len > 0 && rep.payload_len > 0) {
+            uint32_t copy_n = rep.payload_len < xfer_len ? rep.payload_len : xfer_len;
+            memcpy((void *)(uintptr_t)data_ptr, buf, copy_n);
+        }
+        *out = rep.status;
+        return 1;
+    }
+
+    uint32_t dir = (uint32_t)((c32 >> 30) & 3u);
+    uint32_t sz = (uint32_t)((c32 >> 16) & 0x3fffu);
+    uint32_t in_len = (dir & 1u) ? sz : 0u;
+    uint32_t out_len = (dir & 2u) ? sz : 0u;
+
+    /* Legacy Linux tty/termios and reversed-direction usbfs ioctl sizing. */
+    switch (c32) {
+    case SV_TCGETS:
+        in_len = 0; out_len = 36; break;
+    case SV_TCSETS:
+    case SV_TCSETSW:
+    case SV_TCSETSF:
+        in_len = 36; out_len = 0; break;
+    case SV_TIOCGWINSZ:
+        in_len = 0; out_len = 8; break;
+    case SV_TIOCSWINSZ:
+        in_len = 8; out_len = 0; break;
+    case SV_TIOCMGET:
+        in_len = 0; out_len = 4; break;
+    case SV_TIOCMBIS:
+    case SV_TIOCMBIC:
+    case SV_TIOCMSET:
+        in_len = 4; out_len = 0; break;
+    case SV_USBDEVFS_CLAIMIFACE:
+    case SV_USBDEVFS_RELEASEIFACE:
+    case SV_USBDEVFS_SETCONFIG:
+    case SV_USBDEVFS_CLEAR_HALT:
+        in_len = 4; out_len = 0; break;
+    case SV_USBDEVFS_SETINTERFACE:
+        in_len = 8; out_len = 0; break;
+    case SV_USBDEVFS_GETDRIVER:
+        in_len = 260; out_len = 260; break;
+    case SV_USBDEVFS_CONNECTINFO:
+        in_len = 0; out_len = 8; break;
+    default:
+        break;
+    }
+
+    if (in_len > 4096u || out_len > 4096u) {
+        *out = -EINVAL;
+        return 1;
+    }
 
     uint8_t buf[sizeof(struct vdev_ioctl_req) + 4096];
     struct vdev_ioctl_req *req = (struct vdev_ioctl_req *)buf;
-    req->cmd = (uint32_t)cmd;
+    req->cmd = c32;
     req->arg = arg;
-    req->in_len = (dir & 1u) ? sz : 0;
-    req->out_len = (dir & 2u) ? sz : 0;
+    req->in_len = in_len;
+    req->out_len = out_len;
     if (req->in_len > 0) {
-        if (!arg)
-            return -EFAULT;
+        if (!arg) {
+            *out = -EFAULT;
+            return 1;
+        }
         memcpy(buf + sizeof(*req), (const void *)arg, req->in_len);
     }
-    uint32_t out_len = req->out_len;
     long rc = send_msg(rpc_fd, VDEV_OP_IOCTL, slot->proc_id, 0, 0,
                        buf, (uint32_t)(sizeof(*req) + req->in_len), NULL, 0);
     struct vdev_hdr rep;
     if (rc == 0)
         rc = recv_msg(rpc_fd, &rep, buf, sizeof(buf), NULL, 0, NULL);
-    if (rc < 0)
-        return rc;
-    if (rep.status < 0)
-        return rep.status;
+    if (rc < 0) {
+        *out = rc;
+        return 1;
+    }
+    if (rep.status < 0) {
+        *out = rep.status;
+        return 1;
+    }
     if (out_len > 0 && rep.payload_len > 0) {
-        if (!arg)
-            return -EFAULT;
+        if (!arg) {
+            *out = -EFAULT;
+            return 1;
+        }
         uint32_t copy_n = rep.payload_len < out_len ? rep.payload_len : out_len;
         memcpy((void *)arg, buf, copy_n);
     }
-    return rep.status;
+    *out = rep.status;
+    return 1;
 }
 
 static int tun_ioctl(struct vdev_open_slot *slot, unsigned long cmd, unsigned long arg, long *out)
@@ -1004,10 +1163,11 @@ int vdev_fd_call(long number, long a[6], long *out)
         const struct vdev_entry *ve = &g_payload_config.vdevs[slot->vdev_idx];
         if (ve->type == VDEV_TYPE_TUN)
             return tun_ioctl(slot, (unsigned long)a[1], (unsigned long)a[2], out);
-        *out = (ve->type == VDEV_TYPE_BINDER)
-            ? binder_ioctl(slot, (unsigned long)a[1], (unsigned long)a[2])
-            : generic_chr_ioctl(slot, (unsigned long)a[1], (unsigned long)a[2]);
-        return 1;
+        if (ve->type == VDEV_TYPE_BINDER) {
+            *out = binder_ioctl(slot, (unsigned long)a[1], (unsigned long)a[2]);
+            return 1;
+        }
+        return generic_chr_ioctl(slot, (unsigned long)a[1], (unsigned long)a[2], out);
     }
 
     if (number == __NR_mmap) {

@@ -762,7 +762,8 @@ static int handle_sioc_ioctl(unsigned long cmd, unsigned long arg, long *out)
                  c32 == SV_SIOCGIFDSTADDR || c32 == SV_SIOCSIFDSTADDR ||
                  c32 == SV_SIOCGIFBRDADDR || c32 == SV_SIOCGIFNETMASK || c32 == SV_SIOCSIFNETMASK ||
                  c32 == SV_SIOCGIFMTU || c32 == SV_SIOCSIFMTU ||
-                 c32 == SV_SIOCGIFHWADDR || c32 == SV_SIOCGIFINDEX);
+                 c32 == SV_SIOCGIFHWADDR || c32 == SV_SIOCGIFINDEX ||
+                 c32 == SV_SIOCGIFTXQLEN || c32 == SV_SIOCSIFTXQLEN);
     if (!is_rt && !is_if)
         return 0;
     if (!arg) {
