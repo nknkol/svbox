@@ -120,6 +120,7 @@ struct ns_nl_slot {
     int32_t  fd;
     uint32_t nl_id;
     uint32_t nl_groups;
+    uint32_t nl_pid;
 };
 
 struct ns_mark_slot {
@@ -354,7 +355,7 @@ static void nl_clear_fd(int fd)
     ns_unlock();
 }
 
-static void nl_register(int fd, uint32_t nl_id, uint32_t groups)
+static void nl_register(int fd, uint32_t nl_id, uint32_t groups, uint32_t pid)
 {
     ns_lock();
     int free_idx = -1;
@@ -371,6 +372,7 @@ static void nl_register(int fd, uint32_t nl_id, uint32_t groups)
         g_nl_fds[free_idx].fd = fd;
         g_nl_fds[free_idx].nl_id = nl_id;
         g_nl_fds[free_idx].nl_groups = groups;
+        g_nl_fds[free_idx].nl_pid = pid;
     }
     ns_unlock();
 }
@@ -809,7 +811,8 @@ int net_stack_pre_syscall(long number, long a[6], long *out)
     if (number == __NR_socket && a[0] == AF_NETLINK_ && a[2] == NETLINK_ROUTE_) {
         struct vdev_hdr rep;
         int nfd = -1;
-        long rc = ns_rpc(NET_OP_OPEN_NETLINK, 0, (uint64_t)raw_syscall(__NR_getpid, 0, 0, 0, 0, 0, 0),
+        uint32_t my_pid = (uint32_t)raw_syscall(__NR_getpid, 0, 0, 0, 0, 0, 0);
+        long rc = ns_rpc(NET_OP_OPEN_NETLINK, 0, (uint64_t)my_pid,
                          0, NULL, 0, NULL, 0, NULL, &rep, &nfd);
         if (rc < 0 || nfd < 0) {
             if (nfd >= 0) raw_syscall(__NR_close, nfd, 0, 0, 0, 0, 0);
@@ -822,7 +825,7 @@ int net_stack_pre_syscall(long number, long a[6], long *out)
             if (fl >= 0)
                 raw_syscall(__NR_fcntl, nfd, F_SETFL_, fl | O_NONBLOCK, 0, 0, 0);
         }
-        nl_register(nfd, rep.proc_id, 0);
+        nl_register(nfd, rep.proc_id, 0, my_pid);
         *out = nfd;
         return 1;
     }
@@ -836,7 +839,8 @@ int net_stack_pre_syscall(long number, long a[6], long *out)
 
     /* 3. Virtual Netlink FD operations. */
     if (number == __NR_bind || number == __NR_getsockname || number == __NR_sendto ||
-        number == __NR_sendmsg || number == __NR_setsockopt) {
+        number == __NR_sendmsg || number == __NR_setsockopt ||
+        number == __NR_recvfrom || number == __NR_recvmsg) {
         ns_lock();
         struct ns_nl_slot *nls = nl_find((int)a[0]);
         struct ns_nl_slot nl_copy;
@@ -849,14 +853,19 @@ int net_stack_pre_syscall(long number, long a[6], long *out)
         if (is_nl) {
             if (number == __NR_bind) {
                 uint32_t groups = 0;
+                uint32_t req_pid = 0;
                 if (a[1] && (unsigned long)a[2] >= sizeof(struct ns_sockaddr_nl)) {
                     struct ns_sockaddr_nl sa;
                     memcpy(&sa, (const void *)a[1], sizeof(sa));
                     groups = sa.nl_groups;
+                    req_pid = sa.nl_pid;
                 }
-                nl_register((int)a[0], nl_copy.nl_id, groups);
-                if (groups != 0)
-                    ns_rpc(NET_OP_NL_BIND, nl_copy.nl_id, groups, 0, NULL, 0, NULL, 0, NULL, NULL, NULL);
+                uint32_t bound_pid = req_pid ? req_pid
+                                             : (uint32_t)raw_syscall(__NR_getpid, 0, 0, 0, 0, 0, 0);
+                nl_register((int)a[0], nl_copy.nl_id, groups, bound_pid);
+                if (groups != 0 || bound_pid != nl_copy.nl_pid)
+                    ns_rpc(NET_OP_NL_BIND, nl_copy.nl_id, groups, bound_pid,
+                           NULL, 0, NULL, 0, NULL, NULL, NULL);
                 *out = 0;
                 return 1;
             }
@@ -865,7 +874,8 @@ int net_stack_pre_syscall(long number, long a[6], long *out)
                 struct ns_sockaddr_nl sa;
                 sa.nl_family = AF_NETLINK_;
                 sa.nl_pad = 0;
-                sa.nl_pid = (uint32_t)raw_syscall(__NR_getpid, 0, 0, 0, 0, 0, 0);
+                sa.nl_pid = nl_copy.nl_pid ? nl_copy.nl_pid
+                                           : (uint32_t)raw_syscall(__NR_getpid, 0, 0, 0, 0, 0, 0);
                 sa.nl_groups = nl_copy.nl_groups;
                 unsigned cap = *(unsigned *)a[2];
                 unsigned cp = cap < sizeof(sa) ? cap : (unsigned)sizeof(sa);
@@ -892,6 +902,42 @@ int net_stack_pre_syscall(long number, long a[6], long *out)
                 m.msg_name = NULL;
                 m.msg_namelen = 0;
                 *out = raw_syscall(__NR_sendmsg, a[0], (long)&m, a[2], 0, 0, 0);
+                return 1;
+            }
+            if (number == __NR_recvfrom) {
+                unsigned orig_cap = (a[4] && a[5]) ? *(unsigned *)a[5] : 0u;
+                long r = raw_syscall(__NR_recvfrom, a[0], a[1], a[2], a[3], 0, 0);
+                if (r >= 0 && a[4] && a[5]) {
+                    struct ns_sockaddr_nl nl = { AF_NETLINK_, 0, 0, 0 };
+                    unsigned cp = orig_cap < sizeof(nl) ? orig_cap : (unsigned)sizeof(nl);
+                    if (cp > 0) memcpy((void *)a[4], &nl, cp);
+                    *(unsigned *)a[5] = sizeof(nl);
+                }
+                *out = r;
+                return 1;
+            }
+            if (number == __NR_recvmsg) {
+                if (!a[1]) { *out = -EFAULT; return 1; }
+                struct ns_msghdr *um = (struct ns_msghdr *)a[1];
+                void *orig_name = um->msg_name;
+                uint32_t orig_cap = um->msg_namelen;
+                struct ns_msghdr m = *um;
+                m.msg_name = NULL;
+                m.msg_namelen = 0;
+                long r = raw_syscall(__NR_recvmsg, a[0], (long)&m, a[2], 0, 0, 0);
+                if (r >= 0) {
+                    um->msg_flags = m.msg_flags;
+                    um->msg_controllen = m.msg_controllen;
+                    if (orig_name && orig_cap > 0) {
+                        struct ns_sockaddr_nl nl = { AF_NETLINK_, 0, 0, 0 };
+                        unsigned cp = orig_cap < sizeof(nl) ? orig_cap : (unsigned)sizeof(nl);
+                        memcpy(orig_name, &nl, cp);
+                        um->msg_namelen = sizeof(nl);
+                    } else {
+                        um->msg_namelen = 0;
+                    }
+                }
+                *out = r;
                 return 1;
             }
         }

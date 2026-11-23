@@ -322,7 +322,7 @@ s.close()
 assert len(got) == len(payload), (len(got), len(payload))
 assert hashlib.sha256(got).hexdigest() == want_hash, 'SHA256 mismatch on 256KiB TCP!'
 
-# 2. Dual-stack AF_INET6 ::ffff:192.0.2.42:8080 (exact Android Java/OkHttp/Chromium pattern)
+# 2. Dual-stack AF_INET6 ::ffff:192.0.2.42:8080 (IPv4-mapped IPv6 pattern)
 s6 = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
 s6.settimeout(5)
 s6.connect(('::ffff:192.0.2.42', 8080))
@@ -342,6 +342,20 @@ sp.shutdown(socket.SHUT_WR)
 rp = sp.recv(1024)
 sp.close()
 assert rp == b'HOST_SERVER_ACK:GET /svbox-tun-test', rp
+
+# 3b. iproute2-style Netlink ACK test (req.nlmsg_pid=0, recvmsg must populate kernel sockaddr_nl & match local nl_pid)
+nl = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 0)
+nl.bind((0, 0))
+local_nl_pid, _ = nl.getsockname()
+assert local_nl_pid > 0, local_nl_pid
+# Send RTM_NEWRULE (32) with NLM_F_REQUEST|NLM_F_ACK (5) and req.nlmsg_pid=0
+nl_req = struct.pack('=IHHII', 16, 32, 0x05, 777, 0)
+nl.sendmsg([nl_req], [], 0, (0, 0))
+ack_data, _, _, ack_addr = nl.recvmsg(1024)
+assert ack_addr == (0, 0), f'netlink recvmsg addr={ack_addr}'
+a_len, a_type, a_flags, a_seq, a_pid = struct.unpack('=IHHII', ack_data[:16])
+assert a_type == 2 and a_seq == 777 and a_pid == local_nl_pid, (a_type, a_seq, a_pid, local_nl_pid)
+nl.close()
 
 # 4. Connected UDP over TUN
 uc = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

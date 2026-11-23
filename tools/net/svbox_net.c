@@ -595,7 +595,7 @@ static void nl_broadcast_link(struct net_daemon *d, uint16_t msg_type, const str
     }
 }
 
-static void nl_send_ack(int fd, const struct nl_hdr *req, int err)
+static void nl_send_ack(int fd, const struct nl_hdr *req, uint32_t pid, int err)
 {
     struct {
         struct nl_hdr h;
@@ -605,7 +605,7 @@ static void nl_send_ack(int fd, const struct nl_hdr *req, int err)
     pkt.h.len = sizeof(pkt);
     pkt.h.type = NL_MSG_ERROR;
     pkt.h.seq = req->seq;
-    pkt.h.pid = req->pid;
+    pkt.h.pid = pid;
     pkt.e.error = err;
     pkt.e.msg = *req;
     (void)send(fd, &pkt, sizeof(pkt), MSG_NOSIGNAL | MSG_DONTWAIT);
@@ -672,7 +672,7 @@ static void nl_handle_packet(struct net_daemon *d, struct nl_client *nc,
             } else if (found) {
                 (void)send(nc->fd, out, opos, MSG_NOSIGNAL | MSG_DONTWAIT);
             } else {
-                nl_send_ack(nc->fd, &req, -ENODEV);
+                nl_send_ack(nc->fd, &req, pid, -ENODEV);
             }
         } else if (req.type == NL_RTM_GETADDR) {
             uint8_t out[8192];
@@ -775,7 +775,7 @@ static void nl_handle_packet(struct net_daemon *d, struct nl_client *nc,
                     nl_broadcast_link(d, NL_RTM_NEWLINK, f);
                 }
             }
-            if (req.flags & NL_F_ACK) nl_send_ack(nc->fd, &req, err);
+            if (req.flags & NL_F_ACK) nl_send_ack(nc->fd, &req, pid, err);
         } else if (req.type == NL_RTM_NEWADDR || req.type == NL_RTM_DELADDR) {
             int err = 0;
             if (blen >= sizeof(struct nl_ifaddr)) {
@@ -838,7 +838,7 @@ static void nl_handle_packet(struct net_daemon *d, struct nl_client *nc,
                     }
                 }
             }
-            if (req.flags & NL_F_ACK) nl_send_ack(nc->fd, &req, err);
+            if (req.flags & NL_F_ACK) nl_send_ack(nc->fd, &req, pid, err);
         } else if (req.type == NL_RTM_NEWROUTE || req.type == NL_RTM_DELROUTE) {
             int err = 0;
             if (blen >= sizeof(struct nl_rtmsg)) {
@@ -880,11 +880,11 @@ static void nl_handle_packet(struct net_daemon *d, struct nl_client *nc,
                         err = route6_del(d, dst, rm.dst_len, oif);
                 }
             }
-            if (req.flags & NL_F_ACK) nl_send_ack(nc->fd, &req, err);
+            if (req.flags & NL_F_ACK) nl_send_ack(nc->fd, &req, pid, err);
         } else {
             /* Accept RTM_NEWRULE / RTM_DELRULE and other non-fatal netlink ops cleanly. */
             if (req.flags & NL_F_ACK)
-                nl_send_ack(nc->fd, &req, 0);
+                nl_send_ack(nc->fd, &req, pid, 0);
         }
 
         off += NL_ALIGN(req.len);
@@ -1398,6 +1398,8 @@ static void handle_ctl_client(struct net_daemon *d, int cfd)
         for (int i = 0; i < NET_MAX_NLS; i++) {
             if (d->nls[i].active && d->nls[i].nl_id == hdr.proc_id) {
                 d->nls[i].groups = (uint32_t)hdr.arg0;
+                if (hdr.arg1 != 0)
+                    d->nls[i].pid = (uint32_t)hdr.arg1;
                 break;
             }
         }
