@@ -67,8 +67,9 @@ struct vdev_cmsghdr {
 #define VDEV_CMSG_LEN(n) (VDEV_ALIGN8(sizeof(struct vdev_cmsghdr)) + (n))
 #define VDEV_CMSG_SPACE(n) (VDEV_ALIGN8(sizeof(struct vdev_cmsghdr)) + VDEV_ALIGN8(n))
 
-#define VDEV_MAX_OPEN 16
-#define VDEV_MAX_THREADS 64
+#define VDEV_MAX_OPEN     32
+#define VDEV_INIT_THREADS 256
+#define VDEV_MAX_THREADS  4096
 
 struct vdev_thread_chan {
     int32_t tid;
@@ -89,7 +90,8 @@ struct vdev_open_slot {
     int32_t owner_pid;
     uint64_t map_base;
     uint64_t map_len;
-    struct vdev_thread_chan threads[VDEV_MAX_THREADS];
+    struct vdev_thread_chan *threads;
+    uint32_t threads_cap;
 };
 
 static struct vdev_open_slot g_open_slots[VDEV_MAX_OPEN];
@@ -262,16 +264,85 @@ static struct vdev_open_slot *find_slot_by_fd(int fd)
     return NULL;
 }
 
+static int slot_reclaim_dead_threads_locked(struct vdev_open_slot *slot, int32_t pid)
+{
+    int reclaimed = -1;
+    if (!slot->threads)
+        return -1;
+    for (uint32_t i = 0; i < slot->threads_cap; i++) {
+        if (!slot->threads[i].used) {
+            if (reclaimed < 0)
+                reclaimed = (int)i;
+            continue;
+        }
+        int dead = 0;
+        if (slot->threads[i].pid != pid) {
+            dead = 1;
+        } else {
+            long rc = raw_syscall(__NR_tgkill, pid, slot->threads[i].tid, 0, 0, 0, 0);
+            if (rc == -ESRCH)
+                dead = 1;
+        }
+        if (dead) {
+            if (slot->threads[i].pid == pid && slot->threads[i].rpc_fd >= 0)
+                raw_syscall(__NR_close, slot->threads[i].rpc_fd, 0, 0, 0, 0, 0);
+            slot->threads[i].used = 0;
+            slot->threads[i].rpc_fd = -1;
+            slot->threads[i].tid = 0;
+            slot->threads[i].pid = 0;
+            if (reclaimed < 0)
+                reclaimed = (int)i;
+        }
+    }
+    return reclaimed;
+}
+
+static int slot_alloc_thread_idx_locked(struct vdev_open_slot *slot, int32_t pid)
+{
+    if (slot->threads) {
+        for (uint32_t i = 0; i < slot->threads_cap; i++) {
+            if (!slot->threads[i].used || slot->threads[i].pid != pid)
+                return (int)i;
+        }
+        int reclaimed = slot_reclaim_dead_threads_locked(slot, pid);
+        if (reclaimed >= 0)
+            return reclaimed;
+    }
+    uint32_t old_cap = slot->threads_cap;
+    if (old_cap >= VDEV_MAX_THREADS)
+        return -1;
+    uint32_t new_cap = old_cap ? old_cap * 2u : VDEV_INIT_THREADS;
+    if (new_cap > VDEV_MAX_THREADS)
+        new_cap = VDEV_MAX_THREADS;
+    size_t new_bytes = (size_t)new_cap * sizeof(struct vdev_thread_chan);
+    long addr = raw_syscall(__NR_mmap, 0, (long)new_bytes,
+                            PROT_READ_ | PROT_WRITE_,
+                            MAP_PRIVATE_ | MAP_ANONYMOUS_, -1, 0);
+    if (addr < 0)
+        return -1;
+    struct vdev_thread_chan *ntbl = (struct vdev_thread_chan *)addr;
+    if (slot->threads && old_cap > 0) {
+        size_t old_bytes = (size_t)old_cap * sizeof(struct vdev_thread_chan);
+        memcpy(ntbl, slot->threads, old_bytes);
+        raw_syscall(__NR_munmap, (long)slot->threads, (long)old_bytes, 0, 0, 0, 0);
+    }
+    slot->threads = ntbl;
+    slot->threads_cap = new_cap;
+    return (int)old_cap;
+}
+
 static int get_thread_rpc_fd(struct vdev_open_slot *slot)
 {
     int32_t pid = (int32_t)raw_syscall(__NR_getpid, 0, 0, 0, 0, 0, 0);
     int32_t tid = (int32_t)raw_syscall(__NR_gettid, 0, 0, 0, 0, 0, 0);
     vdev_lock();
-    for (int i = 0; i < VDEV_MAX_THREADS; i++) {
-        if (slot->threads[i].used && slot->threads[i].tid == tid && slot->threads[i].pid == pid) {
-            int rfd = slot->threads[i].rpc_fd;
-            vdev_unlock();
-            return rfd;
+    if (slot->threads) {
+        for (uint32_t i = 0; i < slot->threads_cap; i++) {
+            if (slot->threads[i].used && slot->threads[i].tid == tid && slot->threads[i].pid == pid) {
+                int rfd = slot->threads[i].rpc_fd;
+                vdev_unlock();
+                return rfd;
+            }
         }
     }
     vdev_unlock();
@@ -297,18 +368,41 @@ static int get_thread_rpc_fd(struct vdev_open_slot *slot)
     }
 
     vdev_lock();
-    for (int i = 0; i < VDEV_MAX_THREADS; i++) {
-        if (!slot->threads[i].used || slot->threads[i].pid != pid) {
-            slot->threads[i].used = 1;
-            slot->threads[i].pid = pid;
-            slot->threads[i].tid = tid;
-            slot->threads[i].rpc_fd = (int32_t)rfd;
-            vdev_unlock();
-            return (int)rfd;
+    int idx = slot_alloc_thread_idx_locked(slot, pid);
+    if (idx < 0) {
+        vdev_unlock();
+        raw_syscall(__NR_close, rfd, 0, 0, 0, 0, 0);
+        return -ENOMEM;
+    }
+    slot->threads[idx].used = 1;
+    slot->threads[idx].pid = pid;
+    slot->threads[idx].tid = tid;
+    slot->threads[idx].rpc_fd = (int32_t)rfd;
+    vdev_unlock();
+    return (int)rfd;
+}
+
+static void drop_thread_rpc_fd(struct vdev_open_slot *slot)
+{
+    int32_t pid = (int32_t)raw_syscall(__NR_getpid, 0, 0, 0, 0, 0, 0);
+    int32_t tid = (int32_t)raw_syscall(__NR_gettid, 0, 0, 0, 0, 0, 0);
+    int close_fd = -1;
+    vdev_lock();
+    if (slot->threads) {
+        for (uint32_t i = 0; i < slot->threads_cap; i++) {
+            if (slot->threads[i].used && slot->threads[i].tid == tid && slot->threads[i].pid == pid) {
+                close_fd = slot->threads[i].rpc_fd;
+                slot->threads[i].used = 0;
+                slot->threads[i].rpc_fd = -1;
+                slot->threads[i].tid = 0;
+                slot->threads[i].pid = 0;
+                break;
+            }
         }
     }
     vdev_unlock();
-    return (int)rfd;
+    if (close_fd >= 0)
+        raw_syscall(__NR_close, close_fd, 0, 0, 0, 0, 0);
 }
 
 static void close_slot(struct vdev_open_slot *slot)
@@ -320,12 +414,20 @@ static void close_slot(struct vdev_open_slot *slot)
     }
     int memfd = slot->memfd;
     slot->memfd = -1;
-    for (int i = 0; i < VDEV_MAX_THREADS; i++) {
-        if (slot->threads[i].used && slot->threads[i].rpc_fd >= 0) {
-            raw_syscall(__NR_close, slot->threads[i].rpc_fd, 0, 0, 0, 0, 0);
-            slot->threads[i].used = 0;
-            slot->threads[i].rpc_fd = -1;
+    struct vdev_thread_chan *tbl = slot->threads;
+    uint32_t cap = slot->threads_cap;
+    slot->threads = NULL;
+    slot->threads_cap = 0;
+    if (tbl) {
+        for (uint32_t i = 0; i < cap; i++) {
+            if (tbl[i].used && tbl[i].rpc_fd >= 0) {
+                raw_syscall(__NR_close, tbl[i].rpc_fd, 0, 0, 0, 0, 0);
+                tbl[i].used = 0;
+                tbl[i].rpc_fd = -1;
+            }
         }
+        raw_syscall(__NR_munmap, (long)tbl, (long)((size_t)cap * sizeof(struct vdev_thread_chan)),
+                    0, 0, 0, 0);
     }
     slot->active = 0;
     slot->fd = -1;
@@ -441,6 +543,11 @@ long vdev_path_call(long number, long a[6], int vdev_idx)
             return -EMFILE;
         }
         struct vdev_open_slot *s = &g_open_slots[idx];
+        if (s->active && s->threads && s->threads_cap > 0) {
+            raw_syscall(__NR_munmap, (long)s->threads,
+                        (long)((size_t)s->threads_cap * sizeof(struct vdev_thread_chan)),
+                        0, 0, 0, 0);
+        }
         memset(s, 0, sizeof(*s));
         s->active = 1;
         s->vdev_idx = vdev_idx;
@@ -753,6 +860,8 @@ static long binder_ioctl(struct vdev_open_slot *slot, unsigned long cmd, unsigne
         struct vdev_hdr rep;
         if (rc == 0)
             rc = recv_msg(rpc_fd, &rep, NULL, 0, NULL, 0, NULL);
+        if (c32 == SV_BINDER_THREAD_EXIT)
+            drop_thread_rpc_fd(slot);
         if (rc < 0)
             return rc;
         return rep.status;
@@ -772,7 +881,7 @@ static long generic_chr_ioctl(struct vdev_open_slot *slot, unsigned long cmd, un
 
     uint8_t buf[sizeof(struct vdev_ioctl_req) + 4096];
     struct vdev_ioctl_req *req = (struct vdev_ioctl_req *)buf;
-    req->cmd = cmd;
+    req->cmd = (uint32_t)cmd;
     req->arg = arg;
     req->in_len = (dir & 1u) ? sz : 0;
     req->out_len = (dir & 2u) ? sz : 0;
