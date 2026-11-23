@@ -5,7 +5,7 @@ ARCH_DIR := arch/aarch64
 PATH_SRC := ../path
 
 SRC := $(addprefix logic/, config.c dispatch.c async_io.c integrity.c platform.c libc_shim.c broker_client.c hook_runtime.c fake_ids.c \
-	container_state.c union_view.c lazy_layer.c net_view.c vdev.c \
+	container_state.c union_view.c lazy_layer.c net_view.c net_stack.c vdev.c \
 	clone_notify.c vfs_bridge.c vfs_mounts.c vfs_procfs.c vfs_exec.c vfs_auxv.c \
 	vm_write_guard.c fs_policy.c fd_runtime.c fd_snapshot.c \
 	fd_handoff.c fd_receive.c fd_table.c fd_clone.c fd_registry.c fd_guard.c \

@@ -9,6 +9,7 @@
 #include "container_state.h"
 #include "union_view.h"
 #include "net_view.h"
+#include "net_stack.h"
 #include "fake_ids.h"
 #include "host_syscall.h"
 #include "fd_runtime.h"
@@ -56,6 +57,9 @@ long syscall_dispatcher(long sys_no, pt_regs *regs)
     unsigned capacity = named && a[1] && a[2] ? *(unsigned *)a[2] : 0;
     /* Generic userspace character-device proxies (--vdev GUEST:SOCK[:TYPE]). */
     if (vdev_enabled() && vdev_fd_call(sys_no, a, &ret))
+        return ret;
+    /* Generic userspace virtual network & TUN stack (--net-sock PATH). */
+    if (net_stack_enabled() && net_stack_pre_syscall(sys_no, a, &ret))
         return ret;
     /* R6: loop devices are the payload's (before the guarded ioctl policy). */
     if (sys_no == __NR_ioctl && mounts_enabled() && proot_loop_ioctl(a[0], (unsigned long)a[1], a[2], &ret))
@@ -218,5 +222,7 @@ long syscall_dispatcher(long sys_no, pt_regs *regs)
             if (msg_name && msg_length > 0) net_reverse(msg_name, (unsigned)msg_length);
         }
     }
+    if (ret >= 0 && net_stack_enabled())
+        net_stack_post_syscall(sys_no, a, ret, capacity);
     return ret;
 }

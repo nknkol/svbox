@@ -43,5 +43,13 @@ subprocess.run(['clang', '-O1', '-static-pie', '-fPIE', '-nostdlib', '-ffreestan
                 '-fno-builtin', '-fno-stack-protector', '-I', str(repo / 'src/payload/include'),
                 str(repo / 'tools/agent/exec_helper.c'), '-o', str(helper)], check=True)
 manifest['exec_helper_sha256'] = hashlib.sha256(helper.read_bytes()).hexdigest()
+# Generic userspace virtual network & TUN daemon (tools/net).
+net_daemon = build / 'svbox-net'
+subprocess.run(['clang', '-O2', '-Wall', '-Wextra',
+                '-I', str(repo / 'src/payload/include'),
+                str(repo / 'tools/net/svbox_net.c'),
+                str(repo / 'tools/net/tcp_stack.c'),
+                '-o', str(net_daemon)], check=True)
+manifest['net_daemon_sha256'] = hashlib.sha256(net_daemon.read_bytes()).hexdigest()
 (build / f'{name}.json').write_text(json.dumps(manifest, indent=2))
-print('Built', binary)
+print('Built', binary, 'and', net_daemon)

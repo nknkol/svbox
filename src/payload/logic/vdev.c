@@ -17,6 +17,7 @@
 #include "fake_ids.h"
 #include "vdev.h"
 #include "vdev_proto.h"
+#include "net_proto.h"
 
 extern long raw_syscall(long number, long a1, long a2, long a3, long a4, long a5, long a6);
 
@@ -358,7 +359,8 @@ long vdev_path_call(long number, long a[6], int vdev_idx)
     if (vdev_idx < 0 || vdev_idx >= g_payload_config.vdev_count)
         return -ENOENT;
     const struct vdev_entry *ve = &g_payload_config.vdevs[vdev_idx];
-    uint32_t major = 10, minor = 250u + (uint32_t)vdev_idx;
+    uint32_t major = 10;
+    uint32_t minor = (ve->type == VDEV_TYPE_TUN) ? 200u : (250u + (uint32_t)vdev_idx);
 
     switch (number) {
     case __NR_openat: {
@@ -367,7 +369,7 @@ long vdev_path_call(long number, long a[6], int vdev_idx)
         if (a[2] & O_DIRECTORY)
             return -ENOTDIR;
         int cloexec = (a[2] & O_CLOEXEC) ? 1 : 0;
-        long fd = connect_unix_sock(ve->sock, cloexec);
+        long fd = connect_unix_sock(ve->sock, (ve->type == VDEV_TYPE_TUN) ? 1 : cloexec);
         if (fd < 0)
             return fd;
 
@@ -399,6 +401,29 @@ long vdev_path_call(long number, long a[6], int vdev_idx)
             return rc < 0 ? rc : hdr.status;
         }
 
+        int guest_fd = (int)fd;
+        int memfd = nfds > 0 ? rfds[0] : -1;
+        if (ve->type == VDEV_TYPE_TUN) {
+            /* Daemon sends a kernel AF_UNIX SOCK_SEQPACKET data FD via SCM_RIGHTS
+             * so packet boundaries, epoll, O_NONBLOCK, dup and SCM_RIGHTS passing
+             * work natively; close the ephemeral control socket immediately. */
+            raw_syscall(__NR_close, fd, 0, 0, 0, 0, 0);
+            if (nfds < 1 || rfds[0] < 0) {
+                for (uint32_t i = 0; i < nfds; i++)
+                    raw_syscall(__NR_close, rfds[i], 0, 0, 0, 0, 0);
+                return -EPROTO;
+            }
+            guest_fd = rfds[0];
+            memfd = -1;
+            for (uint32_t i = 1; i < nfds; i++)
+                raw_syscall(__NR_close, rfds[i], 0, 0, 0, 0, 0);
+            if (!cloexec)
+                raw_syscall(__NR_fcntl, guest_fd, F_SETFD, 0, 0, 0, 0);
+        } else {
+            for (uint32_t i = 1; i < nfds; i++)
+                raw_syscall(__NR_close, rfds[i], 0, 0, 0, 0, 0);
+        }
+
         vdev_lock();
         int idx = -1;
         int32_t cur_pid = (int32_t)req.pid;
@@ -410,19 +435,17 @@ long vdev_path_call(long number, long a[6], int vdev_idx)
         }
         if (idx < 0) {
             vdev_unlock();
-            for (uint32_t i = 0; i < nfds; i++)
-                raw_syscall(__NR_close, rfds[i], 0, 0, 0, 0, 0);
-            raw_syscall(__NR_close, fd, 0, 0, 0, 0, 0);
+            if (memfd >= 0)
+                raw_syscall(__NR_close, memfd, 0, 0, 0, 0, 0);
+            raw_syscall(__NR_close, guest_fd, 0, 0, 0, 0, 0);
             return -EMFILE;
         }
         struct vdev_open_slot *s = &g_open_slots[idx];
         memset(s, 0, sizeof(*s));
         s->active = 1;
         s->vdev_idx = vdev_idx;
-        s->fd = (int32_t)fd;
-        s->memfd = nfds > 0 ? rfds[0] : -1;
-        for (uint32_t i = 1; i < nfds; i++)
-            raw_syscall(__NR_close, rfds[i], 0, 0, 0, 0, 0);
+        s->fd = (int32_t)guest_fd;
+        s->memfd = memfd;
         s->proc_id = rep.proc_id;
         s->major = rep.major ? rep.major : major;
         s->minor = rep.minor ? rep.minor : minor;
@@ -430,11 +453,11 @@ long vdev_path_call(long number, long a[6], int vdev_idx)
         s->owner_pid = cur_pid;
         vdev_unlock();
         if (a[2] & O_NONBLOCK) {
-            long fl = raw_syscall(__NR_fcntl, fd, F_GETFL, 0, 0, 0, 0);
+            long fl = raw_syscall(__NR_fcntl, guest_fd, F_GETFL, 0, 0, 0, 0);
             if (fl >= 0)
-                raw_syscall(__NR_fcntl, fd, F_SETFL, fl | O_NONBLOCK, 0, 0, 0);
+                raw_syscall(__NR_fcntl, guest_fd, F_SETFL, fl | O_NONBLOCK, 0, 0, 0);
         }
-        return fd;
+        return guest_fd;
     }
     case __NR_newfstatat: {
         struct stat st;
@@ -777,6 +800,89 @@ static long generic_chr_ioctl(struct vdev_open_slot *slot, unsigned long cmd, un
     return rep.status;
 }
 
+static int tun_ioctl(struct vdev_open_slot *slot, unsigned long cmd, unsigned long arg, long *out)
+{
+    uint32_t c32 = (uint32_t)cmd;
+    uint32_t in_len = 0, out_len = 0;
+    switch (c32) {
+    case SV_TUNSETIFF:
+        in_len = 40; /* sizeof(struct ifreq) on LP64 */
+        out_len = 40;
+        break;
+    case SV_TUNGETIFF:
+        in_len = 0;
+        out_len = 40;
+        break;
+    case SV_TUNSETQUEUE:
+        in_len = 40;
+        out_len = 0;
+        break;
+    case SV_TUNGETFEATURES:
+    case SV_TUNGETVNETHDRSZ:
+        in_len = 0;
+        out_len = 4;
+        break;
+    case SV_TUNSETVNETHDRSZ:
+        in_len = 4;
+        out_len = 0;
+        break;
+    case SV_TUNSETPERSIST:
+    case SV_TUNSETOWNER:
+    case SV_TUNSETGROUP:
+        in_len = 0;
+        out_len = 0;
+        break;
+    default:
+        /* Let kernel ioctls like FIONBIO/FIONREAD run directly on the SOCK_SEQPACKET FD. */
+        return 0;
+    }
+
+    const struct vdev_entry *ve = &g_payload_config.vdevs[slot->vdev_idx];
+    long ctl = connect_unix_sock(ve->sock, 1);
+    if (ctl < 0) {
+        *out = ctl;
+        return 1;
+    }
+    uint8_t buf[sizeof(struct vdev_ioctl_req) + 64];
+    struct vdev_ioctl_req *req = (struct vdev_ioctl_req *)buf;
+    req->cmd = c32;
+    req->arg = arg;
+    req->in_len = in_len;
+    req->out_len = out_len;
+    if (in_len > 0) {
+        if (!arg) {
+            raw_syscall(__NR_close, ctl, 0, 0, 0, 0, 0);
+            *out = -EFAULT;
+            return 1;
+        }
+        memcpy(buf + sizeof(*req), (const void *)arg, in_len);
+    }
+    long rc = send_msg((int)ctl, VDEV_OP_IOCTL, slot->proc_id, 0, 0,
+                       buf, (uint32_t)(sizeof(*req) + in_len), NULL, 0);
+    struct vdev_hdr rep;
+    if (rc == 0)
+        rc = recv_msg((int)ctl, &rep, buf, sizeof(buf), NULL, 0, NULL);
+    raw_syscall(__NR_close, ctl, 0, 0, 0, 0, 0);
+    if (rc < 0) {
+        *out = rc;
+        return 1;
+    }
+    if (rep.status < 0) {
+        *out = rep.status;
+        return 1;
+    }
+    if (out_len > 0 && rep.payload_len > 0) {
+        if (!arg) {
+            *out = -EFAULT;
+            return 1;
+        }
+        uint32_t copy_n = rep.payload_len < out_len ? rep.payload_len : out_len;
+        memcpy((void *)arg, buf, copy_n);
+    }
+    *out = rep.status;
+    return 1;
+}
+
 int vdev_fd_call(long number, long a[6], long *out)
 {
     if (!vdev_enabled())
@@ -787,6 +893,8 @@ int vdev_fd_call(long number, long a[6], long *out)
         if (!slot)
             return 0;
         const struct vdev_entry *ve = &g_payload_config.vdevs[slot->vdev_idx];
+        if (ve->type == VDEV_TYPE_TUN)
+            return tun_ioctl(slot, (unsigned long)a[1], (unsigned long)a[2], out);
         *out = (ve->type == VDEV_TYPE_BINDER)
             ? binder_ioctl(slot, (unsigned long)a[1], (unsigned long)a[2])
             : generic_chr_ioctl(slot, (unsigned long)a[1], (unsigned long)a[2]);

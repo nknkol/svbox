@@ -3,6 +3,7 @@
  * per-call bridge (vfs_bridge_internal.h lists the other parts). */
 #include "vfs_bridge_internal.h"
 #include "vdev.h"
+#include "net_stack.h"
 
 /* The view holding a host path (union_find), NULL if none. */
 static const struct union_view *bridge_view(Bridge *b, const char *host, int *layer, const char **rel)
@@ -1718,6 +1719,18 @@ static long dispatch(Bridge *b, long number, long a[6], struct proot_open_origin
     if (mounts_enabled() && path[0] == '/' && pb_loop_device(path) != -1) {
         b->defer_final = false;
         return pb_loop_path_call(number, a, pb_loop_device(path));
+    }
+    /* Virtual /proc/net and /sys/class/net views (--net-sock PATH): serve
+     * directly before host resolution so sandboxed hosts that deny /proc/net
+     * or /sys/class/net still present the container's virtual interfaces. */
+    if (net_stack_enabled() && path[0] == '/' &&
+        (number == __NR_openat || number == __NR_newfstatat || number == __NR_statx ||
+         number == __NR_faccessat || number == __NR_faccessat2)) {
+        long nrc = net_stack_proc_call(number, a, path);
+        if (nrc != -ENOENT) {
+            b->defer_final = false;
+            return nrc;
+        }
     }
     /* Virtual /proc & /sys resource views (--cpuset / --mem-mb): serve directly
      * before host resolution so sandboxed hosts that hide /sys still report the

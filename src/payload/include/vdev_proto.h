@@ -16,6 +16,7 @@
 /* Device classes (matches config.h VDEV_TYPE_*). */
 #define VDEV_TYPE_CHR      0
 #define VDEV_TYPE_BINDER   1
+#define VDEV_TYPE_TUN      2
 
 /* Wire message opcodes. */
 enum vdev_op {

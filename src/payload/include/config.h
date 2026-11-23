@@ -166,6 +166,8 @@ typedef struct payload_config {
      * order; 0: sockets as they are) and its peers file. */
     uint32_t net_addr;
     char net_peers[CONFIG_MAX_PATH];
+    /* Generic userspace virtual network daemon socket (--net-sock PATH). */
+    char net_sock[CONFIG_MAX_PATH];
     /* --pass-fd (guarded build). */
     int32_t passed_count;
     struct passed_fd passed[CONFIG_MAX_PASSED_FDS];

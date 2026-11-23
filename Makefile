@@ -49,6 +49,7 @@ check: build
 	$(PYTHON) test/vfs/test_union.py
 	$(PYTHON) test/vfs/test_loop.py
 	$(PYTHON) test/vfs/test_net.py
+	$(PYTHON) test/vfs/test_tun_netstack.py
 	$(PYTHON) test/vfs/test_caps.py
 	$(PYTHON) test/vfs/test_go_abi.py
 	$(PYTHON) test/vfs/test_many_blocked.py

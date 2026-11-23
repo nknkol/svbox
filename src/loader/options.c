@@ -267,6 +267,7 @@ static void read_handoff(int fd, payload_config_t *cfg, struct loader_options *o
 	    !has_nul(hc->mount_access_observe, sizeof(hc->mount_access_observe)) ||
 	    !has_nul(hc->mount_scratch, sizeof(hc->mount_scratch)) ||
 	    !has_nul(hc->net_peers, sizeof(hc->net_peers)) ||
+	    !has_nul(hc->net_sock, sizeof(hc->net_sock)) ||
 	    !has_nul(g_handoff.exec_target, sizeof(g_handoff.exec_target)) ||
 	    !has_nul(g_handoff.exec_path, sizeof(g_handoff.exec_path)) ||
 	    !has_nul(g_handoff.exec_exe, sizeof(g_handoff.exec_exe)) ||
@@ -341,7 +342,7 @@ void options_print_help(int fd)
 		"  --mount-table PATH             Join/share an emulated mount table file\n"
 		"  --mount-scratch DIR            Host directory backing emulated tmpfs mounts\n"
 		"  --owner-db PATH                Virtual uid/gid/mode ownership database\n"
-		"  --vdev GUEST:SOCK[:TYPE]       Userspace virtual char device proxy (TYPE: chr|binder)\n"
+		"  --vdev GUEST:SOCK[:TYPE]       Userspace virtual char device proxy (TYPE: chr|binder|tun)\n"
 		"\n"
 		"Security & Policy:\n"
 		"  --guard LEVEL                  Guard level: none (default), track, observe, paths, files, access\n"
@@ -375,6 +376,7 @@ void options_print_help(int fd)
 		"  --kernel-sysname NAME          Override uname sysname\n"
 		"  --net-addr IP                  Virtual container IPv4 address (127.128.0.0/9)\n"
 		"  --net-peers FILE               Peer container mapping file\n"
+		"  --net-sock PATH                Userspace virtual network & TUN daemon socket\n"
 		"\n"
 		"Advanced:\n"
 		"  --payload FILE                 Load an external payload binary instead of the embedded one\n"
@@ -572,8 +574,10 @@ void options_parse(int argc, char **argv, payload_config_t *cfg, struct loader_o
 					vtype = VDEV_TYPE_CHR;
 				else if (is(c2 + 1, "binder"))
 					vtype = VDEV_TYPE_BINDER;
+				else if (is(c2 + 1, "tun"))
+					vtype = VDEV_TYPE_TUN;
 				else
-					z_errx(1, "invalid --vdev type %s (expect chr|binder)", c2 + 1);
+					z_errx(1, "invalid --vdev type %s (expect chr|binder|tun)", c2 + 1);
 			}
 			if (cfg->vdev_count >= CONFIG_MAX_VDEVS)
 				z_errx(1, "too many --vdev entries");
@@ -666,6 +670,11 @@ void options_parse(int argc, char **argv, payload_config_t *cfg, struct loader_o
 			if (v[0] != '/' || z_strlen(v) >= CONFIG_MAX_PATH)
 				z_errx(1, "--net-peers needs an absolute host file");
 			copy_cstr(cfg->net_peers, CONFIG_MAX_PATH, v);
+		} else if (is(arg, "--net-sock")) {
+			const char *v = value(argc, argv, &i);
+			if (v[0] != '/' || z_strlen(v) >= CONFIG_MAX_PATH)
+				z_errx(1, "--net-sock needs an absolute host socket path");
+			copy_cstr(cfg->net_sock, CONFIG_MAX_PATH, v);
 		} else if (is(arg, "--log-level")) {
 			cfg->log_level = (int32_t)number(value(argc, argv, &i), LOG_LEVEL_DEBUG, "log level");
 		} else if (is(arg, "--payload")) {

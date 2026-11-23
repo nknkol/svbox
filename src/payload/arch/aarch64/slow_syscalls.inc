@@ -359,12 +359,18 @@ SLOW_SYSCALL(__NR_getsockname)
 #ifdef __NR_getpeername
 SLOW_SYSCALL(__NR_getpeername)
 #endif
+#ifdef __NR_setsockopt
+SLOW_SYSCALL(__NR_setsockopt)
+#endif
 #ifdef __NR_getsockopt
 SLOW_SYSCALL(__NR_getsockopt)
 #endif
 #ifdef __NR_sendto
 /* Pathname AF_UNIX destinations need guest translation. */
 SLOW_SYSCALL(__NR_sendto)
+#endif
+#ifdef __NR_recvfrom
+SLOW_SYSCALL(__NR_recvfrom)
 #endif
 #ifdef __NR_sendmsg
 SLOW_SYSCALL(__NR_sendmsg)
