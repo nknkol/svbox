@@ -53,6 +53,39 @@ static long read_region(int fd, unsigned char *dst, unsigned long len, long off)
     return 0;
 }
 
+static int guest_path_has_prefix(const char *path, const char *prefix)
+{
+    size_t n = 0;
+    while (prefix[n]) {
+        if (path[n] != prefix[n])
+            return 0;
+        n++;
+    }
+    if (n == 1 && prefix[0] == '/')
+        return path[0] == '/';
+    return path[n] == '\0' || path[n] == '/';
+}
+
+static int should_skip_inline_patch_fd(int fd)
+{
+    if (!g_payload_config.seccomp_backstop)
+        return 0;
+    if (g_payload_config.no_inline_patch_all)
+        return 1;
+    uint32_t cnt = g_payload_config.no_inline_patch_count;
+    if (!cnt || fd < 0)
+        return 0;
+    if (cnt > 8) cnt = 8;
+    char gpath[CONFIG_MAX_PATH];
+    if (proot_fd_guest_path(fd, gpath, sizeof(gpath)) < 0)
+        return 0;
+    for (uint32_t i = 0; i < cnt; i++) {
+        if (guest_path_has_prefix(gpath, g_payload_config.no_inline_patch_prefixes[i]))
+            return 1;
+    }
+    return 0;
+}
+
 /* An executable file mapping becomes an anonymous copy (code signing
  * refuses executable file pages on HarmonyOS), patched while writable and
  * made executable once. Fail closed: no unhooked syscall is left runnable. */
@@ -65,8 +98,10 @@ static long map_exec_copy(const long a[6])
     if (mapped < 0)
         return mapped;
     long rc = read_region(fd, (unsigned char *)mapped, len, a[5]);
-    if (rc >= 0 && install_hook_file((void *)mapped, len, (void *)&_start,
-                                     PROT_READ | PROT_WRITE, fd, (unsigned long)a[5]) < 0) {
+    int skip_patch = should_skip_inline_patch_fd(fd);
+    if (rc >= 0 && !skip_patch &&
+        install_hook_file((void *)mapped, len, (void *)&_start,
+                          PROT_READ | PROT_WRITE, fd, (unsigned long)a[5]) < 0) {
         /* With --seccomp-backstop active, unpatched svc #0 traps cleanly into
          * payload via SIGSYS so even >256 MiB or packed VA segments succeed. */
         if (!g_payload_config.seccomp_backstop)
@@ -122,7 +157,14 @@ static long map_exec(long number, long a[6])
     if (ret < 0)
         return ret;
     unsigned long base = number == __NR_mmap ? (unsigned long)ret : (unsigned long)a[0];
-    if (install_hook_prot((void *)base, (size_t)a[1], (void *)&_start, (int)a[2]) < 0) {
+    /* When --seccomp-backstop is combined with --no-inline-patch*, leave
+     * runtime mprotect(..., PROT_EXEC) regions unmodified so self-decrypting
+     * or integrity-checked code stays intact while svc #0 traps cleanly. */
+    int skip_mprot_patch = (g_payload_config.seccomp_backstop &&
+                            (g_payload_config.no_inline_patch_all ||
+                             g_payload_config.no_inline_patch_count > 0));
+    if (!skip_mprot_patch &&
+        install_hook_prot((void *)base, (size_t)a[1], (void *)&_start, (int)a[2]) < 0) {
         /* When --seccomp-backstop is active, leave unpatched svc #0 to the
          * seccomp SIGSYS backstop instead of failing the mapping. */
         if (!g_payload_config.seccomp_backstop) {

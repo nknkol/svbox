@@ -205,6 +205,11 @@ typedef struct payload_config {
      * matching PREFIX (lets runtimes fall back cleanly when host denies
      * MAP_SHARED|PROT_EXEC on memfd). */
     char deny_memfd_prefix[32];
+    /* --no-inline-patch / --no-inline-patch-prefix DIR: keep mapped code pages
+     * bit-for-bit unmodified (requiring --seccomp-backstop to intercept svc). */
+    int32_t no_inline_patch_all;
+    uint32_t no_inline_patch_count;
+    char no_inline_patch_prefixes[8][CONFIG_MAX_PATH];
     /* Initial ELF segments copied into anonymous pages by the loader so
      * /proc/self/maps can report their guest paths and offsets accurately. */
     uint32_t init_vma_count;

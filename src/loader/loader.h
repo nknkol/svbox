@@ -116,6 +116,7 @@ int signal_install(int sig, signal_handler_t handler, unsigned long flags);
 void die_of_signal(int sig);
 void debugger_install(void);
 void sigsys_trap_install(void);
+int sigsys_install_handler(signal_handler_t handler);
 
 /* broker.c (isolation mode) */
 void broker_start(payload_config_t *cfg);
@@ -125,7 +126,7 @@ void guest_filter_install(uint32_t device_mask);
 void guest_filter_dump(uint32_t device_mask);
 
 /* backstop.c */
-void backstop_install(unsigned long payload_entry, int with_filter);
+void backstop_install(unsigned long payload_entry, int with_filter, int trap_host_sigsys);
 
 int platform_is_harmonyos(void);
 int mprotect_exec(void *addr, size_t len, int prot);

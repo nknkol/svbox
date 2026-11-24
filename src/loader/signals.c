@@ -45,6 +45,27 @@ extern void svbox_sigsys_handler(int, siginfo_t *, void *);
 extern void svbox_sigsys_restorer(void);
 #endif
 
+int sigsys_install_handler(signal_handler_t handler)
+{
+#ifdef __aarch64__
+	/* SA_SIGINFO(4) | SA_RESTORER(0x04000000) | SA_ONSTACK(0x08000000) |
+	 * SA_NODEFER(0x40000000) */
+	k_sigaction_t sa = {
+		handler,
+		0x4c000004ul,
+		svbox_sigsys_restorer,
+		0
+	};
+	if (z_syscall(__NR_rt_sigaction, 31 /* SIGSYS */, &sa, NULL, sizeof(sa.mask)) < 0)
+		return -1;
+	unsigned long unblock = 1ul << (31 - 1);
+	z_syscall(__NR_rt_sigprocmask, 1 /* SIG_UNBLOCK */, &unblock, NULL, sizeof(unblock));
+	return 0;
+#else
+	return signal_install(31 /* SIGSYS */, handler, SA_SIGINFO | SA_ONSTACK | SA_NODEFER);
+#endif
+}
+
 void sigsys_trap_install(void)
 {
 #ifdef __aarch64__

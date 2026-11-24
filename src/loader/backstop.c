@@ -13,6 +13,7 @@
  * restart_syscall and clone are allowed by number: they take no paths and
  * clone cannot run inside a signal handler. */
 static unsigned long g_payload_entry;
+static int g_trap_host_sigsys;
 extern char __ehdr_start[], _end[];
 
 static long backstop_call(unsigned long entry, const unsigned long *r)
@@ -36,13 +37,22 @@ static void loader_sigsys_handler(int sig, siginfo_t *si, void *ucontext)
 {
 	ucontext_t *uc = (ucontext_t *)ucontext;
 	/* Our TRAP action's data comes in si_errno: the host sandbox's own
-	 * filter traps some calls too, and those keep their native effect. */
-	if (!si || si->si_code != 1 /* SYS_SECCOMP */ || si->si_errno != BACKSTOP_TRAP_DATA || !uc) {
+	 * filter traps some calls too. When --trap-sigsys is also enabled,
+	 * convert host sandbox traps into -ENOSYS cleanly. */
+	if (!si || si->si_code != 1 /* SYS_SECCOMP */ || !uc) {
 		die_of_signal(sig);
 		return;
 	}
 	unsigned long *regs = (unsigned long *)uc->uc_mcontext.regs;
-	regs[0] = (unsigned long)backstop_call(g_payload_entry, regs);
+	if (si->si_errno == BACKSTOP_TRAP_DATA) {
+		regs[0] = (unsigned long)backstop_call(g_payload_entry, regs);
+		return;
+	}
+	if (g_trap_host_sigsys) {
+		regs[0] = (unsigned long)-38L; /* -ENOSYS */
+		return;
+	}
+	die_of_signal(sig);
 }
 
 static int backstop_filter(void)
@@ -81,13 +91,15 @@ static int backstop_filter(void)
 
 /* The filter survives exec, so only the initial loader installs it; every
  * loader installs the handler. */
-void backstop_install(unsigned long payload_entry, int with_filter)
+void backstop_install(unsigned long payload_entry, int with_filter, int trap_host_sigsys)
 {
 	g_payload_entry = payload_entry;
+	g_trap_host_sigsys = trap_host_sigsys;
 	if (g_payload_lo != PAYLOAD_FIXED_BASE)
 		z_errx(1, "seccomp backstop: payload not at its fixed address");
-	/* NODEFER: a guest handler run from here may itself trap. */
-	if (signal_install(SIGSYS, loader_sigsys_handler, SA_SIGINFO | SA_ONSTACK | SA_NODEFER) < 0)
+	/* NODEFER + explicit SA_RESTORER: a guest handler run from here may
+	 * itself trap, and rt_sigreturn runs from our loader's allowed range. */
+	if (sigsys_install_handler(loader_sigsys_handler) < 0)
 		z_errx(1, "seccomp backstop: cannot install SIGSYS handler");
 	if (with_filter && backstop_filter() < 0)
 		z_errx(1, "seccomp backstop: cannot install the filter");

@@ -426,7 +426,7 @@ void z_entry(unsigned long *sp, void (*fini)(void))
 		}
 	}
 	if (cfg.seccomp_backstop)
-		backstop_install(payload_entry, !opt.child);
+		backstop_install(payload_entry, !opt.child, cfg.trap_sigsys);
 	else if (cfg.trap_sigsys)
 		sigsys_trap_install();
 	/* --cwd: the guest directory, through the root and binds (the program

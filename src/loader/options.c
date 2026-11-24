@@ -360,6 +360,8 @@ void options_print_help(int fd)
 		"  --fd-capacity N                Cap tracked FD records (default: hard RLIMIT_NOFILE)\n"
 		"  --seccomp-backstop             Trap unhooked syscalls via seccomp SIGSYS backstop\n"
 		"  --trap-sigsys                  Convert host seccomp SIGSYS traps into -ENOSYS\n"
+		"  --no-inline-patch              Keep all mapped code unmodified (uses seccomp backstop)\n"
+		"  --no-inline-patch-prefix DIR   Skip inline svc patching for guest paths under DIR (repeatable)\n"
 		"\n"
 		"Resources & Scheduling:\n"
 		"  --cpuset LIST                  Pin container to host CPUs (e.g. 0-3 or 4,5,6,7)\n"
@@ -525,6 +527,22 @@ void options_parse(int argc, char **argv, payload_config_t *cfg, struct loader_o
 			cfg->seccomp_backstop = 1;
 		} else if (is(arg, "--trap-sigsys")) {
 			cfg->trap_sigsys = 1;
+		} else if (is(arg, "--no-inline-patch")) {
+			cfg->no_inline_patch_all = 1;
+			cfg->seccomp_backstop = 1;
+		} else if (is(arg, "--no-inline-patch-prefix")) {
+			const char *v = value(argc, argv, &i);
+			if (!v[0] || v[0] != '/' || z_strlen(v) >= CONFIG_MAX_PATH)
+				z_errx(1, "invalid guest prefix for %s: %s", arg, v);
+			if (cfg->no_inline_patch_count >= 8)
+				z_errx(1, "too many %s options (max 8)", arg);
+			copy_cstr(cfg->no_inline_patch_prefixes[cfg->no_inline_patch_count],
+				  CONFIG_MAX_PATH, v);
+			size_t len = z_strlen(cfg->no_inline_patch_prefixes[cfg->no_inline_patch_count]);
+			while (len > 1 && cfg->no_inline_patch_prefixes[cfg->no_inline_patch_count][len - 1] == '/')
+				cfg->no_inline_patch_prefixes[cfg->no_inline_patch_count][--len] = '\0';
+			cfg->no_inline_patch_count++;
+			cfg->seccomp_backstop = 1;
 		} else if (is(arg, "--cpuset")) {
 			cfg->cpu_mask |= parse_cpuset(value(argc, argv, &i));
 		} else if (is(arg, "--mem-mb")) {
