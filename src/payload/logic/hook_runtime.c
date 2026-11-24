@@ -106,6 +106,199 @@ int island_note(uintptr_t base, size_t len)
     return protected_add(base, base + len);
 }
 
+int hook_note_internal(uintptr_t base, size_t len)
+{
+    return protected_add(base, base + len);
+}
+
+void hook_unnote_internal(uintptr_t base, size_t len)
+{
+    uintptr_t hi = base + len;
+    unsigned n = __atomic_load_n(&protected_count, __ATOMIC_ACQUIRE);
+    if (n > PROTECTED_MAX) n = PROTECTED_MAX;
+    for (unsigned i = 0; i < n; i++) {
+        if (protected_lo[i] == base &&
+            __atomic_load_n(&protected_hi[i], __ATOMIC_ACQUIRE) == hi) {
+            __atomic_store_n(&protected_hi[i], 0, __ATOMIC_RELEASE);
+            break;
+        }
+    }
+}
+
+/* ---- Virtualized VMA tracking for copied executable file mappings ---- */
+#define VMA_TRACK_MAX 1024u
+
+struct vma_slot {
+    uintptr_t start;
+    uintptr_t end;
+    uint64_t  file_off;
+    uint64_t  dev;
+    uint64_t  ino;
+    char      host_path[256];
+};
+
+static struct vma_slot g_vmas[VMA_TRACK_MAX];
+static unsigned g_vma_hi; /* high-water slot index */
+static int g_vma_lock;
+
+static inline void vma_lock(void)
+{
+    while (__atomic_test_and_set(&g_vma_lock, __ATOMIC_ACQUIRE))
+        raw_syscall(__NR_sched_yield, 0, 0, 0, 0, 0, 0);
+}
+static inline void vma_unlock(void)
+{
+    __atomic_clear(&g_vma_lock, __ATOMIC_RELEASE);
+}
+
+static void vma_remove_locked(uintptr_t u_lo, uintptr_t u_hi)
+{
+    unsigned hi = g_vma_hi;
+    for (unsigned i = 0; i < hi; i++) {
+        uintptr_t s = g_vmas[i].start, e = g_vmas[i].end;
+        if (!e || u_hi <= s || u_lo >= e)
+            continue;
+        if (u_lo <= s && u_hi >= e) {
+            g_vmas[i].start = 0;
+            g_vmas[i].end = 0;
+        } else if (u_lo <= s) {
+            g_vmas[i].file_off += (uint64_t)(u_hi - s);
+            g_vmas[i].start = u_hi;
+        } else if (u_hi >= e) {
+            g_vmas[i].end = u_lo;
+        } else {
+            /* Split in middle: keep left half in place, try to store right half. */
+            uint64_t right_off = g_vmas[i].file_off + (uint64_t)(u_hi - s);
+            g_vmas[i].end = u_lo;
+            for (unsigned j = 0; j < VMA_TRACK_MAX; j++) {
+                if (!g_vmas[j].end) {
+                    g_vmas[j] = g_vmas[i];
+                    g_vmas[j].start = u_hi;
+                    g_vmas[j].end = e;
+                    g_vmas[j].file_off = right_off;
+                    if (j + 1 > g_vma_hi) g_vma_hi = j + 1;
+                    break;
+                }
+            }
+        }
+    }
+}
+
+void vma_track_remove(uintptr_t start, size_t len)
+{
+    if (!len || !__atomic_load_n(&g_vma_hi, __ATOMIC_ACQUIRE))
+        return;
+    uintptr_t u_lo = start & ~(ISLAND_PAGE - 1);
+    uintptr_t u_hi = (start + len + ISLAND_PAGE - 1) & ~(ISLAND_PAGE - 1);
+    if (u_hi <= u_lo)
+        return;
+    vma_lock();
+    vma_remove_locked(u_lo, u_hi);
+    vma_unlock();
+}
+
+void vma_track_add(uintptr_t start, size_t len, uint64_t file_off, int fd)
+{
+    if (!len || fd < 0)
+        return;
+    uintptr_t u_lo = start & ~(ISLAND_PAGE - 1);
+    uintptr_t u_hi = (start + len + ISLAND_PAGE - 1) & ~(ISLAND_PAGE - 1);
+    if (u_hi <= u_lo)
+        return;
+
+    /* Resolve host path + (dev, ino) directly from fd before taking lock. */
+    unsigned char st[128];
+    uint64_t dev = 0, ino = 0;
+    if (raw_syscall(__NR_fstat, fd, (long)st, 0, 0, 0, 0) == 0) {
+        __builtin_memcpy(&dev, st + 0, 8);
+        __builtin_memcpy(&ino, st + 8, 8);
+    }
+    char link_path[32];
+    const char *pfx = "/proc/self/fd/";
+    size_t lp = 0;
+    while (pfx[lp]) { link_path[lp] = pfx[lp]; lp++; }
+    char digs[12];
+    int dn = 0, fdv = fd;
+    do { digs[dn++] = (char)('0' + (fdv % 10)); fdv /= 10; } while (fdv > 0 && dn < 12);
+    while (dn > 0) link_path[lp++] = digs[--dn];
+    link_path[lp] = '\0';
+
+    char hpath[256];
+    long rlen = raw_syscall(__NR_readlinkat, -100 /* AT_FDCWD */, (long)link_path,
+                            (long)hpath, (long)(sizeof(hpath) - 1), 0, 0);
+    if (rlen <= 0 || hpath[0] != '/')
+        return;
+    hpath[rlen] = '\0';
+
+    vma_lock();
+    vma_remove_locked(u_lo, u_hi);
+    unsigned slot = VMA_TRACK_MAX;
+    for (unsigned i = 0; i < g_vma_hi; i++) {
+        if (!g_vmas[i].end) { slot = i; break; }
+    }
+    if (slot == VMA_TRACK_MAX && g_vma_hi < VMA_TRACK_MAX)
+        slot = g_vma_hi++;
+    if (slot < VMA_TRACK_MAX) {
+        g_vmas[slot].start = u_lo;
+        g_vmas[slot].end = u_hi;
+        g_vmas[slot].file_off = file_off;
+        g_vmas[slot].dev = dev;
+        g_vmas[slot].ino = ino;
+        __builtin_memcpy(g_vmas[slot].host_path, hpath, (size_t)rlen + 1);
+    }
+    vma_unlock();
+}
+
+int vma_track_lookup(uintptr_t start, uintptr_t end, struct vma_info *out)
+{
+    if (!out || end <= start)
+        return 0;
+    if (__atomic_load_n(&g_vma_hi, __ATOMIC_ACQUIRE) > 0) {
+        vma_lock();
+        unsigned hi = g_vma_hi;
+        for (unsigned i = 0; i < hi; i++) {
+            if (g_vmas[i].end && start >= g_vmas[i].start && end <= g_vmas[i].end) {
+                out->start = g_vmas[i].start;
+                out->end = g_vmas[i].end;
+                out->file_off = g_vmas[i].file_off;
+                out->dev = g_vmas[i].dev;
+                out->ino = g_vmas[i].ino;
+                out->is_guest_path = 0;
+                __builtin_memcpy(out->path, g_vmas[i].host_path, sizeof(out->path));
+                vma_unlock();
+                return 1;
+            }
+        }
+        vma_unlock();
+    }
+    /* Fall back to initial loader-mapped ELF segments (prog and interp). */
+    uint32_t icnt = g_payload_config.init_vma_count;
+    if (icnt > CONFIG_MAX_INIT_VMAS) icnt = CONFIG_MAX_INIT_VMAS;
+    for (uint32_t i = 0; i < icnt; i++) {
+        const struct init_vma *iv = &g_payload_config.init_vmas[i];
+        if (iv->end && start >= (uintptr_t)iv->start && end <= (uintptr_t)iv->end) {
+            const char *src = iv->is_interp ? g_payload_config.exec_interp_path
+                                            : g_payload_config.exec_exe;
+            if (!src[0])
+                return 0;
+            out->start = (uintptr_t)iv->start;
+            out->end = (uintptr_t)iv->end;
+            out->file_off = iv->file_off;
+            out->dev = iv->dev;
+            out->ino = iv->ino;
+            out->is_guest_path = iv->is_interp ? 0 : 1;
+            size_t n = 0;
+            while (src[n] && n + 1 < sizeof(out->path)) {
+                out->path[n] = src[n];
+                n++;
+            }
+            out->path[n] = '\0';
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int hook_protected_overlap(uintptr_t addr, size_t len)
 {
     if (!len) return 0;
@@ -286,7 +479,10 @@ static void island_pool_record(uintptr_t code_lo, size_t code_len, uintptr_t isl
 
 void hook_on_munmap(uintptr_t addr, size_t len)
 {
-    if (!len || __atomic_load_n(&g_track_active, __ATOMIC_ACQUIRE) == 0)
+    if (!len)
+        return;
+    vma_track_remove(addr, len);
+    if (__atomic_load_n(&g_track_active, __ATOMIC_ACQUIRE) == 0)
         return;
     uintptr_t u_lo = addr & ~(ISLAND_PAGE - 1);
     uintptr_t u_hi = (addr + len + ISLAND_PAGE - 1) & ~(ISLAND_PAGE - 1);

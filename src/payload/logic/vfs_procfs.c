@@ -3,6 +3,7 @@
  * fd), their cmdline, readlink of /proc names, and the mount tables
  * generated from the R4 table. */
 #include "vfs_bridge_internal.h"
+#include "hook_runtime.h"
 
 static long current_id(long number)
 {
@@ -355,7 +356,12 @@ long pb_proc_status(Bridge *b, int flags)
         size_t line_len = (nl < total) ? (nl - pos + 1) : (nl - pos);
         int is_uid = (line_len >= 4 && !strncmp(b->proc_data + pos, "Uid:", 4));
         int is_gid = (!is_uid && line_len >= 4 && !strncmp(b->proc_data + pos, "Gid:", 4));
-        if (is_uid || is_gid) {
+        int hide_sec = (g_payload_config.seccomp_backstop || g_payload_config.trap_sigsys);
+        int is_seccomp = (!is_uid && !is_gid && hide_sec &&
+                          line_len >= 8 && !strncmp(b->proc_data + pos, "Seccomp:", 8));
+        int is_secfilt = (!is_uid && !is_gid && !is_seccomp && hide_sec &&
+                          line_len >= 16 && !strncmp(b->proc_data + pos, "Seccomp_filters:", 16));
+        if (is_uid || is_gid || is_seccomp || is_secfilt) {
             if (pos > span_start) {
                 size_t wdone = 0, wlen = pos - span_start;
                 while (wdone < wlen) {
@@ -367,9 +373,20 @@ long pb_proc_status(Bridge *b, int flags)
             }
             if (rc >= 0) {
                 char line[128];
-                size_t llen = format_id_line(line, sizeof(line),
-                                             is_uid ? "Uid:" : "Gid:",
-                                             is_uid ? ids : (ids + 4));
+                size_t llen = 0;
+                if (is_uid || is_gid) {
+                    llen = format_id_line(line, sizeof(line),
+                                          is_uid ? "Uid:" : "Gid:",
+                                          is_uid ? ids : (ids + 4));
+                } else if (is_seccomp) {
+                    const char *s = "Seccomp:\t0\n";
+                    llen = strlen(s);
+                    memcpy(line, s, llen);
+                } else {
+                    const char *s = "Seccomp_filters:\t0\n";
+                    llen = strlen(s);
+                    memcpy(line, s, llen);
+                }
                 size_t wdone = 0;
                 while (wdone < llen) {
                     long w = raw_syscall(__NR_write, mfd, (long)(line + wdone),
@@ -625,6 +642,308 @@ long pb_proc_meminfo(Bridge *b, int flags)
     if (rc < 0) {
         raw_syscall(__NR_close, mfd, 0, 0, 0, 0, 0);
         return rc;
+    }
+    return mfd;
+}
+
+static int parse_hex_u64(const char **pp, const char *end, uint64_t *out)
+{
+    const char *p = *pp;
+    uint64_t v = 0;
+    int digits = 0;
+    while (p < end) {
+        char c = *p;
+        unsigned d;
+        if (c >= '0' && c <= '9') d = (unsigned)(c - '0');
+        else if (c >= 'a' && c <= 'f') d = (unsigned)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') d = (unsigned)(c - 'A' + 10);
+        else break;
+        v = (v << 4) | d;
+        digits++;
+        p++;
+    }
+    if (!digits) return 0;
+    *pp = p;
+    *out = v;
+    return 1;
+}
+
+static size_t append_hex_u64(char *dst, size_t cap, size_t pos, uint64_t v, int min_digits)
+{
+    static const char hex[] = "0123456789abcdef";
+    char tmp[20];
+    int d = 0;
+    do {
+        tmp[d++] = hex[v & 0xfu];
+        v >>= 4;
+    } while (v && d < 20);
+    while (d < min_digits && d < 20)
+        tmp[d++] = '0';
+    while (d > 0 && pos < cap)
+        dst[pos++] = tmp[--d];
+    return pos;
+}
+
+static size_t format_maps_line(char *dst, size_t cap,
+                               uint64_t start, uint64_t end, const char perms[4],
+                               uint64_t off, uint64_t dev, uint64_t ino,
+                               const char *path)
+{
+    size_t p = 0;
+    p = append_hex_u64(dst, cap, p, start, 8);
+    if (p < cap) dst[p++] = '-';
+    p = append_hex_u64(dst, cap, p, end, 8);
+    if (p < cap) dst[p++] = ' ';
+    for (int i = 0; i < 4 && p < cap; i++) dst[p++] = perms[i];
+    if (p < cap) dst[p++] = ' ';
+    p = append_hex_u64(dst, cap, p, off, 8);
+    if (p < cap) dst[p++] = ' ';
+    uint32_t maj = (uint32_t)(((dev >> 8) & 0xfffu) | ((dev >> 32) & ~0xfffu));
+    uint32_t min = (uint32_t)((dev & 0xffu) | ((dev >> 12) & ~0xffu));
+    p = append_hex_u64(dst, cap, p, maj, 2);
+    if (p < cap) dst[p++] = ':';
+    p = append_hex_u64(dst, cap, p, min, 2);
+    if (p < cap) dst[p++] = ' ';
+    p = append_u64(dst, cap, p, ino);
+    if (path && path[0]) {
+        if (p < cap) dst[p++] = ' ';
+        while (p < 73 && p < cap) dst[p++] = ' ';
+        for (size_t i = 0; path[i] && p < cap; i++) dst[p++] = path[i];
+    }
+    if (p < cap) dst[p++] = '\n';
+    return p;
+}
+
+static int path_is_internal_runtime(const char *path, size_t len)
+{
+    if (!path || !len) return 0;
+    if (g_payload_config.loader_path[0]) {
+        size_t lp = strlen(g_payload_config.loader_path);
+        if (len >= lp && !strncmp(path, g_payload_config.loader_path, lp) &&
+            (len == lp || path[lp] == ' '))
+            return 1;
+    }
+    static const char *const suffixes[] = {
+        "/.svbox_svc_cache", "/owner.db", "/memfd:mounts", "/memfd:mounts-ns"
+    };
+    for (size_t s = 0; s < sizeof(suffixes) / sizeof(suffixes[0]); s++) {
+        size_t sl = strlen(suffixes[s]);
+        if (len >= sl) {
+            size_t cmp_len = len;
+            if (cmp_len > 10 && !strncmp(path + cmp_len - 10, " (deleted)", 10))
+                cmp_len -= 10;
+            if (cmp_len >= sl && !strncmp(path + cmp_len - sl, suffixes[s], sl))
+                return 1;
+        }
+    }
+    return 0;
+}
+
+struct maps_writer {
+    int fd;
+    long rc;
+    size_t used;
+    char buf[4096];
+};
+
+static void maps_flush(struct maps_writer *w)
+{
+    if (w->rc < 0 || !w->used) return;
+    w->rc = write_all_fd(w->fd, w->buf, w->used);
+    w->used = 0;
+}
+
+static void maps_emit(struct maps_writer *w, const char *data, size_t len)
+{
+    if (w->rc < 0 || !len) return;
+    if (len >= sizeof(w->buf)) {
+        maps_flush(w);
+        if (w->rc >= 0) w->rc = write_all_fd(w->fd, data, len);
+        return;
+    }
+    if (w->used + len > sizeof(w->buf))
+        maps_flush(w);
+    if (w->rc < 0) return;
+    memcpy(w->buf + w->used, data, len);
+    w->used += len;
+}
+
+/* Virtualize /proc/<pid>/maps and /proc/<pid>/smaps:
+ * - Omit internal runtime mappings (payload, stub islands, shared state).
+ * - Restore guest paths/offsets/dev/ino for copied executable file segments.
+ * - Translate any remaining host-side mapped file paths into guest paths. */
+long pb_proc_maps(Bridge *b, int flags)
+{
+    if (compare_paths("/proc", b->guest) != PATH1_IS_PREFIX)
+        return -ENOENT;
+    const char *cursor = b->guest + strlen("/proc/");
+    long self_pid = raw_syscall(__NR_getpid, 0, 0, 0, 0, 0, 0);
+    long pid = 0;
+    if (!strncmp(cursor, "self/", 5) || !strncmp(cursor, "thread-self/", 12)) {
+        pid = self_pid;
+        cursor = strchr(cursor, '/');
+    } else {
+        if (*cursor < '1' || *cursor > '9') return -ENOENT;
+        while (*cursor >= '0' && *cursor <= '9') pid = pid * 10 + (*cursor++ - '0');
+    }
+    if (!strncmp(cursor, "/task/", 6)) {
+        cursor += 6;
+        if (*cursor < '1' || *cursor > '9') return -ENOENT;
+        while (*cursor >= '0' && *cursor <= '9') cursor++;
+    }
+    int is_smaps = 0;
+    if (!strcmp(cursor, "/maps")) is_smaps = 0;
+    else if (!strcmp(cursor, "/smaps")) is_smaps = 1;
+    else return -ENOENT;
+
+    int is_self = (pid == self_pid);
+    long kfd = raw_syscall(__NR_openat, AT_FDCWD, (long)b->host, O_RDONLY | O_CLOEXEC, 0, 0, 0);
+    if (kfd < 0) return kfd;
+
+    long mfd = raw_syscall(__NR_memfd_create, (long)(is_smaps ? "smaps" : "maps"),
+                           (flags & O_CLOEXEC) ? 1 : 0, 0, 0, 0, 0);
+    if (mfd < 0) {
+        raw_syscall(__NR_close, kfd, 0, 0, 0, 0, 0);
+        return mfd;
+    }
+
+    struct maps_writer w;
+    w.fd = (int)mfd;
+    w.rc = 0;
+    w.used = 0;
+
+    char rbuf[4096];
+    char line[1024];
+    size_t line_len = 0;
+    int skip_smaps_body = 0;
+    int eof = 0;
+
+    while (!eof && w.rc >= 0) {
+        long nr = raw_syscall(__NR_read, kfd, (long)rbuf, sizeof(rbuf), 0, 0, 0);
+        if (nr <= 0) {
+            eof = 1;
+            if (!line_len) break;
+        }
+        size_t ri = 0;
+        while (w.rc >= 0 && (ri < (size_t)(nr > 0 ? nr : 0) || (eof && line_len > 0))) {
+            int got_line = 0;
+            if (!eof) {
+                while (ri < (size_t)nr) {
+                    char ch = rbuf[ri++];
+                    if (line_len + 1 < sizeof(line))
+                        line[line_len++] = ch;
+                    if (ch == '\n') {
+                        got_line = 1;
+                        break;
+                    }
+                }
+            } else {
+                got_line = 1;
+            }
+            if (!got_line) break;
+
+            if (is_smaps && line_len > 0 && line[0] >= 'A' && line[0] <= 'Z') {
+                if (!skip_smaps_body)
+                    maps_emit(&w, line, line_len);
+                line_len = 0;
+                if (eof) break;
+                continue;
+            }
+
+            const char *p = line;
+            const char *lend = line + line_len;
+            uint64_t start = 0, end = 0;
+            int header_ok = parse_hex_u64(&p, lend, &start) &&
+                            p < lend && *p == '-' && (++p, parse_hex_u64(&p, lend, &end)) &&
+                            p + 6 <= lend && *p == ' ';
+            if (!header_ok) {
+                skip_smaps_body = 0;
+                maps_emit(&w, line, line_len);
+                line_len = 0;
+                if (eof) break;
+                continue;
+            }
+
+            const char *perms = p + 1;
+            const char *q = perms + 4;
+            int fields = 0;
+            while (q < lend && fields < 3) {
+                while (q < lend && (*q == ' ' || *q == '\t')) q++;
+                while (q < lend && *q != ' ' && *q != '\t' && *q != '\n') q++;
+                fields++;
+            }
+            const char *ino_end = q;
+            while (q < lend && (*q == ' ' || *q == '\t')) q++;
+            const char *path_start = q;
+            const char *path_end = lend;
+            while (path_end > path_start && (path_end[-1] == '\n' || path_end[-1] == '\r'))
+                path_end--;
+            size_t path_len = (size_t)(path_end - path_start);
+
+            if ((is_self && end > start && hook_protected_overlap((uintptr_t)start, (size_t)(end - start))) ||
+                path_is_internal_runtime(path_start, path_len)) {
+                skip_smaps_body = 1;
+                line_len = 0;
+                if (eof) break;
+                continue;
+            }
+            skip_smaps_body = 0;
+
+            struct vma_info vma;
+            if (is_self && path_len == 0 && vma_track_lookup((uintptr_t)start, (uintptr_t)end, &vma)) {
+                const char *gpath = vma.path;
+                if (!vma.is_guest_path) {
+                    size_t pl = strlen(vma.path);
+                    if (pl < sizeof(b->cwd)) {
+                        memcpy(b->cwd, vma.path, pl + 1);
+                        if (pb_guest_link_target(b, b->cwd) >= 0)
+                            gpath = b->cwd;
+                    }
+                }
+                char out_line[512];
+                size_t olen = format_maps_line(out_line, sizeof(out_line),
+                                               start, end, perms,
+                                               vma.file_off + (start - (uint64_t)vma.start),
+                                               vma.dev, vma.ino, gpath);
+                maps_emit(&w, out_line, olen);
+            } else if (path_len > 0 && path_start[0] == '/' && path_len < sizeof(b->cwd) - 16) {
+                int deleted = (path_len > 10 && !strncmp(path_end - 10, " (deleted)", 10));
+                size_t core_len = deleted ? (path_len - 10) : path_len;
+                memcpy(b->cwd, path_start, core_len);
+                b->cwd[core_len] = '\0';
+                if (pb_guest_link_target(b, b->cwd) >= 0 &&
+                    (strlen(b->cwd) != core_len || strncmp(b->cwd, path_start, core_len) != 0)) {
+                    size_t prefix_len = (size_t)(ino_end - line);
+                    maps_emit(&w, line, prefix_len);
+                    size_t col = prefix_len;
+                    maps_emit(&w, " ", 1);
+                    col++;
+                    if (col < 73) {
+                        static const char spaces[74] =
+                            "                                                                         ";
+                        maps_emit(&w, spaces, 73 - col);
+                    }
+                    maps_emit(&w, b->cwd, strlen(b->cwd));
+                    if (deleted)
+                        maps_emit(&w, " (deleted)", 10);
+                    maps_emit(&w, "\n", 1);
+                } else {
+                    maps_emit(&w, line, line_len);
+                }
+            } else {
+                maps_emit(&w, line, line_len);
+            }
+            line_len = 0;
+            if (eof) break;
+        }
+    }
+
+    maps_flush(&w);
+    raw_syscall(__NR_close, kfd, 0, 0, 0, 0, 0);
+    if (w.rc >= 0) w.rc = raw_syscall(__NR_lseek, mfd, 0, 0, 0, 0, 0);
+    if (w.rc < 0) {
+        raw_syscall(__NR_close, mfd, 0, 0, 0, 0, 0);
+        return w.rc;
     }
     return mfd;
 }

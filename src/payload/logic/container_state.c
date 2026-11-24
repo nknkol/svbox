@@ -12,6 +12,7 @@
 #include "config.h"
 #include "container_state.h"
 #include "fake_ids.h"
+#include "hook_runtime.h"
 #include "host_syscall.h"
 
 extern long raw_syscall(long number, long a1, long a2, long a3, long a4, long a5, long a6);
@@ -45,6 +46,8 @@ static void *map_shared(int fd, size_t size, int *state, void **slot)
     if (!__atomic_compare_exchange_n(slot, &expected, (void *)p, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
         raw_syscall(__NR_munmap, p, (long)size, 0, 0, 0, 0); /* a racing thread won */
         p = (long)expected;
+    } else {
+        hook_note_internal((uintptr_t)p, size);
     }
     __atomic_store_n(state, 2, __ATOMIC_RELEASE);
     return (void *)p;
@@ -165,11 +168,14 @@ int mounts_unshare(void)
         return -EIO;
     }
     raw_syscall(__NR_close, mfd, 0, 0, 0, 0, 0);
+    hook_note_internal((uintptr_t)new_t, MOUNT_TABLE_SIZE);
     void *prev = __atomic_exchange_n(&table_slot, new_t, __ATOMIC_ACQ_REL);
     __atomic_store_n(&table_state, 2, __ATOMIC_RELEASE);
     __atomic_add_fetch(&g_mounts_unshare_gen, 1u, __ATOMIC_RELEASE);
-    if (prev)
+    if (prev) {
+        hook_unnote_internal((uintptr_t)prev, MOUNT_TABLE_SIZE);
         raw_syscall(__NR_munmap, (long)prev, (long)MOUNT_TABLE_SIZE, 0, 0, 0, 0);
+    }
     return 0;
 }
 

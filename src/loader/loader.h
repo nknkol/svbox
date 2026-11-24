@@ -92,6 +92,9 @@ int is_elf_file_at(int dirfd, const char *path);
 /* elf_load.c */
 #define ELF_MAX_PHNUM 256
 extern unsigned long g_payload_lo, g_payload_hi;
+extern struct init_vma g_loader_vmas[CONFIG_MAX_INIT_VMAS];
+extern unsigned g_loader_vma_count;
+extern unsigned g_loader_vma_is_interp;
 void elf_read_headers(int fd, Elf_Ehdr *ehdr, Elf_Phdr *phdr, const char *file);
 unsigned long elf_load_image(int fd, const Elf_Ehdr *ehdr, const Elf_Phdr *phdr,
 			     unsigned long payload_entry, const char *file);

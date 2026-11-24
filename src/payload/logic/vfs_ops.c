@@ -767,6 +767,8 @@ long pb_dispatch(Bridge *b, long number, long a[6], struct proot_open_origin *or
             ret = pb_proc_filesystems(b, (int)a[2]);
         if (ret == -ENOENT && g_payload_config.mode == CONFIG_MODE_CONTAINER)
             ret = pb_proc_status(b, (int)a[2]);
+        if (ret == -ENOENT && g_payload_config.mode == CONFIG_MODE_CONTAINER)
+            ret = pb_proc_maps(b, (int)a[2]);
         if (ret == -ENOENT && g_payload_config.cpu_mask)
             ret = pb_proc_cpuinfo(b, (int)a[2]);
         if (ret == -ENOENT && g_payload_config.mem_limit_mb)

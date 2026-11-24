@@ -78,6 +78,7 @@ static long map_exec_copy(const long a[6])
         raw_syscall(__NR_munmap, mapped, (long)len, 0, 0, 0, 0);
         return rc;
     }
+    vma_track_add((uintptr_t)mapped, (size_t)len, (uint64_t)a[5], fd);
     return mapped;
 }
 
@@ -248,7 +249,12 @@ long dispatch_syscall(long number, long a[6])
             a[0] = 0x1000000000L;
         if (a[2] & PROT_EXEC)
             return map_exec(number, a);
-        return passthrough(number, a);
+        {
+            long rc = passthrough(number, a);
+            if (rc >= 0 && (a[3] & MAP_FIXED))
+                vma_track_remove((uintptr_t)rc, (size_t)a[1]);
+            return rc;
+        }
     case __NR_mprotect:
         if (a[2] & PROT_EXEC)
             return map_exec(number, a);

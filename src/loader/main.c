@@ -189,6 +189,9 @@ static void configure_payload(unsigned long payload_entry, const payload_config_
 		dst->protected_ranges[n][1] = g_loader_islands[i][1];
 	}
 	dst->protected_count = n;
+	dst->init_vma_count = g_loader_vma_count;
+	for (unsigned i = 0; i < g_loader_vma_count && i < CONFIG_MAX_INIT_VMAS; i++)
+		dst->init_vmas[i] = g_loader_vmas[i];
 	for (int i = 0; i < CONFIG_ISOLATE_DEVICES; i++)
 		dst->device_paths[i] = (uint64_t)g_isolate_page.table.path[i];
 	dst->empty_path = (uint64_t)g_isolate_page.table.empty;
@@ -384,11 +387,18 @@ void z_entry(unsigned long *sp, void (*fini)(void))
 	hook_set_scratch(cfg.isolate ? NULL : cfg.mount_scratch);
 	/* An isolated child reads the program and interpreter from the FDs the
 	 * broker opened (and closes them); otherwise they are opened here. */
+	g_loader_vma_is_interp = 0;
 	load(&prog, file, isolated_child ? opt.exec_fd : -1, payload_entry);
 	const char *interp_path = interpreter(&prog, file, &cfg, &opt, interp_buf, sizeof(interp_buf));
-	if (interp_path)
+	if (interp_path) {
+		g_loader_vma_is_interp = 1;
+		size_t il = z_strlen(interp_path);
+		if (il >= sizeof(cfg.exec_interp_path))
+			il = sizeof(cfg.exec_interp_path) - 1;
+		z_memcpy(cfg.exec_interp_path, interp_path, il);
+		cfg.exec_interp_path[il] = '\0';
 		load(&interp, interp_path, isolated_child ? opt.exec_interp_fd : -1, payload_entry);
-	else if (opt.exec_interp_fd > 2)
+	} else if (opt.exec_interp_fd > 2)
 		z_close(opt.exec_interp_fd);
 	hook_release_cache();
 	/* fexecve: the program is loaded; this descriptor copy is not the guest's. */

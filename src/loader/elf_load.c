@@ -47,6 +47,9 @@ int mprotect_exec(void *addr, size_t len, int prot)
 }
 
 unsigned long g_payload_lo, g_payload_hi;
+struct init_vma g_loader_vmas[CONFIG_MAX_INIT_VMAS];
+unsigned g_loader_vma_count;
+unsigned g_loader_vma_is_interp;
 
 /* The whole layout is checked before anything is mapped: header and
  * program table within the file, each loadable segment's file range within
@@ -134,6 +137,12 @@ unsigned long elf_load_image(int fd, const Elf_Ehdr *ehdr, const Elf_Phdr *phdr,
 	if (base == (void *)-1 || (!dyn && base != hint))
 		z_errx(1, "can't load ELF %s: address range unavailable", file);
 	unsigned long bias = dyn ? (unsigned long)base - minva : 0;
+	struct stat img_st;
+	uint64_t img_dev = 0, img_ino = 0;
+	if (z_syscall(__NR_fstat, fd, &img_st) == 0) {
+		img_dev = (uint64_t)img_st.st_dev;
+		img_ino = (uint64_t)img_st.st_ino;
+	}
 
 	for (int i = 0; i < ehdr->e_phnum; i++) {
 		const Elf_Phdr *ph = &phdr[i];
@@ -159,6 +168,16 @@ unsigned long elf_load_image(int fd, const Elf_Ehdr *ehdr, const Elf_Phdr *phdr,
 			z_errx(1, "cannot place syscall stubs within branch range");
 		if (mprotect_exec(p, size, prot) < 0)
 			z_errx(1, "can't protect a segment of %s", file);
+		if (g_loader_vma_count < CONFIG_MAX_INIT_VMAS) {
+			struct init_vma *iv = &g_loader_vmas[g_loader_vma_count++];
+			iv->start = (uint64_t)(uintptr_t)p;
+			iv->end = (uint64_t)(uintptr_t)p + (uint64_t)size;
+			iv->file_off = (uint64_t)TRUNC_PG(ph->p_offset);
+			iv->dev = img_dev;
+			iv->ino = img_ino;
+			iv->is_interp = g_loader_vma_is_interp;
+			iv->_pad = 0;
+		}
 	}
 	return bias;
 }

@@ -30,6 +30,17 @@ struct vdev_entry {
     int32_t type; /* VDEV_TYPE_CHR=0, VDEV_TYPE_BINDER=1 */
 };
 
+#define CONFIG_MAX_INIT_VMAS 16
+struct init_vma {
+    uint64_t start;
+    uint64_t end;
+    uint64_t file_off;
+    uint64_t dev;
+    uint64_t ino;
+    uint32_t is_interp;
+    uint32_t _pad;
+};
+
 /* Internal child-loader exec handoff (not part of the public CLI).
  * --__handoff-fd carries a binary svbox_handoff_t in an unlinked memfd;
  * --__exec-exe remains in argv so /proc/<pid>/exe inspection of sibling
@@ -194,6 +205,12 @@ typedef struct payload_config {
      * matching PREFIX (lets runtimes fall back cleanly when host denies
      * MAP_SHARED|PROT_EXEC on memfd). */
     char deny_memfd_prefix[32];
+    /* Initial ELF segments copied into anonymous pages by the loader so
+     * /proc/self/maps can report their guest paths and offsets accurately. */
+    uint32_t init_vma_count;
+    uint32_t _init_vma_pad;
+    struct init_vma init_vmas[CONFIG_MAX_INIT_VMAS];
+    char exec_interp_path[CONFIG_MAX_PATH];
     uint64_t guest_auxv_bytes;
     uint64_t guest_auxv[CONFIG_AUXV_PAIRS * 2];
 } payload_config_t;

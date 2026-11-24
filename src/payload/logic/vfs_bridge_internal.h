@@ -127,7 +127,7 @@ typedef struct {
     struct guest_msghdr message;
     /* /proc link emulation: never the first_* pair a caller may hold. */
     char proc_guest[PATH_MAX], proc_host[PATH_MAX], proc_link_host[PATH_MAX];
-    char proc_data[8192]; /* A loader-run process's kernel cmdline. */
+    char proc_data[65536]; /* A loader-run process's kernel cmdline (supports long argv). */
     char proc_candidate[PATH_MAX];
     PathFrame path_frames[BRIDGE_FRAMES];
     PathFrame *deep_frames;
@@ -190,6 +190,7 @@ long pb_proc_cmdline(Bridge *b, int flags);
 int pb_proc_link(void *opaque, char *out, const char *path, const char *component, Comparison comparison);
 long pb_proc_mounts(Bridge *b, int flags);
 long pb_proc_status(Bridge *b, int flags);
+long pb_proc_maps(Bridge *b, int flags);
 long pb_proc_cpuinfo(Bridge *b, int flags);
 long pb_proc_meminfo(Bridge *b, int flags);
 long pb_proc_readlink(Bridge *b, long a[6]);
