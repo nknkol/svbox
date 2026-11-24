@@ -79,12 +79,20 @@ static void write_end(uint32_t *lock, uint32_t *version)
     __atomic_store_n(version, (*version | 1) + 1, __ATOMIC_RELEASE);
     spin_unlock(lock);
 }
-static uint32_t read_begin(const uint32_t *version)
+static uint32_t read_begin(uint32_t *lock, uint32_t *version)
 {
-    for (;;) {
+    for (unsigned long spins = 0;; spins++) {
         uint32_t v = __atomic_load_n(version, __ATOMIC_ACQUIRE);
         if (!(v & 1))
             return v;
+        if (spins > 200000) {
+            /* A writer died holding the seqlock: advance past the odd version
+             * and release the writer lock so readers never hang forever. */
+            if (__atomic_compare_exchange_n(version, &v, v + 1, 0,
+                                            __ATOMIC_SEQ_CST, __ATOMIC_RELAXED))
+                __atomic_store_n(lock, 0, __ATOMIC_RELEASE);
+            return v + 1;
+        }
         raw_syscall(__NR_sched_yield, 0, 0, 0, 0, 0, 0);
     }
 }
@@ -171,7 +179,7 @@ int mounts_snapshot(struct mount_entry *out, int max)
     if (!t)
         return 0;
     for (;;) {
-        uint32_t v = read_begin(&t->version);
+        uint32_t v = read_begin(&t->lock, &t->version);
         uint32_t count = __atomic_load_n(&t->count, __ATOMIC_RELAXED);
         if (count > MOUNT_TABLE_MAX) count = MOUNT_TABLE_MAX;
         int n = (int)count < max ? (int)count : max;
@@ -196,7 +204,7 @@ int mounts_access(char *out, int max)
     if (!t)
         return 0;
     for (;;) {
-        uint32_t v = read_begin(&t->version);
+        uint32_t v = read_begin(&t->lock, &t->version);
         uint32_t count = __atomic_load_n(&t->count, __ATOMIC_RELAXED);
         int n = (int)(count > MOUNT_TABLE_MAX ? MOUNT_TABLE_MAX : count);
         if (n > max) n = max;
@@ -318,7 +326,7 @@ int mounts_overlay_lowers(uint32_t id, char (*out)[CONFIG_MAX_PATH], int max, ch
     if (!t || !id)
         return 0;
     for (;;) {
-        uint32_t v = read_begin(&t->version);
+        uint32_t v = read_begin(&t->lock, &t->version);
         int n = 0;
         for (int i = 0; i < MOUNT_OVERLAYS; i++) {
             if (t->overlay[i].id != id) continue;
@@ -342,7 +350,7 @@ long mounts_loop_get(int n, struct mount_loop *out)
     if (!t) return -ENODEV;
     if (n < 0 || n >= MOUNT_LOOPS) return -ENXIO;
     for (;;) {
-        uint32_t v = read_begin(&t->version);
+        uint32_t v = read_begin(&t->lock, &t->version);
         memcpy(out, &t->loop[n], sizeof(*out));
         if (read_retry(&t->version, v)) continue;
         out->file[CONFIG_MAX_PATH - 1] = 0;
@@ -732,7 +740,7 @@ static int find(const struct stat *st, struct owner_record *out)
     if (!h)
         return 0;
     for (;;) {
-        uint32_t v = read_begin(&h->version);
+        uint32_t v = read_begin(&h->lock, &h->version);
         struct owner_record *r = probe(h, st->st_dev, st->st_ino, NULL);
         int hit = r != NULL;
         if (hit) memcpy(out, r, sizeof(*out));
