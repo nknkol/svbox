@@ -32,6 +32,37 @@ static void island_pool_record(uintptr_t code_lo, size_t code_len, uintptr_t isl
 
 #include "stub_island.h"
 
+static long svc_cache_openat(const char *path, int flags, int mode)
+{
+    return raw_syscall(__NR_openat, -100 /* AT_FDCWD */, (long)path, flags, mode, 0, 0);
+}
+static long svc_cache_fstat(int fd, void *st_buf)
+{
+    return raw_syscall(__NR_fstat, fd, (long)st_buf, 0, 0, 0, 0);
+}
+static long svc_cache_ftruncate(int fd, long len)
+{
+    return raw_syscall(__NR_ftruncate, fd, len, 0, 0, 0, 0);
+}
+static long svc_cache_mmap_shared(int fd, size_t len)
+{
+    return raw_syscall(__NR_mmap, 0, (long)len, PROT_READ | PROT_WRITE, 0x01 /* MAP_SHARED */, fd, 0);
+}
+static long svc_cache_munmap(void *addr, size_t len)
+{
+    return raw_syscall(__NR_munmap, (long)addr, (long)len, 0, 0, 0, 0);
+}
+static long svc_cache_close(int fd)
+{
+    return raw_syscall(__NR_close, fd, 0, 0, 0, 0, 0);
+}
+static int svc_cache_note_protected(uintptr_t base, size_t len)
+{
+    return island_note(base, len);
+}
+
+#include "svc_cache.h"
+
 long island_mmap(uintptr_t addr, size_t len, int prot, int flags)
 {
     return raw_syscall(__NR_mmap, (long)addr, (long)len, prot, flags, -1, 0);
@@ -301,16 +332,49 @@ long install_hook_file(void *target_base, size_t target_size, void *payload_entr
 {
     if (!target_base || !payload_entry || target_size < 4)
         return 0;
+    /* Code that may already run stays executable while patched; fresh code
+     * (final prot without exec) is patched through a plain writable view. */
+    int writable = (prot & PROT_EXEC) ? PROT_READ | PROT_WRITE | PROT_EXEC : PROT_READ | PROT_WRITE;
+
+    struct svc_cache_map *cache = NULL;
+    struct svc_cache_key key;
+    int has_key = 0;
+    uint32_t cached_sites[1024];
+
+    if (!g_payload_config.isolate && g_payload_config.mount_scratch[0] && fd >= 0) {
+        cache = svc_cache_get(g_payload_config.mount_scratch);
+        if (cache && svc_cache_key_from_fd(fd, (uint64_t)file_off, target_size, &key) == 0) {
+            has_key = 1;
+            uint32_t hit_cnt = 0;
+            if (svc_cache_lookup(cache, &key, cached_sites, 1024u, &hit_cnt)) {
+                if (hit_cnt == 0)
+                    return 0;
+                return island_hook_sites((uintptr_t)target_base, target_size,
+                                         (uintptr_t)payload_entry, writable, prot,
+                                         cached_sites, hit_cnt);
+            }
+        }
+    }
+
     struct island_code code[ISLAND_CODE_MAX];
     /* Section headers do not limit control flow: only with the seccomp
      * backstop catching anything skipped may scanning trust them. */
     int ranges = g_payload_config.seccomp_backstop ?
         island_code_ranges(fd, file_off, target_size, code) : 0;
-    /* Code that may already run stays executable while patched; fresh code
-     * (final prot without exec) is patched through a plain writable view. */
-    int writable = (prot & PROT_EXEC) ? PROT_READ | PROT_WRITE | PROT_EXEC : PROT_READ | PROT_WRITE;
-    return island_hook_code((uintptr_t)target_base, target_size, (uintptr_t)payload_entry,
-                            writable, prot, code, ranges);
+    if (ranges < 0) {
+        /* Valid ELF with SHF_EXECINSTR sections elsewhere, 0 overlap here. */
+        if (has_key)
+            svc_cache_store(cache, &key, NULL, 0);
+        return 0;
+    }
+
+    size_t found_sites = 0;
+    long rc = island_hook_code_ex((uintptr_t)target_base, target_size, (uintptr_t)payload_entry,
+                                  writable, prot, code, ranges,
+                                  has_key ? cached_sites : NULL, 1024u, &found_sites);
+    if (rc >= 0 && has_key && found_sites <= 1024u)
+        svc_cache_store(cache, &key, cached_sites, found_sites);
+    return rc;
 }
 
 int install_hook(void *target_base, size_t target_size, void *payload_entry, size_t payload_size)

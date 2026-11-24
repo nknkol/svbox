@@ -100,6 +100,8 @@ payload_config_t *payload_config_of(unsigned long entry);
 
 /* hook.c */
 void hook_set_section_scan(int enabled);
+void hook_set_scratch(const char *scratch_dir);
+void hook_release_cache(void);
 long install_hook_file(void *target_base, size_t target_size, void *payload_entry, int prot,
 		       int fd, unsigned long file_off);
 extern uint64_t g_loader_islands[64][2];

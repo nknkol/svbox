@@ -381,6 +381,7 @@ void z_entry(unsigned long *sp, void (*fini)(void))
 	char **env = environment(&cfg, &opt, host_env, &envc);
 
 	unsigned long payload_entry = payload_load(opt.payload);
+	hook_set_scratch(cfg.isolate ? NULL : cfg.mount_scratch);
 	/* An isolated child reads the program and interpreter from the FDs the
 	 * broker opened (and closes them); otherwise they are opened here. */
 	load(&prog, file, isolated_child ? opt.exec_fd : -1, payload_entry);
@@ -389,6 +390,7 @@ void z_entry(unsigned long *sp, void (*fini)(void))
 		load(&interp, interp_path, isolated_child ? opt.exec_interp_fd : -1, payload_entry);
 	else if (opt.exec_interp_fd > 2)
 		z_close(opt.exec_interp_fd);
+	hook_release_cache();
 	/* fexecve: the program is loaded; this descriptor copy is not the guest's. */
 	if (!isolated_child && opt.exec_fd > 2)
 		z_close(opt.exec_fd);

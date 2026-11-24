@@ -340,6 +340,7 @@ void options_print_help(int fd)
 		"  --link-copy                    Copy file when host storage refuses hard links\n"
 		"  --emulate-mounts               Emulate mount(2)/umount2(2) via a private mount table\n"
 		"  --emulate-bpf                  Emulate Linux bpf(2) maps & pinned objects in userspace\n"
+		"  --deny-memfd-prefix PREFIX     Return ENOSYS for memfd_create() names starting with PREFIX\n"
 		"  --mount-table PATH             Join/share an emulated mount table file\n"
 		"  --mount-scratch DIR            Host directory backing emulated tmpfs mounts\n"
 		"  --owner-db PATH                Virtual uid/gid/mode ownership database\n"
@@ -552,6 +553,11 @@ void options_parse(int argc, char **argv, payload_config_t *cfg, struct loader_o
 			opt->emulate_mounts = 1;
 		} else if (is(arg, "--emulate-bpf")) {
 			cfg->emulate_bpf = 1;
+		} else if (is(arg, "--deny-memfd-prefix")) {
+			const char *v = value(argc, argv, &i);
+			if (!v[0] || z_strlen(v) >= sizeof(cfg->deny_memfd_prefix))
+				z_errx(1, "invalid value for %s", arg);
+			copy_cstr(cfg->deny_memfd_prefix, sizeof(cfg->deny_memfd_prefix), v);
 		} else if (is(arg, "--mount-table")) {
 			opt->mount_table = value(argc, argv, &i);
 		} else if (is(arg, "--mount-scratch")) {

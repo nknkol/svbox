@@ -18,6 +18,18 @@ SLOW_SYSCALL(__NR_sched_setaffinity)
 #ifdef __NR_sched_getaffinity
 SLOW_SYSCALL(__NR_sched_getaffinity)
 #endif
+#ifdef __NR_sched_setscheduler
+SLOW_SYSCALL(__NR_sched_setscheduler)
+#endif
+#ifdef __NR_sched_setparam
+SLOW_SYSCALL(__NR_sched_setparam)
+#endif
+#ifdef __NR_sched_setattr
+SLOW_SYSCALL(__NR_sched_setattr)
+#endif
+#ifdef __NR_memfd_create
+SLOW_SYSCALL(__NR_memfd_create)
+#endif
 #ifdef __NR_sysinfo
 SLOW_SYSCALL(__NR_sysinfo)
 #endif

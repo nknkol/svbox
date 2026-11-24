@@ -37,16 +37,15 @@ static long passthrough(long number, const long a[6])
 /* Reads [off, off+len) of fd into dst; the tail past end of file is zero. */
 static long read_region(int fd, unsigned char *dst, unsigned long len, long off)
 {
+    /* Fresh MAP_ANONYMOUS pages are already zero-initialized by the kernel,
+     * so we can read in large 1 MiB chunks and stop immediately on EOF. */
     while (len) {
-        unsigned long chunk = len > 4096 ? 4096 : len;
+        unsigned long chunk = len > (1024ul * 1024ul) ? (1024ul * 1024ul) : len;
         long n = raw_syscall(__NR_pread64, fd, (long)dst, (long)chunk, off, 0, 0);
         if (n < 0)
             return n;
-        if (n == 0) {
-            for (unsigned long i = 0; i < len; i++)
-                dst[i] = 0;
+        if (n == 0)
             break;
-        }
         dst += n;
         off += n;
         len -= (unsigned long)n;
@@ -97,8 +96,28 @@ static long map_exec(long number, long a[6])
         return -EACCES;
     if (number == __NR_mmap && !(a[3] & MAP_ANONYMOUS) && (int)a[4] >= 0)
         return map_exec_copy(a);
-    long ret = number == __NR_mmap ? passthrough(number, a) :
-        platform_mprotect_exec(a[0], (unsigned long)a[1], (int)a[2]);
+    long ret;
+    if (number == __NR_mmap) {
+        if ((a[3] & MAP_ANONYMOUS) && (a[2] & PROT_EXEC) && platform_is_harmonyos()) {
+            long rw_a[6] = { a[0], a[1], (a[2] & ~PROT_EXEC) | PROT_READ | PROT_WRITE, a[3], a[4], a[5] };
+            ret = passthrough(number, rw_a);
+            if (ret >= 0) {
+                long prc = platform_mprotect_exec((unsigned long)ret, (unsigned long)a[1], (int)a[2]);
+                if (prc < 0) {
+                    raw_syscall(__NR_munmap, ret, a[1], 0, 0, 0, 0);
+                    return prc;
+                }
+            }
+        } else {
+            ret = passthrough(number, a);
+        }
+        /* Fresh MAP_ANONYMOUS pages are kernel-zeroed (0 svc #0 instructions);
+         * skipping the scan avoids faulting in multi-MiB JIT arenas prematurely. */
+        if (ret >= 0 && (a[3] & MAP_ANONYMOUS))
+            return ret;
+    } else {
+        ret = platform_mprotect_exec(a[0], (unsigned long)a[1], (int)a[2]);
+    }
     if (ret < 0)
         return ret;
     unsigned long base = number == __NR_mmap ? (unsigned long)ret : (unsigned long)a[0];
@@ -165,6 +184,35 @@ long dispatch_syscall(long number, long a[6])
             return rc;
         }
         return passthrough(number, a);
+#ifdef __NR_sched_setscheduler
+    case __NR_sched_setscheduler:
+#endif
+#ifdef __NR_sched_setparam
+    case __NR_sched_setparam:
+#endif
+#ifdef __NR_sched_setattr
+    case __NR_sched_setattr:
+#endif
+    {
+        long rc = passthrough(number, a);
+        /* In an unprivileged container holding virtual CAP_SYS_NICE (23),
+         * emulate real-time scheduling elevation success when host rejects -EPERM. */
+        if (rc == -EPERM && fake_ids_capable(23 /* CAP_SYS_NICE */))
+            return 0;
+        return rc;
+    }
+#ifdef __NR_memfd_create
+    case __NR_memfd_create:
+        if (g_payload_config.deny_memfd_prefix[0] && a[0]) {
+            const char *name = (const char *)a[0];
+            const char *pfx = g_payload_config.deny_memfd_prefix;
+            size_t i = 0;
+            while (pfx[i] && name[i] == pfx[i]) i++;
+            if (!pfx[i])
+                return -ENOSYS;
+        }
+        return passthrough(number, a);
+#endif
     case __NR_sysinfo: {
         long rc = passthrough(number, a);
         if (rc == 0 && g_payload_config.mem_limit_mb > 0 && a[0]) {

@@ -190,6 +190,10 @@ typedef struct payload_config {
     int32_t sched_policy;
     int32_t trap_sigsys;
     int32_t emulate_bpf;
+    /* --deny-memfd-prefix PREFIX: return -ENOSYS for memfd_create() names
+     * matching PREFIX (lets runtimes fall back cleanly when host denies
+     * MAP_SHARED|PROT_EXEC on memfd). */
+    char deny_memfd_prefix[32];
     uint64_t guest_auxv_bytes;
     uint64_t guest_auxv[CONFIG_AUXV_PAIRS * 2];
 } payload_config_t;
