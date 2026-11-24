@@ -22,7 +22,7 @@
 #define CONFIG_MAX_PATH     256
 #define CONFIG_AUXV_PAIRS   64
 #define CONFIG_MAX_BINDS    64
-#define CONFIG_MAX_VDEVS    16
+#define CONFIG_MAX_VDEVS    32
 
 struct vdev_entry {
     char guest[CONFIG_MAX_PATH];
