@@ -384,6 +384,8 @@ void z_entry(unsigned long *sp, void (*fini)(void))
 	char **env = environment(&cfg, &opt, host_env, &envc);
 
 	unsigned long payload_entry = payload_load(opt.payload);
+	hook_set_section_scan(cfg.seccomp_backstop);
+	g_loader_no_inline_patch = (cfg.seccomp_backstop && cfg.no_inline_patch_all);
 	hook_set_scratch(cfg.isolate ? NULL : cfg.mount_scratch);
 	/* An isolated child reads the program and interpreter from the FDs the
 	 * broker opened (and closes them); otherwise they are opened here. */
@@ -425,9 +427,13 @@ void z_entry(unsigned long *sp, void (*fini)(void))
 			z_syscall(__NR_sched_setscheduler, 0, cfg.sched_policy, sp, 0, 0, 0);
 		}
 	}
-	if (cfg.seccomp_backstop)
-		backstop_install(payload_entry, !opt.child, cfg.trap_sigsys);
-	else if (cfg.trap_sigsys)
+	if (cfg.seccomp_backstop) {
+		int has_lazy_layer = 0;
+		for (int i = 0; i < cfg.lower_count; i++)
+			if (cfg.lower_image[i][0]) { has_lazy_layer = 1; break; }
+		int fast_io = (!cfg.isolate && !has_lazy_layer);
+		backstop_install(payload_entry, !opt.child, cfg.trap_sigsys, fast_io);
+	} else if (cfg.trap_sigsys)
 		sigsys_trap_install();
 	/* --cwd: the guest directory, through the root and binds (the program
 	 * and its interpreter are loaded: they were named from the root). */

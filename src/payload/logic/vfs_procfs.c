@@ -890,7 +890,9 @@ long pb_proc_maps(Bridge *b, int flags)
             skip_smaps_body = 0;
 
             struct vma_info vma;
-            if (is_self && path_len == 0 && vma_track_lookup((uintptr_t)start, (uintptr_t)end, &vma)) {
+            if (is_self &&
+                (path_len == 0 || (path_len >= 7 && !strncmp(path_start, "/memfd:", 7))) &&
+                vma_track_lookup((uintptr_t)start, (uintptr_t)end, &vma)) {
                 const char *gpath = vma.path;
                 if (!vma.is_guest_path) {
                     size_t pl = strlen(vma.path);

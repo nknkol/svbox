@@ -27,8 +27,8 @@ static long backstop_call(unsigned long entry, const unsigned long *r)
 	/* The payload entry restores every register except x0 (and the x16,
 	 * x17 and x30 a stub saves itself). */
 	__asm__ volatile("blr x17"
-			 : "+r"(x0)
-			 : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5), "r"(x8), "r"(x17)
+			 : "+r"(x0), "+r"(x8), "+r"(x17)
+			 : "r"(x1), "r"(x2), "r"(x3), "r"(x4), "r"(x5)
 			 : "x16", "x30", "memory", "cc");
 	return x0;
 }
@@ -45,7 +45,18 @@ static void loader_sigsys_handler(int sig, siginfo_t *si, void *ucontext)
 	}
 	unsigned long *regs = (unsigned long *)uc->uc_mcontext.regs;
 	if (si->si_errno == BACKSTOP_TRAP_DATA) {
-		regs[0] = (unsigned long)backstop_call(g_payload_entry, regs);
+		unsigned long nr = (unsigned)regs[8];
+		long ret = backstop_call(g_payload_entry, regs);
+		regs[0] = (unsigned long)ret;
+		/* rt_sigreturn restores current->blocked from uc->uc_sigmask,
+		 * which would otherwise undo any rt_sigprocmask executed here. */
+		if (nr == __NR_rt_sigprocmask && ret == 0 && regs[1] != 0) {
+			unsigned long cur_mask = 0;
+			if (z_syscall(__NR_rt_sigprocmask, 0, 0, (long)&cur_mask, 8) == 0) {
+				cur_mask &= ~(1ul << (31 - 1)); /* keep SIGSYS unblocked */
+				*(unsigned long *)&uc->uc_sigmask = cur_mask;
+			}
+		}
 		return;
 	}
 	if (g_trap_host_sigsys) {
@@ -55,25 +66,33 @@ static void loader_sigsys_handler(int sig, siginfo_t *si, void *ucontext)
 	die_of_signal(sig);
 }
 
-static int backstop_filter(void)
+static int backstop_filter(int fast_io)
 {
 	unsigned long ranges[2][2] = {{(unsigned long)__ehdr_start, (unsigned long)_end},
 				      {g_payload_lo, g_payload_hi}};
-	struct { unsigned short code; unsigned char jt, jf; unsigned int k; } f[64];
+	struct { unsigned short code; unsigned char jt, jf; unsigned int k; } f[128];
 	int n = 0;
 #define BPF(c, t, e, v) (f[n++] = (typeof(f[0])){(c), (t), (e), (v)})
 	/* seccomp_data: nr at 0, arch at 4, instruction_pointer at 8.
-	 * Allow pure fast-passthrough syscalls (never intercepted by payload's
-	 * slow_syscalls.inc / fd_runtime_syscalls.inc) directly in BPF so unpatched
-	 * libraries avoid SIGSYS trap storms on hot sync/time/poll/signal paths. */
+	 * Fast-path pure passthrough syscalls directly in BPF so unpatched
+	 * libraries avoid SIGSYS trap overhead on hot sync/time/poll/I/O paths,
+	 * and return -ENOSYS directly for rseq/clone3 so libc falls back cleanly. */
 	BPF(0x20, 0, 0, 0); /* ld nr */
+	static const unsigned enosys_nrs[] = {
+		293, /* rseq */
+		435, /* clone3 */
+	};
+	int enosys_start = n;
+	for (unsigned i = 0; i < sizeof(enosys_nrs) / sizeof(enosys_nrs[0]); i++)
+		BPF(0x15, 0, 0, enosys_nrs[i]); /* jeq -> enosys (patched below) */
+	int enosys_end = n;
+
 	static const unsigned allowed[] = {
 		139, /* rt_sigreturn */
 		93,  /* exit */
 		94,  /* exit_group */
 		128, /* restart_syscall */
 		220, /* clone */
-		435, /* clone3 */
 		98,  /* futex */
 		101, /* nanosleep */
 		113, /* clock_gettime */
@@ -102,9 +121,24 @@ static int backstop_filter(void)
 		214, /* brk */
 		260, /* wait4 */
 	};
+	static const unsigned io_allowed[] = {
+		62,  /* lseek */
+		63,  /* read */
+		64,  /* write */
+		65,  /* readv */
+		66,  /* writev */
+		67,  /* pread64 */
+		68,  /* pwrite64 */
+	};
+	int allow_start = n;
 	for (unsigned i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++)
 		BPF(0x15, 0, 0, allowed[i]); /* jeq -> allow (patched below) */
-	int nr_checks = n;
+	if (fast_io) {
+		for (unsigned i = 0; i < sizeof(io_allowed) / sizeof(io_allowed[0]); i++)
+			BPF(0x15, 0, 0, io_allowed[i]); /* jeq -> allow (patched below) */
+	}
+	int allow_end = n;
+
 	for (int r = 0; r < 2; r++) {
 		if ((ranges[r][0] >> 32) != ((ranges[r][1] - 1) >> 32))
 			return -1; /* A range across a 4 GiB boundary: unsupported. */
@@ -116,9 +150,14 @@ static int backstop_filter(void)
 		BPF(0x06, 0, 0, 0x7fff0000u);                       /* ret ALLOW */
 	}
 	BPF(0x06, 0, 0, 0x00030000u | BACKSTOP_TRAP_DATA);          /* ret TRAP */
+	int allow_idx = n;
 	BPF(0x06, 0, 0, 0x7fff0000u);                               /* ret ALLOW */
-	for (int i = 1; i < nr_checks; i++)
-		f[i].jt = (unsigned char)(n - 1 - (i + 1));
+	int enosys_idx = n;
+	BPF(0x06, 0, 0, 0x00050000u | 38u);                         /* ret ERRNO(ENOSYS) */
+	for (int i = enosys_start; i < enosys_end; i++)
+		f[i].jt = (unsigned char)(enosys_idx - i - 1);
+	for (int i = allow_start; i < allow_end; i++)
+		f[i].jt = (unsigned char)(allow_idx - i - 1);
 #undef BPF
 	struct { unsigned short len; void *filter; } prog = {(unsigned short)n, f};
 	if (z_syscall(__NR_prctl, 38 /* PR_SET_NO_NEW_PRIVS */, 1, 0, 0, 0) < 0)
@@ -128,7 +167,8 @@ static int backstop_filter(void)
 
 /* The filter survives exec, so only the initial loader installs it; every
  * loader installs the handler. */
-void backstop_install(unsigned long payload_entry, int with_filter, int trap_host_sigsys)
+void backstop_install(unsigned long payload_entry, int with_filter,
+		      int trap_host_sigsys, int fast_io)
 {
 	g_payload_entry = payload_entry;
 	g_trap_host_sigsys = trap_host_sigsys;
@@ -138,7 +178,7 @@ void backstop_install(unsigned long payload_entry, int with_filter, int trap_hos
 	 * itself trap, and rt_sigreturn runs from our loader's allowed range. */
 	if (sigsys_install_handler(loader_sigsys_handler) < 0)
 		z_errx(1, "seccomp backstop: cannot install SIGSYS handler");
-	if (with_filter && backstop_filter() < 0)
+	if (with_filter && backstop_filter(fast_io) < 0)
 		z_errx(1, "seccomp backstop: cannot install the filter");
 }
 

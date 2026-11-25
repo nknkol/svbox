@@ -53,6 +53,31 @@ long syscall_dispatcher(long sys_no, pt_regs *regs)
         return -ENOSYS; /* Untranslated newer path calls (syscall_nums.h). */
     if (integrity_check(sys_no, a, &ret))
         return ret;
+    /* Destructive madvise on a thread's own stack (e.g. reclaiming unused
+     * stack pages with a 1-page margin below guest SP) can overlap our active
+     * pt_regs and SIGSYS rt_sigframe (~5 KiB on AArch64), zeroing the return
+     * context. Preserve [page_down(regs), page_up(regs + 12 KiB)). */
+    if (sys_no == __NR_madvise &&
+        (a[2] == 4 /* MADV_DONTNEED */ || a[2] == 8 /* MADV_FREE */ ||
+         a[2] == 9 /* MADV_REMOVE */ || a[2] == 24 /* MADV_DONTNEED_LOCKED */) &&
+        a[1] > 0) {
+        uintptr_t lo = (uintptr_t)a[0];
+        uintptr_t hi = lo + (uintptr_t)a[1];
+        uintptr_t guard_lo = (uintptr_t)regs & ~(uintptr_t)4095;
+        uintptr_t guard_hi = ((uintptr_t)regs + 12288u + 4095u) & ~(uintptr_t)4095;
+        if (hi > lo && lo < guard_hi && hi > guard_lo) {
+            long rc = 0;
+            if (lo < guard_lo) {
+                long sub[6] = { (long)lo, (long)(guard_lo - lo), a[2], a[3], a[4], a[5] };
+                rc = DISPATCH(__NR_madvise, sub);
+            }
+            if (rc == 0 && hi > guard_hi) {
+                long sub[6] = { (long)guard_hi, (long)(hi - guard_hi), a[2], a[3], a[4], a[5] };
+                rc = DISPATCH(__NR_madvise, sub);
+            }
+            return rc;
+        }
+    }
     int named = sys_no == __NR_accept || sys_no == __NR_accept4 ||
         sys_no == __NR_getsockname || sys_no == __NR_getpeername;
     unsigned capacity = named && a[1] && a[2] ? *(unsigned *)a[2] : 0;

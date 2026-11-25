@@ -131,6 +131,8 @@ static long wrapped_sigaction(const long a[6])
     if (a[1]) {
         struct k_sigaction_rec new_act;
         memcpy(&new_act, (const void *)a[1], sizeof(new_act));
+        if (g_payload_config.seccomp_backstop || g_payload_config.trap_sigsys)
+            new_act.sa_mask &= ~(1ul << (SIGSYS - 1));
         int want_wrap = (new_act.sa_handler > 1ul && !(new_act.sa_flags & SA_ONSTACK_));
         if (want_wrap) {
             /* Publish handler before installing trampoline so a concurrent
@@ -144,7 +146,7 @@ static long wrapped_sigaction(const long a[6])
             if (rc < 0)
                 __atomic_store_n(&g_sig_wrapped[sig], was_wrapped, __ATOMIC_RELEASE);
         } else {
-            rc = raw_syscall(__NR_rt_sigaction, sig, a[1], (long)&host_old, 8, 0, 0);
+            rc = raw_syscall(__NR_rt_sigaction, sig, (long)&new_act, (long)&host_old, 8, 0, 0);
             if (rc == 0)
                 __atomic_store_n(&g_sig_wrapped[sig], 0, __ATOMIC_RELEASE);
         }
@@ -177,6 +179,17 @@ int integrity_check(long number, const long a[6], long *result)
     if (number == __NR_rt_sigaction && !is_sync_fault_sig((int)a[0])) {
         *result = wrapped_sigaction(a);
         return 1;
+    }
+    if ((g_payload_config.seccomp_backstop || g_payload_config.trap_sigsys) &&
+        number == __NR_rt_sigaction && a[1] && a[3] == 8) {
+        struct k_sigaction_rec na;
+        memcpy(&na, (const void *)a[1], sizeof(na));
+        unsigned long sigsys_bit = 1ul << (SIGSYS - 1);
+        if (na.sa_mask & sigsys_bit) {
+            na.sa_mask &= ~sigsys_bit;
+            *result = raw_syscall(__NR_rt_sigaction, a[0], (long)&na, a[2], a[3], 0, 0);
+            return 1;
+        }
     }
     if ((g_payload_config.seccomp_backstop || g_payload_config.trap_sigsys) &&
         number == __NR_rt_sigprocmask && a[1] && a[3] == 8 &&

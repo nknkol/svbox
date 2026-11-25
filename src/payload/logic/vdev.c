@@ -15,6 +15,7 @@
 #include "syscall_nums.h"
 #include "config.h"
 #include "fake_ids.h"
+#include "hook_runtime.h"
 #include "vdev.h"
 #include "vdev_proto.h"
 #include "net_proto.h"
@@ -1359,6 +1360,15 @@ int vdev_fd_call(long number, long a[6], long *out)
         }
         slot->map_base = (uint64_t)addr;
         slot->map_len = len;
+        if (slot->vdev_idx >= 0 && slot->vdev_idx < g_payload_config.vdev_count) {
+            const struct vdev_entry *ve = &g_payload_config.vdevs[slot->vdev_idx];
+            uint64_t rdev = ((uint64_t)(slot->major & 0xfffu) << 8) |
+                            ((uint64_t)(slot->minor & 0xffu)) |
+                            ((uint64_t)(slot->minor & ~0xffu) << 12);
+            vma_track_add_guest((uintptr_t)addr, (size_t)len, (uint64_t)a[5],
+                                rdev, (uint64_t)(0x50000u + (uint32_t)slot->vdev_idx),
+                                ve->guest);
+        }
         int rpc_fd = get_thread_rpc_fd(slot);
         if (rpc_fd >= 0) {
             struct vdev_mmap_req mreq = { (uint64_t)addr, len };

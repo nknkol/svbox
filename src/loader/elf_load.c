@@ -12,6 +12,7 @@
 
 extern unsigned char _binary_payload_payload_bin_start[];
 extern unsigned char _binary_payload_payload_bin_end[];
+int g_loader_no_inline_patch = 0;
 
 int platform_is_harmonyos(void)
 {
@@ -162,7 +163,7 @@ unsigned long elf_load_image(int fd, const Elf_Ehdr *ehdr, const Elf_Phdr *phdr,
 		if (p == (void *)-1 || z_lseek(fd, (off_t)ph->p_offset, SEEK_SET) < 0 ||
 		    z_read(fd, p + off, ph->p_filesz) != (ssize_t)ph->p_filesz)
 			z_errx(1, "can't load ELF %s", file);
-		if ((prot & PROT_EXEC) &&
+		if (!g_loader_no_inline_patch && (prot & PROT_EXEC) &&
 		    install_hook_file(p + off, ph->p_filesz, (void *)payload_entry,
 				      PROT_READ | PROT_WRITE, fd, ph->p_offset) < 0)
 			z_errx(1, "cannot place syscall stubs within branch range");

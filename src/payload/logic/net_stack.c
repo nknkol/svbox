@@ -19,6 +19,7 @@
 #include "syscall_nums.h"
 #include "config.h"
 #include "fake_ids.h"
+#include "hook_runtime.h"
 #include "net_view.h"
 #include "net_proto.h"
 #include "net_stack.h"
@@ -326,6 +327,7 @@ const struct sv_net_state *net_stack_state(void)
             if (addr >= 0 && (unsigned long)addr < (unsigned long)-4095) {
                 const struct sv_net_state *st = (const struct sv_net_state *)addr;
                 if (st->magic == SV_NET_STATE_MAGIC && st->version == SV_NET_STATE_VERSION) {
+                    hook_note_internal((uintptr_t)addr, sz);
                     __atomic_store_n(&g_net_state, st, __ATOMIC_RELEASE);
                     cur = st;
                 } else {

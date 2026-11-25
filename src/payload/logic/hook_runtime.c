@@ -134,6 +134,8 @@ struct vma_slot {
     uint64_t  file_off;
     uint64_t  dev;
     uint64_t  ino;
+    uint8_t   is_guest_path;
+    uint8_t   is_exec_copy;
     char      host_path[256];
 };
 
@@ -247,7 +249,44 @@ void vma_track_add(uintptr_t start, size_t len, uint64_t file_off, int fd)
         g_vmas[slot].file_off = file_off;
         g_vmas[slot].dev = dev;
         g_vmas[slot].ino = ino;
+        g_vmas[slot].is_guest_path = 0;
+        g_vmas[slot].is_exec_copy = 1;
         __builtin_memcpy(g_vmas[slot].host_path, hpath, (size_t)rlen + 1);
+    }
+    vma_unlock();
+}
+
+void vma_track_add_guest(uintptr_t start, size_t len, uint64_t file_off,
+                         uint64_t dev, uint64_t ino, const char *guest_path)
+{
+    if (!len || !guest_path || !guest_path[0])
+        return;
+    uintptr_t u_lo = start & ~(ISLAND_PAGE - 1);
+    uintptr_t u_hi = (start + len + ISLAND_PAGE - 1) & ~(ISLAND_PAGE - 1);
+    if (u_hi <= u_lo)
+        return;
+    size_t plen = 0;
+    while (guest_path[plen] && plen + 1 < sizeof(g_vmas[0].host_path))
+        plen++;
+
+    vma_lock();
+    vma_remove_locked(u_lo, u_hi);
+    unsigned slot = VMA_TRACK_MAX;
+    for (unsigned i = 0; i < g_vma_hi; i++) {
+        if (!g_vmas[i].end) { slot = i; break; }
+    }
+    if (slot == VMA_TRACK_MAX && g_vma_hi < VMA_TRACK_MAX)
+        slot = g_vma_hi++;
+    if (slot < VMA_TRACK_MAX) {
+        g_vmas[slot].start = u_lo;
+        g_vmas[slot].end = u_hi;
+        g_vmas[slot].file_off = file_off;
+        g_vmas[slot].dev = dev;
+        g_vmas[slot].ino = ino;
+        g_vmas[slot].is_guest_path = 1;
+        g_vmas[slot].is_exec_copy = 0;
+        __builtin_memcpy(g_vmas[slot].host_path, guest_path, plen);
+        g_vmas[slot].host_path[plen] = '\0';
     }
     vma_unlock();
 }
@@ -267,7 +306,7 @@ int vma_track_lookup(uintptr_t start, uintptr_t end, struct vma_info *out)
                 out->file_off = g_vmas[i].file_off;
                 out->dev = g_vmas[i].dev;
                 out->ino = g_vmas[i].ino;
-                out->is_guest_path = 0;
+                out->is_guest_path = g_vmas[i].is_guest_path;
                 __builtin_memcpy(out->path, g_vmas[i].host_path, sizeof(out->path));
                 vma_unlock();
                 return 1;
@@ -315,7 +354,7 @@ int vma_track_next_overlap(uintptr_t start, uintptr_t end,
         unsigned hi = g_vma_hi;
         for (unsigned i = 0; i < hi; i++) {
             uintptr_t s = g_vmas[i].start, e = g_vmas[i].end;
-            if (!e || e <= start || s >= end)
+            if (!e || !g_vmas[i].is_exec_copy || e <= start || s >= end)
                 continue;
             if (!found || s < best_lo || (s == best_lo && e > best_hi)) {
                 best_lo = s;

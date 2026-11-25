@@ -95,6 +95,7 @@ extern unsigned long g_payload_lo, g_payload_hi;
 extern struct init_vma g_loader_vmas[CONFIG_MAX_INIT_VMAS];
 extern unsigned g_loader_vma_count;
 extern unsigned g_loader_vma_is_interp;
+extern int g_loader_no_inline_patch;
 void elf_read_headers(int fd, Elf_Ehdr *ehdr, Elf_Phdr *phdr, const char *file);
 unsigned long elf_load_image(int fd, const Elf_Ehdr *ehdr, const Elf_Phdr *phdr,
 			     unsigned long payload_entry, const char *file);
@@ -126,7 +127,8 @@ void guest_filter_install(uint32_t device_mask);
 void guest_filter_dump(uint32_t device_mask);
 
 /* backstop.c */
-void backstop_install(unsigned long payload_entry, int with_filter, int trap_host_sigsys);
+void backstop_install(unsigned long payload_entry, int with_filter,
+		      int trap_host_sigsys, int fast_io);
 
 int platform_is_harmonyos(void);
 int mprotect_exec(void *addr, size_t len, int prot);
