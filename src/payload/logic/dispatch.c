@@ -179,6 +179,65 @@ static long map_exec(long number, long a[6])
     return number == __NR_mmap ? ret : 0;
 }
 
+/* Wrap a guest SECCOMP_SET_MODE_FILTER program with a 7-instruction prefix
+ * that returns SECCOMP_RET_ALLOW for syscalls issued by svbox's own loader
+ * and payload images ([LOADER_FIXED_BASE, +16 MiB) and [PAYLOAD_FIXED_BASE,
+ * +16 MiB)), so guest seccomp-BPF filters work natively without blocking
+ * svbox's internal VFS, broker, or PR_HM_JIT syscalls. */
+struct svbox_sock_filter {
+    uint16_t code;
+    uint8_t jt;
+    uint8_t jf;
+    uint32_t k;
+};
+struct svbox_sock_fprog {
+    uint16_t len;
+    struct svbox_sock_filter *filter;
+};
+
+static long install_wrapped_seccomp(long number, const long a[6], unsigned long fprog_addr)
+{
+    if (!fprog_addr)
+        return passthrough(number, a);
+    const struct svbox_sock_fprog *up = (const struct svbox_sock_fprog *)fprog_addr;
+    uint16_t ulen = up->len;
+    const struct svbox_sock_filter *ufilt = up->filter;
+    if (!ufilt || ulen == 0 || ulen > 4089u)
+        return passthrough(number, a);
+    enum { PREFIX_LEN = 7 };
+    size_t total = (size_t)ulen + PREFIX_LEN;
+    size_t bytes = total * sizeof(struct svbox_sock_filter);
+    struct svbox_sock_filter stack_buf[512];
+    struct svbox_sock_filter *buf = stack_buf;
+    int used_mmap = 0;
+    if (total > 512) {
+        long m = raw_syscall(__NR_mmap, 0, (long)bytes, PROT_READ | PROT_WRITE,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (m < 0)
+            return -ENOMEM;
+        buf = (struct svbox_sock_filter *)m;
+        used_mmap = 1;
+    }
+    static const struct svbox_sock_filter prefix[PREFIX_LEN] = {
+        { 0x20, 0, 0, 12u },                                          /* ld ip_hi */
+        { 0x15, 0, 5, (uint32_t)(LOADER_FIXED_BASE >> 32) },          /* != 0x3f -> guest[0] */
+        { 0x20, 0, 0, 8u },                                           /* ld ip_lo */
+        { 0x35, 0, 2, 0x01000000u },                                  /* < 16 MiB (loader) -> ALLOW */
+        { 0x35, 0, 2, (uint32_t)(PAYLOAD_FIXED_BASE & 0xffffffffu) }, /* < payload -> guest[0] */
+        { 0x35, 1, 0, (uint32_t)((PAYLOAD_FIXED_BASE & 0xffffffffu) + 0x01000000u) }, /* >= end -> guest[0] */
+        { 0x06, 0, 0, 0x7fff0000u },                                  /* ret SECCOMP_RET_ALLOW */
+    };
+    memcpy(buf, prefix, sizeof(prefix));
+    memcpy(buf + PREFIX_LEN, ufilt, (size_t)ulen * sizeof(struct svbox_sock_filter));
+    struct svbox_sock_fprog wp = { (uint16_t)total, buf };
+    long wa[6] = { a[0], a[1], a[2], a[3], a[4], a[5] };
+    wa[2] = (long)&wp;
+    long rc = passthrough(number, wa);
+    if (used_mmap)
+        raw_syscall(__NR_munmap, (long)buf, (long)bytes, 0, 0, 0, 0);
+    return rc;
+}
+
 long dispatch_syscall(long number, long a[6])
 {
     if (number == __NR_prctl && a[0] == PR_GET_AUXV)
@@ -364,12 +423,8 @@ long dispatch_syscall(long number, long a[6])
         if (g_payload_config.seccomp_backstop || g_payload_config.trap_sigsys) {
             if (a[0] == 21 /* PR_GET_SECCOMP */)
                 return 0;
-            /* A guest seccomp-BPF filter stacked in the host kernel would also
-             * intercept svbox's own in-process payload syscalls (VFS, broker,
-             * platform_mprotect_exec) and conflict with svbox's SIGSYS handler.
-             * Report seccomp filter mode unavailable (same as CONFIG_SECCOMP_FILTER=n). */
-            if (a[0] == 22 /* PR_SET_SECCOMP */)
-                return -EINVAL;
+            if (a[0] == 22 /* PR_SET_SECCOMP */ && a[1] == 2 /* SECCOMP_MODE_FILTER */)
+                return install_wrapped_seccomp(number, a, (unsigned long)a[2]);
             if (a[0] == 38 /* PR_SET_NO_NEW_PRIVS */ && a[1] == 1 && !a[2] && !a[3] && !a[4]) {
                 guest_nnp = 1;
                 return 0;
@@ -381,8 +436,8 @@ long dispatch_syscall(long number, long a[6])
     }
 #ifdef __NR_seccomp
     case __NR_seccomp:
-        if (g_payload_config.seccomp_backstop || g_payload_config.trap_sigsys)
-            return -ENOSYS;
+        if (a[0] == 1 /* SECCOMP_SET_MODE_FILTER */)
+            return install_wrapped_seccomp(number, a, (unsigned long)a[2]);
         return passthrough(number, a);
 #endif
     /* glibc falls back from both; the sandbox kills rseq with SIGSYS. */
