@@ -204,6 +204,8 @@ static int host_lookup(void *opaque, Finality finality, unsigned int depth,
         return IS_FINAL(finality) ? 0 : (int)ret;
 
 have_stat:;
+    if ((st.st_mode & S_IFMT) == S_IFREG && owners_is_symlink(&st))
+        st.st_mode = (st.st_mode & ~S_IFMT) | S_IFLNK | 0777;
     unsigned int type = st.st_mode & S_IFMT;
     if (!IS_FINAL(finality) && type != S_IFDIR && type != S_IFLNK)
         return -ENOTDIR;
@@ -230,8 +232,24 @@ int pb_host_readlink(void *opaque, const char *path, char *out, size_t size)
         if (cached != -EAGAIN)
             return cached;
     }
-    return (int)raw_syscall(__NR_readlinkat, AT_FDCWD, (long)path, (long)out,
-                           size, 0, 0);
+    long rc = raw_syscall(__NR_readlinkat, AT_FDCWD, (long)path, (long)out,
+                          size, 0, 0);
+    if (rc == -EINVAL && owners_has_symlinks()) {
+        struct stat st;
+        if (raw_syscall(__NR_newfstatat, AT_FDCWD, (long)path, (long)&st,
+                        AT_SYMLINK_NOFOLLOW, 0, 0) == 0 &&
+            (st.st_mode & S_IFMT) == S_IFREG && owners_is_symlink(&st)) {
+            long fd = raw_syscall(__NR_openat, AT_FDCWD, (long)path,
+                                  O_RDONLY | O_CLOEXEC, 0, 0, 0);
+            if (fd >= 0) {
+                long n = raw_syscall(__NR_read, fd, (long)out, size, 0, 0, 0);
+                raw_syscall(__NR_close, fd, 0, 0, 0, 0, 0);
+                if (n >= 0)
+                    return (int)n;
+            }
+        }
+    }
+    return (int)rc;
 }
 
 int pb_guest_link_target(Bridge *b, char *target)

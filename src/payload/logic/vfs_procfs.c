@@ -4,7 +4,12 @@
  * generated from the R4 table. */
 #include "vfs_bridge_internal.h"
 #include "hook_runtime.h"
+#include "integrity.h"
 #include "vdev.h"
+
+static int parse_hex_u64(const char **pp, const char *end, uint64_t *out);
+static size_t append_hex_u64(char *dst, size_t cap, size_t pos, uint64_t v, int min_digits);
+static long write_all_fd(int fd, const char *buf, size_t len);
 
 static long current_id(long number)
 {
@@ -395,20 +400,25 @@ long pb_proc_status(Bridge *b, int flags)
         size_t line_len = (nl < total) ? (nl - pos + 1) : (nl - pos);
         int is_uid = (line_len >= 4 && !strncmp(b->proc_data + pos, "Uid:", 4));
         int is_gid = (!is_uid && line_len >= 4 && !strncmp(b->proc_data + pos, "Gid:", 4));
+        int is_groups = (!is_uid && !is_gid && line_len >= 7 && !strncmp(b->proc_data + pos, "Groups:", 7));
         int hide_sec = (g_payload_config.seccomp_backstop || g_payload_config.trap_sigsys);
-        int is_seccomp = (!is_uid && !is_gid && hide_sec &&
+        int is_sigcgt = (!is_uid && !is_gid && !is_groups && hide_sec &&
+                         line_len >= 7 && !strncmp(b->proc_data + pos, "SigCgt:", 7));
+        int is_sigign = (!is_uid && !is_gid && !is_groups && !is_sigcgt && hide_sec &&
+                         line_len >= 7 && !strncmp(b->proc_data + pos, "SigIgn:", 7));
+        int is_seccomp = (!is_uid && !is_gid && !is_groups && !is_sigcgt && !is_sigign && hide_sec &&
                           line_len >= 8 && !strncmp(b->proc_data + pos, "Seccomp:", 8));
-        int is_secfilt = (!is_uid && !is_gid && !is_seccomp && hide_sec &&
+        int is_secfilt = (!is_uid && !is_gid && !is_groups && !is_sigcgt && !is_sigign && !is_seccomp && hide_sec &&
                           line_len >= 16 && !strncmp(b->proc_data + pos, "Seccomp_filters:", 16));
-        int is_nnp = (!is_uid && !is_gid && !is_seccomp && !is_secfilt && hide_sec &&
+        int is_nnp = (!is_uid && !is_gid && !is_groups && !is_sigcgt && !is_sigign && !is_seccomp && !is_secfilt && hide_sec &&
                       line_len >= 11 && !strncmp(b->proc_data + pos, "NoNewPrivs:", 11));
-        int is_cap_zero = (!is_uid && !is_gid && !is_seccomp && !is_secfilt && !is_nnp &&
+        int is_cap_zero = (!is_uid && !is_gid && !is_groups && !is_sigcgt && !is_sigign && !is_seccomp && !is_secfilt && !is_nnp &&
                            ids[1] != 0 && line_len >= 7 &&
                            (!strncmp(b->proc_data + pos, "CapInh:", 7) ||
                             !strncmp(b->proc_data + pos, "CapPrm:", 7) ||
                             !strncmp(b->proc_data + pos, "CapEff:", 7) ||
                             !strncmp(b->proc_data + pos, "CapAmb:", 7)));
-        if (is_uid || is_gid || is_seccomp || is_secfilt || is_nnp || is_cap_zero) {
+        if (is_uid || is_gid || is_groups || is_sigcgt || is_sigign || is_seccomp || is_secfilt || is_nnp || is_cap_zero) {
             if (pos > span_start) {
                 size_t wdone = 0, wlen = pos - span_start;
                 while (wdone < wlen) {
@@ -419,12 +429,50 @@ long pb_proc_status(Bridge *b, int flags)
                 }
             }
             if (rc >= 0) {
-                char line[128];
+                char line[256];
                 size_t llen = 0;
                 if (is_uid || is_gid) {
                     llen = format_id_line(line, sizeof(line),
                                           is_uid ? "Uid:" : "Gid:",
                                           is_uid ? ids : (ids + 4));
+                } else if (is_groups) {
+                    const char *lbl = "Groups:\t";
+                    llen = strlen(lbl);
+                    memcpy(line, lbl, llen);
+                    if (pid == self_pid) {
+                        uint32_t grps[32];
+                        int ng = fake_ids_groups(grps);
+                        for (int gi = 0; gi < ng && llen + 12 < sizeof(line); gi++) {
+                            if (gi > 0) line[llen++] = ' ';
+                            llen = append_u32(line, sizeof(line) - 2, llen, grps[gi]);
+                        }
+                    } else {
+                        llen = append_u32(line, sizeof(line) - 2, llen, ids[4]);
+                    }
+                    line[llen++] = '\n';
+                } else if (is_sigcgt || is_sigign) {
+                    const char *lp = b->proc_data + pos + 7;
+                    const char *lend = b->proc_data + pos + line_len;
+                    while (lp < lend && (*lp == ' ' || *lp == '\t')) lp++;
+                    uint64_t mask = 0;
+                    if (!parse_hex_u64(&lp, lend, &mask)) {
+                        llen = line_len < sizeof(line) ? line_len : sizeof(line);
+                        memcpy(line, b->proc_data + pos, llen);
+                    } else {
+                        int ss_state = (pid == self_pid) ? integrity_guest_sigsys_state() : 0;
+                        const uint64_t sigsys_bit = 1ull << 30; /* SIGSYS (31) */
+                        if (is_sigcgt) {
+                            if (ss_state != 2) mask &= ~sigsys_bit;
+                        } else {
+                            if (ss_state == 1) mask |= sigsys_bit;
+                            else if (ss_state == 0) mask &= ~sigsys_bit;
+                        }
+                        const char *lbl = is_sigcgt ? "SigCgt:\t" : "SigIgn:\t";
+                        llen = strlen(lbl);
+                        memcpy(line, lbl, llen);
+                        llen = append_hex_u64(line, sizeof(line) - 2, llen, mask, 16);
+                        line[llen++] = '\n';
+                    }
                 } else if (is_seccomp) {
                     const char *s = "Seccomp:\t0\n";
                     llen = strlen(s);
@@ -471,6 +519,135 @@ long pb_proc_status(Bridge *b, int flags)
         return rc;
     }
     return mfd;
+}
+
+/* Helper: parse "/proc/<pid|self|thread-self>[/task/<tid>]" prefix and return
+ * pointer to the trailing subpath (starting with '/'), or NULL on mismatch. */
+static const char *parse_proc_pid_subpath(const char *guest, long self_pid, long *out_pid)
+{
+    if (compare_paths("/proc", guest) != PATH1_IS_PREFIX)
+        return NULL;
+    const char *cursor = guest + strlen("/proc/");
+    long pid = 0;
+    if (!strncmp(cursor, "self/", 5) || !strncmp(cursor, "thread-self/", 12)) {
+        pid = self_pid;
+        cursor = strchr(cursor, '/');
+    } else {
+        if (*cursor < '1' || *cursor > '9') return NULL;
+        while (*cursor >= '0' && *cursor <= '9') pid = pid * 10 + (*cursor++ - '0');
+    }
+    if (!strncmp(cursor, "/task/", 6)) {
+        cursor += 6;
+        if (*cursor < '1' || *cursor > '9') return NULL;
+        while (*cursor >= '0' && *cursor <= '9') cursor++;
+    }
+    if (*cursor != '/') return NULL;
+    *out_pid = pid;
+    return cursor;
+}
+
+/* Container cgroup-namespace view: strip host cgroup paths in /proc/<pid>/cgroup
+ * so each hierarchy reports container-relative root ("/") instead of host paths. */
+long pb_proc_cgroup(Bridge *b, int flags)
+{
+    long self_pid = raw_syscall(__NR_getpid, 0, 0, 0, 0, 0, 0);
+    long pid = 0;
+    const char *sub = parse_proc_pid_subpath(b->guest, self_pid, &pid);
+    if (!sub || strcmp(sub, "/cgroup") != 0)
+        return -ENOENT;
+
+    long kfd = raw_syscall(__NR_openat, AT_FDCWD, (long)b->host, O_RDONLY | O_CLOEXEC, 0, 0, 0);
+    if (kfd < 0) return kfd;
+    size_t total = 0;
+    while (total < sizeof(b->proc_data)) {
+        long r = raw_syscall(__NR_read, kfd, (long)(b->proc_data + total),
+                             (long)(sizeof(b->proc_data) - total), 0, 0, 0);
+        if (r <= 0) break;
+        total += (size_t)r;
+    }
+    raw_syscall(__NR_close, kfd, 0, 0, 0, 0, 0);
+
+    long mfd = raw_syscall(__NR_memfd_create, (long)"cgroup",
+                           (flags & O_CLOEXEC) ? 1 : 0, 0, 0, 0, 0);
+    if (mfd < 0) return mfd;
+
+    long rc = 0;
+    size_t pos = 0;
+    while (pos < total && rc >= 0) {
+        size_t nl = pos;
+        while (nl < total && b->proc_data[nl] != '\n') nl++;
+        size_t llen = (nl < total) ? (nl - pos + 1) : (nl - pos);
+        const char *lp = b->proc_data + pos;
+        int colons = 0;
+        size_t second_colon = 0;
+        for (size_t k = 0; k < llen; k++) {
+            if (lp[k] == ':') {
+                colons++;
+                if (colons == 2) { second_colon = k; break; }
+            }
+        }
+        if (colons == 2) {
+            rc = write_all_fd((int)mfd, lp, second_colon + 1);
+            if (rc >= 0) rc = write_all_fd((int)mfd, "/\n", 2);
+        } else {
+            rc = write_all_fd((int)mfd, lp, llen);
+        }
+        pos += llen;
+    }
+    if (rc >= 0) rc = raw_syscall(__NR_lseek, mfd, 0, 0, 0, 0, 0);
+    if (rc < 0) {
+        raw_syscall(__NR_close, mfd, 0, 0, 0, 0, 0);
+        return rc;
+    }
+    return mfd;
+}
+
+/* Container /proc/<self>/environ: return the sanitized initial container
+ * environment instead of the host execve environment of the loader. */
+long pb_proc_environ(Bridge *b, int flags)
+{
+    if (!g_payload_config.init_env_addr)
+        return -ENOENT;
+    long self_pid = raw_syscall(__NR_getpid, 0, 0, 0, 0, 0, 0);
+    long pid = 0;
+    const char *sub = parse_proc_pid_subpath(b->guest, self_pid, &pid);
+    if (!sub || strcmp(sub, "/environ") != 0 || pid != self_pid)
+        return -ENOENT;
+
+    long mfd = raw_syscall(__NR_memfd_create, (long)"environ",
+                           (flags & O_CLOEXEC) ? 1 : 0, 0, 0, 0, 0);
+    if (mfd < 0) return mfd;
+    long rc = 0;
+    if (g_payload_config.init_env_addr > 1 && g_payload_config.init_env_size > 0) {
+        rc = write_all_fd((int)mfd,
+                          (const char *)(uintptr_t)g_payload_config.init_env_addr,
+                          (size_t)g_payload_config.init_env_size);
+    }
+    if (rc >= 0) rc = raw_syscall(__NR_lseek, mfd, 0, 0, 0, 0, 0);
+    if (rc < 0) {
+        raw_syscall(__NR_close, mfd, 0, 0, 0, 0, 0);
+        return rc;
+    }
+    return mfd;
+}
+
+/* Container LSM isolation: when running in a container without an active
+ * LSM namespace, do not expose the host's /proc/<pid>/attr/<context> label. */
+long pb_proc_attr(Bridge *b, int flags)
+{
+    (void)flags;
+    long self_pid = raw_syscall(__NR_getpid, 0, 0, 0, 0, 0, 0);
+    long pid = 0;
+    const char *sub = parse_proc_pid_subpath(b->guest, self_pid, &pid);
+    if (!sub || strncmp(sub, "/attr/", 6) != 0)
+        return -ENOENT;
+    const char *attr = sub + 6;
+    if (!strcmp(attr, "current") || !strcmp(attr, "prev") ||
+        !strcmp(attr, "exec") || !strcmp(attr, "fscreate") ||
+        !strcmp(attr, "keycreate") || !strcmp(attr, "sockcreate") ||
+        !strncmp(attr, "smack/", 6) || !strncmp(attr, "apparmor/", 9))
+        return -EINVAL;
+    return -ENOENT;
 }
 
 
@@ -1287,6 +1464,22 @@ void proot_vfd_fix_fstat(int fd, void *stat_buf)
     st->st_mode = (st->st_mode & ~07777u) | 0444u;
     st->st_size = 0;
     st->st_blocks = 0;
+}
+
+int proot_vfd_is_procfs(int fd)
+{
+    if (fd < 0 || !__atomic_load_n(&g_vfd_active, __ATOMIC_ACQUIRE))
+        return 0;
+    int is_proc = 0;
+    vfd_lock();
+    for (unsigned i = 0; i < VFD_MAX; i++) {
+        if (g_vfds[i].path[0] && g_vfds[i].fd == fd) {
+            is_proc = g_vfds[i].is_procfs;
+            break;
+        }
+    }
+    vfd_unlock();
+    return is_proc;
 }
 
 static int proc_pid_is_container(const char *pid_str, long self_pid, const char *loader, size_t loader_len)

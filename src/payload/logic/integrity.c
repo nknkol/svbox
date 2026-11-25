@@ -54,6 +54,15 @@ static int touches_protected(long number, const long a[6])
  * host kernel; backstop.c queries this slot to forward non-SYS_SECCOMP SIGSYS
  * (e.g. guest raise/kill/tgkill) with POSIX semantics. */
 static unsigned char guest_sigsys[32];
+int integrity_guest_sigsys_state(void)
+{
+    unsigned long h = 0;
+    memcpy(&h, guest_sigsys, sizeof(h));
+    if (h == 0) return 0;
+    if (h == 1) return 1;
+    return 2;
+}
+
 static long sigsys_action(const long a[6])
 {
     if (a[3] != 8)

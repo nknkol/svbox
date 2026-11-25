@@ -188,6 +188,10 @@ static void configure_payload(unsigned long payload_entry, const payload_config_
 		dst->protected_ranges[n][0] = g_loader_islands[i][0];
 		dst->protected_ranges[n][1] = g_loader_islands[i][1];
 	}
+	if (cfg->init_env_addr > 1 && cfg->init_env_size > 0 && n < 64) {
+		dst->protected_ranges[n][0] = cfg->init_env_addr;
+		dst->protected_ranges[n++][1] = ROUND_PG(cfg->init_env_addr + cfg->init_env_size);
+	}
 	dst->protected_count = n;
 	dst->init_vma_count = g_loader_vma_count;
 	for (unsigned i = 0; i < g_loader_vma_count && i < CONFIG_MAX_INIT_VMAS; i++)
@@ -382,6 +386,30 @@ void z_entry(unsigned long *sp, void (*fini)(void))
 	}
 	int envc;
 	char **env = environment(&cfg, &opt, host_env, &envc);
+	if (!opt.child && cfg.mode == CONFIG_MODE_CONTAINER) {
+		size_t total = 0;
+		for (int i = 0; i < envc; i++)
+			total += z_strlen(env[i]) + 1;
+		if (total > 0) {
+			char *buf = z_mmap(NULL, ROUND_PG(total), PROT_READ | PROT_WRITE,
+					   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			if (buf != (void *)-1) {
+				size_t off = 0;
+				for (int i = 0; i < envc; i++) {
+					size_t l = z_strlen(env[i]) + 1;
+					z_memcpy(buf + off, env[i], l);
+					off += l;
+				}
+				z_mprotect(buf, ROUND_PG(total), PROT_READ);
+				cfg.init_env_addr = (uint64_t)(uintptr_t)buf;
+				cfg.init_env_size = (uint64_t)total;
+			}
+		} else {
+			/* Sentinel: empty container environment (0 bytes). */
+			cfg.init_env_addr = 1;
+			cfg.init_env_size = 0;
+		}
+	}
 
 	unsigned long payload_entry = payload_load(opt.payload);
 	hook_set_section_scan(cfg.seccomp_backstop);

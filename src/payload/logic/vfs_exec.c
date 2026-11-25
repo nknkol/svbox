@@ -445,6 +445,9 @@ long proot_execve_context(long number, long a[6], const struct proot_path_contex
     s->handoff.cfg.fake_group_count = group_count;
     for (int i = 0; i < group_count && i < 32; i++)
         s->handoff.cfg.fake_groups[i] = groups[i];
+    /* Child execve passes the guest's own envp directly to the kernel. */
+    s->handoff.cfg.init_env_addr = 0;
+    s->handoff.cfg.init_env_size = 0;
 
     /* Export FD runtime snapshot BEFORE creating handoff_fd so the snapshot
      * never records the internal handoff descriptor. */

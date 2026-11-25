@@ -15,4 +15,6 @@
  * answered without installing anything (the loader's handler stays). */
 int integrity_check(long number, const long a[6], long *result);
 unsigned long integrity_get_sig_handler(int sig);
+/* Returns 0 for SIG_DFL, 1 for SIG_IGN, 2 for a guest-installed handler. */
+int integrity_guest_sigsys_state(void);
 #endif

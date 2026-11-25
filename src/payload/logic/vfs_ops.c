@@ -180,8 +180,39 @@ static long mutate(Bridge *b, long number, long a[6])
             owners_new_name(b);
             return 0;
         }
-        /* Generic fallback when host sandbox forbids symlink() with EACCES/EPERM:
-         * materialize a mountpoint and bind-mount it in the container mount table. */
+        /* Generic POSIX virtual symlink fallback when host sandbox forbids
+         * symlink() with EACCES/EPERM: store the target string in a regular
+         * backing file and tag its (dev, ino) with OWNER_SYMLINK in owner.db,
+         * preserving exact lstat/stat/readlink/open/unlink semantics. */
+        if ((ret == -EACCES || ret == -EPERM) && owners_enabled()) {
+            const char *target = (const char *)a[0];
+            size_t tlen = strlen(target);
+            long sfd = raw_syscall(__NR_openat, AT_FDCWD, (long)b->host,
+                                   O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644, 0, 0);
+            if (sfd < 0)
+                return sfd;
+            long wrc = 0;
+            size_t wdone = 0;
+            while (wdone < tlen) {
+                long w = raw_syscall(__NR_write, sfd, (long)(target + wdone),
+                                     (long)(tlen - wdone), 0, 0, 0);
+                if (w <= 0) { wrc = w ? w : -EIO; break; }
+                wdone += (size_t)w;
+            }
+            struct stat sst;
+            if (wrc >= 0)
+                wrc = raw_syscall(__NR_fstat, sfd, (long)&sst, 0, 0, 0, 0);
+            raw_syscall(__NR_close, sfd, 0, 0, 0, 0, 0);
+            if (wrc >= 0)
+                wrc = owners_mark_symlink(&sst);
+            if (wrc < 0) {
+                raw_syscall(__NR_unlinkat, AT_FDCWD, (long)b->host, 0, 0, 0, 0);
+                return wrc;
+            }
+            if (b->union_on) vfs_upper_note_mutation();
+            return 0;
+        }
+        /* Fallback when owner.db is not active: materialize a bind mount. */
         if ((ret == -EACCES || ret == -EPERM) && mounts_enabled() &&
             strlen(b->guest) < CONFIG_MAX_PATH && strlen(b->host) < sizeof(b->first_host)) {
             strcpy(b->first_guest, b->guest);
@@ -228,10 +259,13 @@ static long mutate(Bridge *b, long number, long a[6])
             return ret;
         if (number == __NR_unlinkat && contains_mount(b, b->guest))
             return -EBUSY;
-        if (number == __NR_unlinkat && b->union_layer >= 0)
-            return union_remove(b->uv, b->union_rel, a[2] & AT_REMOVEDIR);
         struct stat old;
         bool known = number == __NR_unlinkat && owners_enabled() && !host_stat(b->host, false, &old);
+        if (number == __NR_unlinkat && b->union_layer >= 0) {
+            ret = union_remove(b->uv, b->union_rel, a[2] & AT_REMOVEDIR);
+            if (!ret) owners_last_name(&old, known);
+            return ret;
+        }
         ret = raw_syscall(number, AT_FDCWD, (long)b->host, a[2], 0, 0, 0);
         if (!ret && b->union_on) vfs_upper_note_mutation();
         if (!ret && number == __NR_mkdirat && b->union_layer >= 0 && b->union_opaque)
@@ -481,6 +515,10 @@ long pb_dispatch(Bridge *b, long number, long a[6], struct proot_open_origin *or
                       number != __NR_llistxattr && number != __NR_lremovexattr;
         ret = pb_resolve(b, AT_FDCWD, (const char *)a[0], follow);
         if (ret < 0) return ret;
+        if ((number == __NR_getxattr || number == __NR_lgetxattr) &&
+            g_payload_config.mode == CONFIG_MODE_CONTAINER && a[1] &&
+            !strcmp((const char *)a[1], "security.selinux"))
+            return -ENODATA;
         ret = raw_syscall(number, (long)b->host, a[1], a[2], a[3], a[4], a[5]);
         if ((number == __NR_setxattr || number == __NR_lsetxattr) &&
             (ret == -EACCES || ret == -EPERM || ret == -EOPNOTSUPP) &&
@@ -684,6 +722,7 @@ long pb_dispatch(Bridge *b, long number, long a[6], struct proot_open_origin *or
         (path[0] == '/' || b->anchor.known);
     size_t length = strnlen(path, PATH_MAX);
     b->defer_final = number == __NR_openat && follow && !(a[2] & O_PATH) &&
+        !owners_has_symlinks() &&
         length && length < PATH_MAX && path[length - 1] != '/';
     bool deferred = b->defer_final;
 
@@ -776,6 +815,12 @@ long pb_dispatch(Bridge *b, long number, long a[6], struct proot_open_origin *or
         if (ret == -ENOENT && g_payload_config.mode == CONFIG_MODE_CONTAINER)
             ret = pb_proc_status(b, (int)a[2]);
         if (ret == -ENOENT && g_payload_config.mode == CONFIG_MODE_CONTAINER)
+            ret = pb_proc_cgroup(b, (int)a[2]);
+        if (ret == -ENOENT && g_payload_config.mode == CONFIG_MODE_CONTAINER)
+            ret = pb_proc_environ(b, (int)a[2]);
+        if (ret == -ENOENT && g_payload_config.mode == CONFIG_MODE_CONTAINER)
+            ret = pb_proc_attr(b, (int)a[2]);
+        if (ret == -ENOENT && g_payload_config.mode == CONFIG_MODE_CONTAINER)
             ret = pb_proc_maps(b, (int)a[2]);
         if (ret == -ENOENT && g_payload_config.cpu_mask)
             ret = pb_proc_cpuinfo(b, (int)a[2]);
@@ -826,7 +871,15 @@ long pb_dispatch(Bridge *b, long number, long a[6], struct proot_open_origin *or
                 return up;
             arg2 &= ~2L;
         }
+        if (number == __NR_openat && !follow && !(a[2] & O_PATH) && owners_has_symlinks()) {
+            struct stat vst;
+            if (host_stat(b->host, false, &vst) == 0 &&
+                (vst.st_mode & S_IFMT) == S_IFREG && owners_is_symlink(&vst))
+                return ((a[2] & O_CREAT) && (a[2] & O_EXCL)) ? -EEXIST : -ELOOP;
+        }
         ret = raw_syscall(number, AT_FDCWD, (long)b->host, arg2, a[3], a[4], a[5]);
+        if (number == __NR_readlinkat && ret == -EINVAL && owners_has_symlinks())
+            ret = pb_host_readlink(b, b->host, (char *)a[2], (size_t)a[3]);
     }
  opened:
     if (ret >= 0 && b->union_on && b->mutation)

@@ -124,17 +124,19 @@ const char *mounts_fs_name(const char *host);
  * record keeps probe chains intact after a deletion. Writers hold lock and
  * make version odd while writing. */
 #define OWNER_DB_MAGIC "ELFOWN1"
-#define OWNER_USED 1u
-#define OWNER_IDS  2u
-#define OWNER_MODE 4u
-#define OWNER_DEAD 8u
+#define OWNER_USED    1u
+#define OWNER_IDS     2u
+#define OWNER_MODE    4u
+#define OWNER_DEAD    8u
+#define OWNER_SYMLINK 16u
 struct owner_db_header {
     char magic[8];
     uint32_t capacity;   /* records, a power of two */
     uint32_t count;      /* used slots, dead ones included */
     uint32_t lock;
     uint32_t version;
-    uint32_t reserved[10];
+    uint32_t symlinks;   /* active virtual symlink records */
+    uint32_t reserved[9];
 };
 struct owner_record {
     uint64_t dev, ino;
@@ -172,5 +174,9 @@ void owners_copied(const struct stat *from, const struct stat *to);
 void owners_lookup(const struct stat *st, uint32_t *uid, uint32_t *gid, uint32_t *mode);
 /* POSIX DAC check for faccessat/faccessat2 against virtual owner & mode. */
 long owners_check_access(const struct stat *st, unsigned mode, int use_effective);
+/* Virtual POSIX symlinks (backed by regular files when host denies symlink(2)). */
+int owners_has_symlinks(void);
+int owners_is_symlink(const struct stat *st);
+long owners_mark_symlink(const struct stat *st);
 
 #endif

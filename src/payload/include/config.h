@@ -216,6 +216,11 @@ typedef struct payload_config {
     uint32_t _init_vma_pad;
     struct init_vma init_vmas[CONFIG_MAX_INIT_VMAS];
     char exec_interp_path[CONFIG_MAX_PATH];
+    /* Packed NUL-separated initial guest environment (container mode, !child)
+     * so /proc/self/environ matches the sanitized container env instead of
+     * the host's execve environment. */
+    uint64_t init_env_addr;
+    uint64_t init_env_size;
     uint64_t guest_auxv_bytes;
     uint64_t guest_auxv[CONFIG_AUXV_PAIRS * 2];
 } payload_config_t;

@@ -200,10 +200,11 @@ long dispatch_syscall(long number, long a[6])
     switch (number) {
     case __NR_sched_setaffinity:
         if (g_payload_config.cpu_mask != 0) {
-            if (!a[2] || (unsigned long)a[1] < sizeof(uint64_t))
+            if (!a[2] || (unsigned long)a[1] < sizeof(uint32_t))
                 return -EINVAL;
+            size_t cpy = (unsigned long)a[1] < sizeof(uint64_t) ? (size_t)a[1] : sizeof(uint64_t);
             uint64_t req = 0;
-            memcpy(&req, (const void *)a[2], sizeof(req));
+            memcpy(&req, (const void *)a[2], cpy);
             uint64_t clamped = req & g_payload_config.cpu_mask;
             if (!clamped)
                 clamped = g_payload_config.cpu_mask;
@@ -214,15 +215,16 @@ long dispatch_syscall(long number, long a[6])
     case __NR_sched_getaffinity:
         if (g_payload_config.cpu_mask != 0) {
             long rc = passthrough(number, a);
-            if (rc > 0 && a[2] && (unsigned long)a[1] >= sizeof(uint64_t)) {
+            if (rc > 0 && a[2] && (unsigned long)a[1] >= sizeof(uint32_t)) {
+                size_t cpy = (unsigned long)a[1] < sizeof(uint64_t) ? (size_t)a[1] : sizeof(uint64_t);
                 uint64_t cur = 0;
-                memcpy(&cur, (const void *)a[2], sizeof(cur));
+                memcpy(&cur, (const void *)a[2], cpy);
                 cur &= g_payload_config.cpu_mask;
                 if (!cur)
                     cur = g_payload_config.cpu_mask;
-                memcpy((void *)a[2], &cur, sizeof(cur));
-                if ((unsigned long)rc > sizeof(uint64_t))
-                    memset((unsigned char *)a[2] + sizeof(uint64_t), 0, (size_t)rc - sizeof(uint64_t));
+                memcpy((void *)a[2], &cur, cpy);
+                if ((unsigned long)rc > cpy)
+                    memset((unsigned char *)a[2] + cpy, 0, (size_t)rc - cpy);
             }
             return rc;
         }
@@ -460,6 +462,22 @@ long dispatch_syscall(long number, long a[6])
             proot_vfd_fix_fstat((int)a[0], (void *)a[1]);
         return rc;
     }
+    case __NR_ioctl: {
+        long rc = passthrough(number, a);
+        /* Virtualized procfs memfds: host LSMs can return -EACCES on ioctl
+         * (e.g. FIONREAD from Java FileInputStream.available); real procfs
+         * files return -ENOTTY. */
+        if (rc == -EACCES && proot_vfd_is_procfs((int)a[0]))
+            return -ENOTTY;
+        return rc;
+    }
+#ifdef __NR_fgetxattr
+    case __NR_fgetxattr:
+        if (g_payload_config.mode == CONFIG_MODE_CONTAINER && a[1] &&
+            !strcmp((const char *)a[1], "security.selinux"))
+            return -ENODATA;
+        return passthrough(number, a);
+#endif
     default:
         return passthrough(number, a);
     }

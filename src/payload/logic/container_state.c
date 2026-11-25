@@ -781,12 +781,18 @@ static long update(const struct stat *st, uint32_t set, uint32_t clear,
         }
     }
     if (r) {
+        int was_sym = (r->flags & OWNER_SYMLINK) != 0;
         r->flags &= ~clear;
         if (set & OWNER_IDS) { r->uid = uid; r->gid = gid; }
         if (set & OWNER_MODE) r->mode = mode & 07777;
         r->flags |= set;
-        if (!(r->flags & (OWNER_IDS | OWNER_MODE)))
+        if (!(r->flags & (OWNER_IDS | OWNER_MODE | OWNER_SYMLINK)))
             r->flags = OWNER_DEAD;
+        int is_sym = (r->flags & OWNER_SYMLINK) != 0;
+        if (!was_sym && is_sym)
+            h->symlinks++;
+        else if (was_sym && !is_sym && h->symlinks > 0)
+            h->symlinks--;
     }
     write_end(&h->lock, &h->version);
     return rc;
@@ -831,11 +837,20 @@ void owners_stat(long number, const long *a)
         uint16_t m;
         memcpy(&m, buffer + 28, 2);
         if (r.flags & OWNER_IDS) { memcpy(buffer + 20, &r.uid, 4); memcpy(buffer + 24, &r.gid, 4); }
-        if (r.flags & OWNER_MODE) { m = (uint16_t)((m & S_IFMT_) | (r.mode & 07777)); memcpy(buffer + 28, &m, 2); }
+        if (r.flags & OWNER_SYMLINK) {
+            m = (uint16_t)(0120777u);
+            memcpy(buffer + 28, &m, 2);
+        } else if (r.flags & OWNER_MODE) {
+            m = (uint16_t)((m & S_IFMT_) | (r.mode & 07777));
+            memcpy(buffer + 28, &m, 2);
+        }
     } else {
         struct stat *out = (struct stat *)buffer;
         if (r.flags & OWNER_IDS) { out->st_uid = r.uid; out->st_gid = r.gid; }
-        if (r.flags & OWNER_MODE) out->st_mode = (out->st_mode & S_IFMT_) | (r.mode & 07777);
+        if (r.flags & OWNER_SYMLINK)
+            out->st_mode = (out->st_mode & ~0177777u) | 0120777u;
+        else if (r.flags & OWNER_MODE)
+            out->st_mode = (out->st_mode & S_IFMT_) | (r.mode & 07777);
     }
 }
 
@@ -896,13 +911,13 @@ void owners_created(const struct stat *st)
         return;
     uint32_t uid = fake_ids_fs(0), gid = fake_ids_fs(1);
     /* A reused inode number must not keep a deleted file's record. */
-    update(st, uid || gid ? OWNER_IDS : 0, OWNER_IDS | OWNER_MODE, uid, gid, 0);
+    update(st, uid || gid ? OWNER_IDS : 0, OWNER_IDS | OWNER_MODE | OWNER_SYMLINK, uid, gid, 0);
 }
 
 void owners_forget(const struct stat *st)
 {
     if (db())
-        update(st, 0, OWNER_IDS | OWNER_MODE, 0, 0, 0);
+        update(st, 0, OWNER_IDS | OWNER_MODE | OWNER_SYMLINK, 0, 0, 0);
 }
 
 void owners_copied(const struct stat *from, const struct stat *to)
@@ -910,10 +925,36 @@ void owners_copied(const struct stat *from, const struct stat *to)
     struct owner_record r;
     if (!db())
         return;
-    if (find(from, &r) && (r.flags & (OWNER_IDS | OWNER_MODE)))
-        update(to, r.flags & (OWNER_IDS | OWNER_MODE), OWNER_IDS | OWNER_MODE, r.uid, r.gid, r.mode);
+    if (find(from, &r) && (r.flags & (OWNER_IDS | OWNER_MODE | OWNER_SYMLINK)))
+        update(to, r.flags & (OWNER_IDS | OWNER_MODE | OWNER_SYMLINK),
+               OWNER_IDS | OWNER_MODE | OWNER_SYMLINK, r.uid, r.gid, r.mode);
     else
-        update(to, 0, OWNER_IDS | OWNER_MODE, 0, 0, 0);
+        update(to, 0, OWNER_IDS | OWNER_MODE | OWNER_SYMLINK, 0, 0, 0);
+}
+
+int owners_has_symlinks(void)
+{
+    if (!owners_enabled())
+        return 0;
+    struct owner_db_header *h = db();
+    return h && __atomic_load_n(&h->symlinks, __ATOMIC_RELAXED) > 0;
+}
+
+int owners_is_symlink(const struct stat *st)
+{
+    if (!owners_has_symlinks())
+        return 0;
+    struct owner_record r;
+    return find(st, &r) && (r.flags & OWNER_SYMLINK) != 0;
+}
+
+long owners_mark_symlink(const struct stat *st)
+{
+    if (!db())
+        return -EIO;
+    uint32_t uid = fake_ids_fs(0), gid = fake_ids_fs(1);
+    uint32_t set = OWNER_SYMLINK | (uid || gid ? OWNER_IDS : 0);
+    return update(st, set, OWNER_IDS | OWNER_MODE | OWNER_SYMLINK, uid, gid, 0);
 }
 
 long owners_check_access(const struct stat *st, unsigned mode, int use_effective)

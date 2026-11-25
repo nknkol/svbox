@@ -343,6 +343,7 @@ void options_print_help(int fd)
 		"  --deny-memfd-prefix PREFIX     Return ENOSYS for memfd_create() names starting with PREFIX\n"
 		"  --mount-table PATH             Join/share an emulated mount table file\n"
 		"  --mount-scratch DIR            Host directory backing emulated tmpfs mounts\n"
+		"  --glue-dir DIR                 Host directory for synthetic bind-mount glue\n"
 		"  --owner-db PATH                Virtual uid/gid/mode ownership database\n"
 		"  --vdev GUEST:SOCK[:TYPE]       Userspace virtual char device proxy (TYPE: chr|binder|tun)\n"
 		"\n"
@@ -583,6 +584,11 @@ void options_parse(int argc, char **argv, payload_config_t *cfg, struct loader_o
 			if (v[0] != '/' || z_strlen(v) >= CONFIG_MAX_PATH - 48)
 				z_errx(1, "invalid value for %s", arg);
 			copy_cstr(cfg->mount_scratch, CONFIG_MAX_PATH, v);
+		} else if (is(arg, "--glue-dir")) {
+			const char *v = value(argc, argv, &i);
+			if (v[0] != '/' || z_strlen(v) >= CONFIG_MAX_PATH - 32)
+				z_errx(1, "invalid value for %s", arg);
+			copy_cstr(cfg->glue_dir, CONFIG_MAX_PATH, v);
 		} else if (is(arg, "--owner-db")) {
 			opt->owner_db = value(argc, argv, &i);
 		} else if (is(arg, "--vdev")) {
