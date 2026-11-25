@@ -35,5 +35,7 @@ struct vma_info {
 void vma_track_add(uintptr_t start, size_t len, uint64_t file_off, int fd);
 void vma_track_remove(uintptr_t start, size_t len);
 int  vma_track_lookup(uintptr_t start, uintptr_t end, struct vma_info *out);
+int  vma_track_next_overlap(uintptr_t start, uintptr_t end,
+                            uintptr_t *ov_lo, uintptr_t *ov_hi);
 
 #endif /* PAYLOAD_HOOK_RUNTIME_H */

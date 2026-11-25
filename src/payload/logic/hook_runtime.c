@@ -126,7 +126,7 @@ void hook_unnote_internal(uintptr_t base, size_t len)
 }
 
 /* ---- Virtualized VMA tracking for copied executable file mappings ---- */
-#define VMA_TRACK_MAX 1024u
+#define VMA_TRACK_MAX 2048u
 
 struct vma_slot {
     uintptr_t start;
@@ -226,9 +226,12 @@ void vma_track_add(uintptr_t start, size_t len, uint64_t file_off, int fd)
     char hpath[256];
     long rlen = raw_syscall(__NR_readlinkat, -100 /* AT_FDCWD */, (long)link_path,
                             (long)hpath, (long)(sizeof(hpath) - 1), 0, 0);
-    if (rlen <= 0 || hpath[0] != '/')
-        return;
-    hpath[rlen] = '\0';
+    if (rlen > 0 && hpath[0] == '/')
+        hpath[rlen] = '\0';
+    else {
+        hpath[0] = '\0';
+        rlen = 0;
+    }
 
     vma_lock();
     vma_remove_locked(u_lo, u_hi);
@@ -257,7 +260,8 @@ int vma_track_lookup(uintptr_t start, uintptr_t end, struct vma_info *out)
         vma_lock();
         unsigned hi = g_vma_hi;
         for (unsigned i = 0; i < hi; i++) {
-            if (g_vmas[i].end && start >= g_vmas[i].start && end <= g_vmas[i].end) {
+            if (g_vmas[i].end && g_vmas[i].host_path[0] &&
+                start >= g_vmas[i].start && end <= g_vmas[i].end) {
                 out->start = g_vmas[i].start;
                 out->end = g_vmas[i].end;
                 out->file_off = g_vmas[i].file_off;
@@ -297,6 +301,48 @@ int vma_track_lookup(uintptr_t start, uintptr_t end, struct vma_info *out)
         }
     }
     return 0;
+}
+
+int vma_track_next_overlap(uintptr_t start, uintptr_t end,
+                           uintptr_t *ov_lo, uintptr_t *ov_hi)
+{
+    if (end <= start)
+        return 0;
+    int found = 0;
+    uintptr_t best_lo = 0, best_hi = 0;
+    if (__atomic_load_n(&g_vma_hi, __ATOMIC_ACQUIRE) > 0) {
+        vma_lock();
+        unsigned hi = g_vma_hi;
+        for (unsigned i = 0; i < hi; i++) {
+            uintptr_t s = g_vmas[i].start, e = g_vmas[i].end;
+            if (!e || e <= start || s >= end)
+                continue;
+            if (!found || s < best_lo || (s == best_lo && e > best_hi)) {
+                best_lo = s;
+                best_hi = e;
+                found = 1;
+            }
+        }
+        vma_unlock();
+    }
+    uint32_t icnt = g_payload_config.init_vma_count;
+    if (icnt > CONFIG_MAX_INIT_VMAS) icnt = CONFIG_MAX_INIT_VMAS;
+    for (uint32_t i = 0; i < icnt; i++) {
+        uintptr_t s = (uintptr_t)g_payload_config.init_vmas[i].start;
+        uintptr_t e = (uintptr_t)g_payload_config.init_vmas[i].end;
+        if (!e || e <= start || s >= end)
+            continue;
+        if (!found || s < best_lo || (s == best_lo && e > best_hi)) {
+            best_lo = s;
+            best_hi = e;
+            found = 1;
+        }
+    }
+    if (found) {
+        if (ov_lo) *ov_lo = best_lo;
+        if (ov_hi) *ov_hi = best_hi;
+    }
+    return found;
 }
 
 int hook_protected_overlap(uintptr_t addr, size_t len)

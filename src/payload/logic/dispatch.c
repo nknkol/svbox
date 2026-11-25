@@ -301,6 +301,55 @@ long dispatch_syscall(long number, long a[6])
         if (a[2] & PROT_EXEC)
             return map_exec(number, a);
         return passthrough(number, a);
+    case __NR_madvise: {
+        int advice = (int)a[2];
+        /* On Linux, MADV_DONTNEED / MADV_DONTNEED_LOCKED on a file-backed
+         * MAP_PRIVATE mapping discards private dirty pages and re-faults clean
+         * bytes from the backing file, whereas on MAP_ANONYMOUS it zero-fills
+         * them. Because map_exec_copy materializes executable file segments as
+         * MAP_ANONYMOUS copies, forwarding destructive advices on those ranges
+         * would wipe live code to zeroes (SIGILL). Split around tracked exec
+         * copies so only genuinely anonymous sub-ranges are advised. */
+        if (advice == 4 /* MADV_DONTNEED */ ||
+            advice == 8 /* MADV_FREE */ ||
+            advice == 24 /* MADV_DONTNEED_LOCKED */) {
+            uintptr_t addr = (uintptr_t)a[0];
+            size_t len = (size_t)a[1];
+            if ((addr & 4095ul) != 0)
+                return -EINVAL;
+            if (!len)
+                return passthrough(number, a);
+            uintptr_t end = addr + len;
+            if (end < addr)
+                return -EINVAL;
+            uintptr_t align_end = (end + 4095ul) & ~4095ul;
+            if (align_end < end)
+                align_end = ~(uintptr_t)4095ul;
+            uintptr_t ov_lo = 0, ov_hi = 0;
+            if (!vma_track_next_overlap(addr, align_end, &ov_lo, &ov_hi))
+                return passthrough(number, a);
+            uintptr_t cur = addr;
+            long rc = 0;
+            while (cur < align_end) {
+                if (!vma_track_next_overlap(cur, align_end, &ov_lo, &ov_hi)) {
+                    long r = raw_syscall(__NR_madvise, (long)cur, (long)(align_end - cur),
+                                         advice, 0, 0, 0);
+                    if (r < 0 && rc == 0) rc = r;
+                    break;
+                }
+                if (ov_lo > cur) {
+                    long r = raw_syscall(__NR_madvise, (long)cur, (long)(ov_lo - cur),
+                                         advice, 0, 0, 0);
+                    if (r < 0 && rc == 0) rc = r;
+                }
+                if (ov_hi <= cur)
+                    break;
+                cur = ov_hi;
+            }
+            return rc;
+        }
+        return passthrough(number, a);
+    }
     /* HarmonyOS AArch64 enables TBID0 (data-only TBI), so tagged pointers
      * trap infinitely on instruction fetch (e.g. JIT code in heap pages). */
     case __NR_prctl:
