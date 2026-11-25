@@ -50,8 +50,9 @@ static int touches_protected(long number, const long a[6])
     return hook_protected_overlap((uintptr_t)a[0], (size_t)a[1]);
 }
 
-/* A guest SIGSYS action is recorded and reported back, never installed
- * (signals the guest raises itself are then not delivered to it). */
+/* A guest SIGSYS action is recorded and reported back, never installed in the
+ * host kernel; backstop.c queries this slot to forward non-SYS_SECCOMP SIGSYS
+ * (e.g. guest raise/kill/tgkill) with POSIX semantics. */
 static unsigned char guest_sigsys[32];
 static long sigsys_action(const long a[6])
 {

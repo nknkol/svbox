@@ -1288,3 +1288,92 @@ void proot_vfd_fix_fstat(int fd, void *stat_buf)
     st->st_size = 0;
     st->st_blocks = 0;
 }
+
+static int proc_pid_is_container(const char *pid_str, long self_pid, const char *loader, size_t loader_len)
+{
+    long pid = 0;
+    for (const char *p = pid_str; *p; p++)
+        pid = pid * 10 + (*p - '0');
+    if (pid == self_pid)
+        return 1;
+
+    char path[64];
+    size_t pl = strlen(pid_str);
+    if (6 + pl + 9 >= sizeof(path))
+        return 0;
+    memcpy(path, "/proc/", 6);
+    memcpy(path + 6, pid_str, pl);
+    memcpy(path + 6 + pl, "/cmdline", 9);
+
+    long cfd = raw_syscall(__NR_openat, AT_FDCWD, (long)path, O_RDONLY | O_CLOEXEC, 0, 0, 0);
+    if (cfd < 0)
+        return 0;
+    char cbuf[CONFIG_MAX_PATH + 4];
+    size_t want = loader_len + 1;
+    if (want > sizeof(cbuf)) want = sizeof(cbuf);
+    long n = raw_syscall(__NR_read, cfd, (long)cbuf, (long)want, 0, 0, 0);
+    raw_syscall(__NR_close, cfd, 0, 0, 0, 0, 0);
+    return n >= (long)(loader_len + 1) && cbuf[loader_len] == '\0' &&
+           !strncmp(cbuf, loader, loader_len);
+}
+
+/* Filter /proc root directory listings in container mode so host/sibling
+ * non-container processes sharing the same host UID are not exposed to guests. */
+long proot_proc_filter_pids(int fd, void *buffer, long length)
+{
+    if (g_payload_config.mode != CONFIG_MODE_CONTAINER ||
+        !g_payload_config.loader_path[0] || !buffer || length <= 0)
+        return length;
+
+    unsigned long fs[16];
+    if (raw_syscall(__NR_fstatfs, fd, (long)fs, 0, 0, 0, 0) ||
+        (unsigned)fs[0] != 0x9fa0 /* PROC_SUPER_MAGIC */)
+        return length;
+
+    /* Confirm fd refers to /proc itself, not /proc/<pid>/task or /proc/<pid>/fd. */
+    char fdlink[32];
+    memcpy(fdlink, "/proc/self/fd/", 14);
+    size_t fp = append_u32(fdlink, sizeof(fdlink) - 1, 14, (uint32_t)fd);
+    fdlink[fp] = '\0';
+    char target[32];
+    long tlen = raw_syscall(__NR_readlinkat, AT_FDCWD, (long)fdlink,
+                            (long)target, (long)(sizeof(target) - 1), 0, 0);
+    if (tlen != 5)
+        return length;
+    target[5] = '\0';
+    if (strcmp(target, "/proc") != 0)
+        return length;
+
+    const char *loader = g_payload_config.loader_path;
+    size_t loader_len = strlen(loader);
+    long self_pid = current_id(__NR_getpid);
+
+    unsigned char *bytes = (unsigned char *)buffer;
+    long kept = 0;
+    for (long at = 0; at < length;) {
+        unsigned short size;
+        memcpy(&size, bytes + at + 16, sizeof(size));
+        if (size < 20 || at + size > length)
+            return length;
+        unsigned char type = bytes[at + 18];
+        const char *name = (const char *)bytes + at + 19;
+        int is_pid_dir = 0;
+        if ((type == 4 /* DT_DIR */ || type == 0 /* DT_UNKNOWN */) &&
+            name[0] >= '1' && name[0] <= '9') {
+            is_pid_dir = 1;
+            for (const char *p = name + 1; *p; p++) {
+                if (*p < '0' || *p > '9') { is_pid_dir = 0; break; }
+            }
+        }
+        int keep = 1;
+        if (is_pid_dir)
+            keep = proc_pid_is_container(name, self_pid, loader, loader_len);
+        if (keep) {
+            if (kept != at)
+                memmove(bytes + kept, bytes + at, size);
+            kept += size;
+        }
+        at += size;
+    }
+    return kept;
+}

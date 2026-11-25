@@ -65,4 +65,6 @@ int proot_loop_ioctl(long fd, unsigned long cmd, long arg, long *result);
 void proot_vfd_close(int fd);
 void proot_vfd_dup(int oldfd, int newfd);
 void proot_vfd_fix_fstat(int fd, void *stat_buf);
+/* Container /proc directory listing filter: omit non-container host PIDs. */
+long proot_proc_filter_pids(int fd, void *buffer, long length);
 #endif

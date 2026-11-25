@@ -33,14 +33,44 @@ static long backstop_call(unsigned long entry, const unsigned long *r)
 	return x0;
 }
 
+static void forward_guest_sigsys(int sig, siginfo_t *si, void *ucontext)
+{
+	struct {
+		unsigned long handler;
+		unsigned long flags;
+		unsigned long restorer;
+		unsigned long mask;
+	} gact = {0, 0, 0, 0};
+	unsigned long qregs[9] = {31 /* SIGSYS */, 0, (unsigned long)&gact, 8, 0, 0, 0, 0, __NR_rt_sigaction};
+	if (g_payload_entry && backstop_call(g_payload_entry, qregs) == 0) {
+		if (gact.handler == 1ul /* SIG_IGN */)
+			return;
+		if (gact.handler > 1ul) {
+			if (gact.flags & 0x80000000ul /* SA_RESETHAND */) {
+				struct {
+					unsigned long handler, flags, restorer, mask;
+				} dfl = {0, 0, 0, 0};
+				unsigned long rregs[9] = {31, (unsigned long)&dfl, 0, 8, 0, 0, 0, 0, __NR_rt_sigaction};
+				backstop_call(g_payload_entry, rregs);
+			}
+			if (gact.flags & 0x00000004ul /* SA_SIGINFO */)
+				((void (*)(int, siginfo_t *, void *))gact.handler)(sig, si, ucontext);
+			else
+				((void (*)(int))gact.handler)(sig);
+			return;
+		}
+	}
+	die_of_signal(sig);
+}
+
 static void loader_sigsys_handler(int sig, siginfo_t *si, void *ucontext)
 {
 	ucontext_t *uc = (ucontext_t *)ucontext;
 	/* Our TRAP action's data comes in si_errno: the host sandbox's own
-	 * filter traps some calls too. When --trap-sigsys is also enabled,
-	 * convert host sandbox traps into -ENOSYS cleanly. */
+	 * filter traps some calls too. Non-SYS_SECCOMP SIGSYS (e.g. raised by
+	 * the guest via kill/tgkill) is forwarded to the guest's SIGSYS action. */
 	if (!si || si->si_code != 1 /* SYS_SECCOMP */ || !uc) {
-		die_of_signal(sig);
+		forward_guest_sigsys(sig, si, ucontext);
 		return;
 	}
 	unsigned long *regs = (unsigned long *)uc->uc_mcontext.regs;

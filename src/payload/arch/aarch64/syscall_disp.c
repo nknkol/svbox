@@ -96,9 +96,14 @@ long syscall_dispatcher(long sys_no, pt_regs *regs)
     /* R6: a directory of the merged view lists every layer. */
     if (sys_no == __NR_getdents64 && union_enabled())
         ret = union_getdents((int)a[0], (void *)a[1], (unsigned long)a[2], ret);
-    /* A batch holding only the payload's FDs is read again: zero means the
-     * end of the directory. */
-    while (sys_no == __NR_getdents64 && ret > 0 && !(ret = broker_hide_fds((int)a[0], (void *)a[1], ret))) {
+    /* A batch holding only filtered FDs or non-container /proc PIDs is read
+     * again: zero means the end of the directory. */
+    while (sys_no == __NR_getdents64 && ret > 0) {
+        ret = broker_hide_fds((int)a[0], (void *)a[1], ret);
+        if (ret > 0)
+            ret = proot_proc_filter_pids((int)a[0], (void *)a[1], ret);
+        if (ret != 0)
+            break;
         long again[6] = {a[0], a[1], a[2], a[3], a[4], a[5]};
         ret = DISPATCH(sys_no, again);
     }
