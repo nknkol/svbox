@@ -351,12 +351,26 @@ long dispatch_syscall(long number, long a[6])
         return passthrough(number, a);
     }
     /* HarmonyOS AArch64 enables TBID0 (data-only TBI), so tagged pointers
-     * trap infinitely on instruction fetch (e.g. JIT code in heap pages). */
-    case __NR_prctl:
+     * trap infinitely on instruction fetch (e.g. JIT code in heap pages).
+     * Also keep PR_GET_SECCOMP / PR_GET_NO_NEW_PRIVS consistent with
+     * /proc/self/status when svbox's own seccomp backstop is active. */
+    case __NR_prctl: {
+        static int guest_nnp = 0;
         if (platform_is_harmonyos() && (a[0] == 55 /* PR_SET_TAGGED_ADDR_CTRL */ ||
                                         a[0] == 56 /* PR_GET_TAGGED_ADDR_CTRL */))
             return -EINVAL;
+        if (g_payload_config.seccomp_backstop || g_payload_config.trap_sigsys) {
+            if (a[0] == 21 /* PR_GET_SECCOMP */)
+                return 0;
+            if (a[0] == 38 /* PR_SET_NO_NEW_PRIVS */ && a[1] == 1 && !a[2] && !a[3] && !a[4]) {
+                guest_nnp = 1;
+                return 0;
+            }
+            if (a[0] == 39 /* PR_GET_NO_NEW_PRIVS */)
+                return guest_nnp;
+        }
         return passthrough(number, a);
+    }
     /* glibc falls back from both; the sandbox kills rseq with SIGSYS. */
     case __NR_rseq:
     case __NR_clone3:

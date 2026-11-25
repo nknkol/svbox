@@ -4,6 +4,7 @@
  * generated from the R4 table. */
 #include "vfs_bridge_internal.h"
 #include "hook_runtime.h"
+#include "vdev.h"
 
 static long current_id(long number)
 {
@@ -198,6 +199,38 @@ long pb_proc_readlink(Bridge *b, long a[6])
     if (action < 0) return action;
     long count;
     if (action == FS_LINK_DEFAULT || action == FS_LINK_KEEP) {
+        /* Report virtual device guest paths for /proc/<self>/fd/<N> instead
+         * of the internal host memfd backing name. */
+        if (vdev_enabled() && component[0] >= '0' && component[0] <= '9') {
+            const char *cur = b->guest;
+            if (!strncmp(cur, "/proc/", 6)) {
+                cur += 6;
+                long self_pid = current_id(__NR_getpid);
+                long pid = 0;
+                if (!strncmp(cur, "self", 4) && cur[4] == '/') {
+                    pid = self_pid; cur += 4;
+                } else if (!strncmp(cur, "thread-self", 11) && cur[11] == '/') {
+                    pid = self_pid; cur += 11;
+                } else {
+                    while (*cur >= '0' && *cur <= '9') pid = pid * 10 + (*cur++ - '0');
+                }
+                if (pid == self_pid && !strcmp(cur, "/fd")) {
+                    int fdn = 0;
+                    const char *d = component;
+                    while (*d >= '0' && *d <= '9') { fdn = fdn * 10 + (*d++ - '0'); }
+                    if (!*d) {
+                        const char *vg = vdev_fd_guest_path(fdn);
+                        if (vg && strlen(vg) < sizeof(b->cwd)) {
+                            strcpy(b->cwd, vg);
+                            count = (long)strlen(b->cwd);
+                            if ((unsigned long)a[3] < (unsigned long)count) count = (long)a[3];
+                            memcpy((void *)a[2], b->cwd, (size_t)count);
+                            return count;
+                        }
+                    }
+                }
+            }
+        }
         /* Not emulated, or a kept magic link: the kernel's own answer,
          * with an absolute target reported in guest terms. */
         *slash = '/';
@@ -361,7 +394,9 @@ long pb_proc_status(Bridge *b, int flags)
                           line_len >= 8 && !strncmp(b->proc_data + pos, "Seccomp:", 8));
         int is_secfilt = (!is_uid && !is_gid && !is_seccomp && hide_sec &&
                           line_len >= 16 && !strncmp(b->proc_data + pos, "Seccomp_filters:", 16));
-        if (is_uid || is_gid || is_seccomp || is_secfilt) {
+        int is_nnp = (!is_uid && !is_gid && !is_seccomp && !is_secfilt && hide_sec &&
+                      line_len >= 11 && !strncmp(b->proc_data + pos, "NoNewPrivs:", 11));
+        if (is_uid || is_gid || is_seccomp || is_secfilt || is_nnp) {
             if (pos > span_start) {
                 size_t wdone = 0, wlen = pos - span_start;
                 while (wdone < wlen) {
@@ -380,6 +415,10 @@ long pb_proc_status(Bridge *b, int flags)
                                           is_uid ? ids : (ids + 4));
                 } else if (is_seccomp) {
                     const char *s = "Seccomp:\t0\n";
+                    llen = strlen(s);
+                    memcpy(line, s, llen);
+                } else if (is_nnp) {
+                    const char *s = "NoNewPrivs:\t0\n";
                     llen = strlen(s);
                     memcpy(line, s, llen);
                 } else {
@@ -724,7 +763,8 @@ static int path_is_internal_runtime(const char *path, size_t len)
             return 1;
     }
     static const char *const suffixes[] = {
-        "/.svbox_svc_cache", "/owner.db", "/memfd:mounts", "/memfd:mounts-ns"
+        "/.svbox_svc_cache", "/owner.db", "/memfd:mounts", "/memfd:mounts-ns",
+        "/memfd:svbox_net_state"
     };
     for (size_t s = 0; s < sizeof(suffixes) / sizeof(suffixes[0]); s++) {
         size_t sl = strlen(suffixes[s]);
@@ -816,6 +856,8 @@ long pb_proc_maps(Bridge *b, int flags)
     char line[1024];
     size_t line_len = 0;
     int skip_smaps_body = 0;
+    int exec_copy_smaps = 0;
+    uint64_t smaps_rss_kb = 0;
     int eof = 0;
 
     while (!eof && w.rc >= 0) {
@@ -843,8 +885,34 @@ long pb_proc_maps(Bridge *b, int flags)
             if (!got_line) break;
 
             if (is_smaps && line_len > 0 && line[0] >= 'A' && line[0] <= 'Z') {
-                if (!skip_smaps_body)
-                    maps_emit(&w, line, line_len);
+                if (!skip_smaps_body) {
+                    if (exec_copy_smaps) {
+                        char sl[96];
+                        if (line_len >= 4 && !strncmp(line, "Rss:", 4)) {
+                            smaps_rss_kb = parse_kb_value(line, line_len);
+                            maps_emit(&w, line, line_len);
+                        } else if (line_len >= 14 && !strncmp(line, "Private_Clean:", 14)) {
+                            size_t n = format_meminfo_line(sl, sizeof(sl), "Private_Clean:", smaps_rss_kb);
+                            maps_emit(&w, sl, n);
+                        } else if (line_len >= 14 && !strncmp(line, "Private_Dirty:", 14)) {
+                            size_t n = format_meminfo_line(sl, sizeof(sl), "Private_Dirty:", 0);
+                            maps_emit(&w, sl, n);
+                        } else if (line_len >= 10 && !strncmp(line, "Anonymous:", 10)) {
+                            size_t n = format_meminfo_line(sl, sizeof(sl), "Anonymous:", 0);
+                            maps_emit(&w, sl, n);
+                        } else if (line_len >= 14 && !strncmp(line, "AnonHugePages:", 14)) {
+                            size_t n = format_meminfo_line(sl, sizeof(sl), "AnonHugePages:", 0);
+                            maps_emit(&w, sl, n);
+                        } else if (line_len >= 8 && !strncmp(line, "VmFlags:", 8)) {
+                            static const char vf[] = "VmFlags: pr \n";
+                            maps_emit(&w, vf, sizeof(vf) - 1);
+                        } else {
+                            maps_emit(&w, line, line_len);
+                        }
+                    } else {
+                        maps_emit(&w, line, line_len);
+                    }
+                }
                 line_len = 0;
                 if (eof) break;
                 continue;
@@ -858,6 +926,7 @@ long pb_proc_maps(Bridge *b, int flags)
                             p + 6 <= lend && *p == ' ';
             if (!header_ok) {
                 skip_smaps_body = 0;
+                exec_copy_smaps = 0;
                 maps_emit(&w, line, line_len);
                 line_len = 0;
                 if (eof) break;
@@ -880,19 +949,27 @@ long pb_proc_maps(Bridge *b, int flags)
                 path_end--;
             size_t path_len = (size_t)(path_end - path_start);
 
-            if ((is_self && end > start && hook_protected_overlap((uintptr_t)start, (size_t)(end - start))) ||
-                path_is_internal_runtime(path_start, path_len)) {
+            int omit = (end > start &&
+                        (is_self ? hook_protected_overlap((uintptr_t)start, (size_t)(end - start))
+                                 : hook_fixed_runtime_overlap((uintptr_t)start, (size_t)(end - start)))) ||
+                       path_is_internal_runtime(path_start, path_len);
+            if (omit) {
                 skip_smaps_body = 1;
+                exec_copy_smaps = 0;
                 line_len = 0;
                 if (eof) break;
                 continue;
             }
             skip_smaps_body = 0;
+            exec_copy_smaps = 0;
+            smaps_rss_kb = 0;
 
             struct vma_info vma;
             if (is_self &&
                 (path_len == 0 || (path_len >= 7 && !strncmp(path_start, "/memfd:", 7))) &&
                 vma_track_lookup((uintptr_t)start, (uintptr_t)end, &vma)) {
+                if (is_smaps && vma.is_exec_copy && perms[1] != 'w')
+                    exec_copy_smaps = 1;
                 const char *gpath = vma.path;
                 if (!vma.is_guest_path) {
                     size_t pl = strlen(vma.path);

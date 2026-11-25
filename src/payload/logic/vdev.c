@@ -1318,6 +1318,18 @@ static int tun_ioctl(struct vdev_open_slot *slot, unsigned long cmd, unsigned lo
     return 1;
 }
 
+const char *vdev_fd_guest_path(int fd)
+{
+    if (!vdev_enabled() || fd < 0)
+        return NULL;
+    struct vdev_open_slot *slot = find_slot_by_fd(fd);
+    if (!slot)
+        return NULL;
+    if (slot->vdev_idx < 0 || slot->vdev_idx >= g_payload_config.vdev_count)
+        return NULL;
+    return g_payload_config.vdevs[slot->vdev_idx].guest;
+}
+
 int vdev_fd_call(long number, long a[6], long *out)
 {
     if (!vdev_enabled())

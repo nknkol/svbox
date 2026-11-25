@@ -307,6 +307,7 @@ int vma_track_lookup(uintptr_t start, uintptr_t end, struct vma_info *out)
                 out->dev = g_vmas[i].dev;
                 out->ino = g_vmas[i].ino;
                 out->is_guest_path = g_vmas[i].is_guest_path;
+                out->is_exec_copy = g_vmas[i].is_exec_copy;
                 __builtin_memcpy(out->path, g_vmas[i].host_path, sizeof(out->path));
                 vma_unlock();
                 return 1;
@@ -330,6 +331,7 @@ int vma_track_lookup(uintptr_t start, uintptr_t end, struct vma_info *out)
             out->dev = iv->dev;
             out->ino = iv->ino;
             out->is_guest_path = iv->is_interp ? 0 : 1;
+            out->is_exec_copy = 1;
             size_t n = 0;
             while (src[n] && n + 1 < sizeof(out->path)) {
                 out->path[n] = src[n];
@@ -384,7 +386,7 @@ int vma_track_next_overlap(uintptr_t start, uintptr_t end,
     return found;
 }
 
-int hook_protected_overlap(uintptr_t addr, size_t len)
+int hook_fixed_runtime_overlap(uintptr_t addr, size_t len)
 {
     if (!len) return 0;
     uintptr_t end = addr + len < addr ? (uintptr_t)-1 : addr + len;
@@ -394,6 +396,15 @@ int hook_protected_overlap(uintptr_t addr, size_t len)
         if (addr < g_payload_config.protected_ranges[i][1] &&
             end > g_payload_config.protected_ranges[i][0])
             return 1;
+    return 0;
+}
+
+int hook_protected_overlap(uintptr_t addr, size_t len)
+{
+    if (hook_fixed_runtime_overlap(addr, len))
+        return 1;
+    if (!len) return 0;
+    uintptr_t end = addr + len < addr ? (uintptr_t)-1 : addr + len;
     unsigned n = __atomic_load_n(&protected_count, __ATOMIC_ACQUIRE);
     if (n > PROTECTED_MAX) n = PROTECTED_MAX;
     for (unsigned i = 0; i < n; i++) {

@@ -22,4 +22,8 @@ long vdev_path_call(long number, long a[6], int vdev_idx);
  * handled; returns 0 to let normal dispatch continue. */
 int vdev_fd_call(long number, long a[6], long *out);
 
+/* Returns the guest device path (e.g. "/dev/binder") if fd belongs to an
+ * active vdev, or NULL otherwise. */
+const char *vdev_fd_guest_path(int fd);
+
 #endif /* SVBOX_VDEV_H */

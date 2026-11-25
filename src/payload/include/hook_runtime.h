@@ -14,6 +14,8 @@ long install_hook_file(void *target_base, size_t target_size, void *payload_entr
                        int fd, unsigned long file_off);
 /* Whether [addr, addr + len) touches loader, payload or stub-island memory. */
 int hook_protected_overlap(uintptr_t addr, size_t len);
+/* Whether [addr, addr + len) overlaps fixed-address loader/payload runtime VMAs. */
+int hook_fixed_runtime_overlap(uintptr_t addr, size_t len);
 /* Register/unregister an internal runtime mapping so guest mm calls cannot
  * touch it while active and /proc/self/maps omits it. */
 int hook_note_internal(uintptr_t base, size_t len);
@@ -30,6 +32,7 @@ struct vma_info {
     uint64_t  dev;
     uint64_t  ino;
     int       is_guest_path; /* 1 = already guest path, 0 = host path to map */
+    int       is_exec_copy;  /* 1 = anonymous copy of a file-backed exec VMA */
     char      path[256];
 };
 void vma_track_add(uintptr_t start, size_t len, uint64_t file_off, int fd);
