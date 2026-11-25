@@ -59,6 +59,7 @@
     mov x19, x0
     mov x20, x1
     mov x21, x2
+    mov x0, sp
     bl payload_stack_claim      /* general registers only */
     mov x22, x0
     mov x23, sp

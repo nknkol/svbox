@@ -159,6 +159,49 @@ void reentry_exec_restore(struct reentry_slot *slot)
                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
 }
 
+struct reentry_slot *reentry_suspend_current(long *out_tid)
+{
+    long tid = raw_syscall(__NR_gettid, 0, 0, 0, 0, 0, 0);
+    if (out_tid)
+        *out_tid = tid;
+    if (tid <= 0)
+        return NULL;
+    for (int i = 0; __atomic_load_n(&vfork_count, __ATOMIC_ACQUIRE) && i < REENTRY_VFORKS; i++) {
+        if (__atomic_load_n(&vfork_leases[i].tid, __ATOMIC_ACQUIRE) != tid)
+            continue;
+        long owner = tid;
+        if (__atomic_compare_exchange_n(&vfork_leases[i].slot.tid, &owner, 0, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            return &vfork_leases[i].slot;
+        return NULL;
+    }
+    if (__atomic_load_n(&private_tid, __ATOMIC_ACQUIRE) == tid) {
+        long owner = tid;
+        if (__atomic_compare_exchange_n(&private_slot.tid, &owner, 0, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            return &private_slot;
+        return NULL;
+    }
+    struct guard_table *table = __atomic_load_n(&g_table, __ATOMIC_ACQUIRE);
+    int used = table ? __atomic_load_n(&table->used, __ATOMIC_ACQUIRE) : 0;
+    for (int i = 0; i < used; i++) {
+        long owner = tid;
+        if (__atomic_compare_exchange_n(&table->slots[i].tid, &owner, 0, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            return &table->slots[i];
+    }
+    return NULL;
+}
+
+void reentry_resume_current(struct reentry_slot *slot, long tid)
+{
+    if (!slot || tid <= 0)
+        return;
+    long empty = 0;
+    __atomic_compare_exchange_n(&slot->tid, &empty, tid, 0,
+                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+}
+
 void reentry_vfork_begin(long tid)
 {
     for (int i = 0; i < REENTRY_VFORKS; i++) {

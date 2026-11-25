@@ -23,4 +23,8 @@ void reentry_leave_owned(struct reentry_slot *slot, long owner);
  * alone. */
 struct reentry_slot *reentry_exec_release(void);
 void reentry_exec_restore(struct reentry_slot *slot);
+/* Temporarily suspend/resume the calling thread's active reentry lease while
+ * a guest signal handler runs on the restored guest stack. */
+struct reentry_slot *reentry_suspend_current(long *out_tid);
+void reentry_resume_current(struct reentry_slot *slot, long tid);
 #endif

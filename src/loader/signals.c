@@ -48,11 +48,12 @@ extern void svbox_sigsys_restorer(void);
 int sigsys_install_handler(signal_handler_t handler)
 {
 #ifdef __aarch64__
-	/* SA_SIGINFO(4) | SA_RESTORER(0x04000000) | SA_ONSTACK(0x08000000) |
-	 * SA_NODEFER(0x40000000) */
+	/* SA_SIGINFO(4) | SA_RESTORER(0x04000000) | SA_NODEFER(0x40000000).
+	 * Keep on the thread's own stack (no SA_ONSTACK) so entry.S records
+	 * the real guest thread SP when switching onto payload_stack. */
 	k_sigaction_t sa = {
 		handler,
-		0x4c000004ul,
+		0x44000004ul,
 		svbox_sigsys_restorer,
 		0
 	};

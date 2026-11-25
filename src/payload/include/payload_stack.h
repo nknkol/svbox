@@ -6,9 +6,12 @@
  * reentry slot). More than that: those run on their own stack. */
 #define PAYLOAD_STACKS 1024
 #define PAYLOAD_STACK_SIZE (64 * 1024)
+#include <stdint.h>
 /* The top of a stack now owned by this thread, or 0 (none free, or this
- * thread is on one already). */
-void *payload_stack_claim(void);
+ * thread is on one already). guest_sp is saved so async signal trampolines
+ * can switch back onto the thread's real stack before invoking guest handlers. */
+void *payload_stack_claim(void *guest_sp);
 void payload_stack_release(void *top);
+void *payload_stack_lookup_guest_sp(uintptr_t cur_sp);
 void payload_stack_clone_finish(unsigned long flags, long result);
 #endif

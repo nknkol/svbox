@@ -19,11 +19,11 @@
 
 extern long raw_syscall(long, long, long, long, long, long, long);
 
-static struct payload_stack { long owner; void *base; } payload_stacks[PAYLOAD_STACKS];
+static struct payload_stack { long owner; void *base; void *guest_sp; } payload_stacks[PAYLOAD_STACKS];
 /* Slots ever claimed: scans stop there (most processes use a few). */
 static int payload_stacks_used;
 
-void *payload_stack_claim(void)
+void *payload_stack_claim(void *guest_sp)
 {
     long tid = raw_syscall(__NR_gettid, 0, 0, 0, 0, 0, 0);
     if (tid <= 0)
@@ -61,6 +61,7 @@ void *payload_stack_claim(void)
             base = (void *)mem;
             __atomic_store_n(&s->base, base, __ATOMIC_RELEASE);
         }
+        __atomic_store_n(&s->guest_sp, guest_sp, __ATOMIC_RELEASE);
         return (char *)base + PAYLOAD_STACK_SIZE;
     }
     return 0;
@@ -72,10 +73,22 @@ void payload_stack_release(void *top)
         return;
     int used = __atomic_load_n(&payload_stacks_used, __ATOMIC_ACQUIRE);
     for (int i = 0; i < used; i++)
-        if ((char *)__atomic_load_n(&payload_stacks[i].base, __ATOMIC_RELAXED) + PAYLOAD_STACK_SIZE == top) {
+        if ((char *)__atomic_load_n(&payload_stacks[i].base, __ATOMIC_ACQUIRE) + PAYLOAD_STACK_SIZE == top) {
+            __atomic_store_n(&payload_stacks[i].guest_sp, (void *)0, __ATOMIC_RELEASE);
             __atomic_store_n(&payload_stacks[i].owner, 0, __ATOMIC_RELEASE);
             return;
         }
+}
+
+void *payload_stack_lookup_guest_sp(uintptr_t cur_sp)
+{
+    int used = __atomic_load_n(&payload_stacks_used, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < used; i++) {
+        uintptr_t base = (uintptr_t)__atomic_load_n(&payload_stacks[i].base, __ATOMIC_ACQUIRE);
+        if (base && cur_sp >= base && cur_sp < base + PAYLOAD_STACK_SIZE)
+            return __atomic_load_n(&payload_stacks[i].guest_sp, __ATOMIC_ACQUIRE);
+    }
+    return (void *)0;
 }
 
 void payload_stack_clone_finish(unsigned long flags, long result)

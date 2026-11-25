@@ -92,7 +92,9 @@ slow_path:
     ldr     x21, [x19] /* Owner TID: leave releases only its own lease. */
 
     /* Onto a payload stack (none: stay on this one). x23 = the saved
-     * general registers, x22 = the stack to give back. */
+     * general registers, x22 = the stack to give back. Pass guest SP so
+     * payload_sig_trampoline can restore the real guest stack for async signals. */
+    mov     x0, sp
     bl      payload_stack_claim
     mov     x22, x0
     mov     x23, sp
@@ -218,3 +220,72 @@ fast_passthrough:
 fast_path_sigreturn:
     svc     #0
     br      x30
+
+/* Generic async signal trampoline: if a guest signal handler (installed without
+ * SA_ONSTACK) interrupts a thread while SP is on svbox's payload_stack, switch
+ * SP back onto the thread's saved real guest stack (right below pt_regs), patch
+ * ucontext->uc_mcontext.sp, temporarily suspend the reentry lease, invoke the
+ * guest handler, and restore everything cleanly before returning to rt_sigreturn. */
+    .align 4
+    .global payload_sig_trampoline
+    .type payload_sig_trampoline, %function
+payload_sig_trampoline:
+    stp     x29, x30, [sp, #-64]!
+    mov     x29, sp
+    stp     x19, x20, [sp, #16]
+    stp     x21, x22, [sp, #32]
+    stp     x23, x24, [sp, #48]
+
+    mov     x19, x0             /* sig */
+    mov     x20, x1             /* siginfo_t * */
+    mov     x21, x2             /* ucontext_t * */
+
+    mov     x0, x19
+    bl      integrity_get_sig_handler
+    mov     x22, x0             /* guest sa_handler */
+    cbz     x22, .Lsig_done
+
+    mov     x0, sp
+    bl      payload_stack_lookup_guest_sp
+    cbz     x0, .Lsig_direct
+
+    /* Interrupted on payload_stack: switch onto real guest stack (x0). */
+    mov     x23, sp             /* saved payload SP */
+    mov     x24, x0             /* saved guest SP */
+    sub     sp, x24, #32
+    add     x0, sp, #8          /* &saved_tid */
+    bl      reentry_suspend_current
+    str     x0, [sp, #0]        /* saved reentry_slot */
+
+    cbz     x21, 1f
+    ldr     x9, [x21, #432]     /* ucontext->uc_mcontext.sp */
+    str     x9, [sp, #16]
+    str     x24, [x21, #432]
+1:
+    mov     x0, x19
+    mov     x1, x20
+    mov     x2, x21
+    blr     x22
+
+    cbz     x21, 2f
+    ldr     x9, [sp, #16]
+    str     x9, [x21, #432]
+2:
+    ldr     x0, [sp, #0]
+    ldr     x1, [sp, #8]
+    bl      reentry_resume_current
+    mov     sp, x23
+    b       .Lsig_done
+
+.Lsig_direct:
+    mov     x0, x19
+    mov     x1, x20
+    mov     x2, x21
+    blr     x22
+
+.Lsig_done:
+    ldp     x23, x24, [sp, #48]
+    ldp     x21, x22, [sp, #32]
+    ldp     x19, x20, [sp, #16]
+    ldp     x29, x30, [sp], #64
+    ret

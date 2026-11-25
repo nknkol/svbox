@@ -59,12 +59,49 @@ static int backstop_filter(void)
 {
 	unsigned long ranges[2][2] = {{(unsigned long)__ehdr_start, (unsigned long)_end},
 				      {g_payload_lo, g_payload_hi}};
-	struct { unsigned short code; unsigned char jt, jf; unsigned int k; } f[32];
+	struct { unsigned short code; unsigned char jt, jf; unsigned int k; } f[64];
 	int n = 0;
 #define BPF(c, t, e, v) (f[n++] = (typeof(f[0])){(c), (t), (e), (v)})
-	/* seccomp_data: nr at 0, arch at 4, instruction_pointer at 8. */
+	/* seccomp_data: nr at 0, arch at 4, instruction_pointer at 8.
+	 * Allow pure fast-passthrough syscalls (never intercepted by payload's
+	 * slow_syscalls.inc / fd_runtime_syscalls.inc) directly in BPF so unpatched
+	 * libraries avoid SIGSYS trap storms on hot sync/time/poll/signal paths. */
 	BPF(0x20, 0, 0, 0); /* ld nr */
-	static const unsigned allowed[] = {139, 93, 94, 128, 220, 435};
+	static const unsigned allowed[] = {
+		139, /* rt_sigreturn */
+		93,  /* exit */
+		94,  /* exit_group */
+		128, /* restart_syscall */
+		220, /* clone */
+		435, /* clone3 */
+		98,  /* futex */
+		101, /* nanosleep */
+		113, /* clock_gettime */
+		114, /* clock_getres */
+		115, /* clock_nanosleep */
+		120, /* sched_getparam */
+		121, /* sched_getscheduler */
+		124, /* sched_yield */
+		130, /* tkill */
+		131, /* tgkill */
+		132, /* sigaltstack */
+		133, /* rt_sigsuspend */
+		136, /* rt_sigpending */
+		137, /* rt_sigtimedwait */
+		140, /* setpriority */
+		141, /* getpriority */
+		165, /* getrusage */
+		169, /* gettimeofday */
+		172, /* getpid */
+		173, /* getppid */
+		178, /* gettid */
+		21,  /* epoll_ctl */
+		22,  /* epoll_pwait */
+		73,  /* ppoll */
+		95,  /* waitid */
+		214, /* brk */
+		260, /* wait4 */
+	};
 	for (unsigned i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++)
 		BPF(0x15, 0, 0, allowed[i]); /* jeq -> allow (patched below) */
 	int nr_checks = n;

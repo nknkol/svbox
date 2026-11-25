@@ -14,4 +14,5 @@
  * payload or a stub island; a SIGSYS rt_sigaction under the backstop is
  * answered without installing anything (the loader's handler stays). */
 int integrity_check(long number, const long a[6], long *result);
+unsigned long integrity_get_sig_handler(int sig);
 #endif
