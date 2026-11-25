@@ -199,9 +199,9 @@ long pb_proc_readlink(Bridge *b, long a[6])
     if (action < 0) return action;
     long count;
     if (action == FS_LINK_DEFAULT || action == FS_LINK_KEEP) {
-        /* Report virtual device guest paths for /proc/<self>/fd/<N> instead
-         * of the internal host memfd backing name. */
-        if (vdev_enabled() && component[0] >= '0' && component[0] <= '9') {
+        /* Report virtual device or synthesized procfs/sysfs guest paths for
+         * /proc/<self>/fd/<N> instead of internal host memfd backing names. */
+        if (component[0] >= '0' && component[0] <= '9') {
             const char *cur = b->guest;
             if (!strncmp(cur, "/proc/", 6)) {
                 cur += 6;
@@ -219,9 +219,15 @@ long pb_proc_readlink(Bridge *b, long a[6])
                     const char *d = component;
                     while (*d >= '0' && *d <= '9') { fdn = fdn * 10 + (*d++ - '0'); }
                     if (!*d) {
-                        const char *vg = vdev_fd_guest_path(fdn);
+                        const char *vg = vdev_enabled() ? vdev_fd_guest_path(fdn) : NULL;
                         if (vg && strlen(vg) < sizeof(b->cwd)) {
                             strcpy(b->cwd, vg);
+                            count = (long)strlen(b->cwd);
+                            if ((unsigned long)a[3] < (unsigned long)count) count = (long)a[3];
+                            memcpy((void *)a[2], b->cwd, (size_t)count);
+                            return count;
+                        }
+                        if (pb_vfd_guest_path(fdn, b->cwd, sizeof(b->cwd)) == 0) {
                             count = (long)strlen(b->cwd);
                             if ((unsigned long)a[3] < (unsigned long)count) count = (long)a[3];
                             memcpy((void *)a[2], b->cwd, (size_t)count);
@@ -396,7 +402,13 @@ long pb_proc_status(Bridge *b, int flags)
                           line_len >= 16 && !strncmp(b->proc_data + pos, "Seccomp_filters:", 16));
         int is_nnp = (!is_uid && !is_gid && !is_seccomp && !is_secfilt && hide_sec &&
                       line_len >= 11 && !strncmp(b->proc_data + pos, "NoNewPrivs:", 11));
-        if (is_uid || is_gid || is_seccomp || is_secfilt || is_nnp) {
+        int is_cap_zero = (!is_uid && !is_gid && !is_seccomp && !is_secfilt && !is_nnp &&
+                           ids[1] != 0 && line_len >= 7 &&
+                           (!strncmp(b->proc_data + pos, "CapInh:", 7) ||
+                            !strncmp(b->proc_data + pos, "CapPrm:", 7) ||
+                            !strncmp(b->proc_data + pos, "CapEff:", 7) ||
+                            !strncmp(b->proc_data + pos, "CapAmb:", 7)));
+        if (is_uid || is_gid || is_seccomp || is_secfilt || is_nnp || is_cap_zero) {
             if (pos > span_start) {
                 size_t wdone = 0, wlen = pos - span_start;
                 while (wdone < wlen) {
@@ -421,6 +433,12 @@ long pb_proc_status(Bridge *b, int flags)
                     const char *s = "NoNewPrivs:\t0\n";
                     llen = strlen(s);
                     memcpy(line, s, llen);
+                } else if (is_cap_zero) {
+                    memcpy(line, b->proc_data + pos, 7);
+                    const char *z = "\t0000000000000000\n";
+                    size_t zl = strlen(z);
+                    memcpy(line + 7, z, zl);
+                    llen = 7 + zl;
                 } else {
                     const char *s = "Seccomp_filters:\t0\n";
                     llen = strlen(s);
@@ -454,6 +472,7 @@ long pb_proc_status(Bridge *b, int flags)
     }
     return mfd;
 }
+
 
 static long write_all_fd(int fd, const char *buf, size_t len)
 {
@@ -589,6 +608,7 @@ long pb_proc_cpuinfo(Bridge *b, int flags)
     return mfd;
 }
 
+
 static uint64_t parse_kb_value(const char *line, size_t len)
 {
     size_t i = 0;
@@ -684,6 +704,7 @@ long pb_proc_meminfo(Bridge *b, int flags)
     }
     return mfd;
 }
+
 
 static int parse_hex_u64(const char **pp, const char *end, uint64_t *out)
 {
@@ -1025,4 +1046,245 @@ long pb_proc_maps(Bridge *b, int flags)
         return w.rc;
     }
     return mfd;
+}
+
+static size_t append_str(char *dst, size_t cap, size_t pos, const char *s)
+{
+    while (*s && pos < cap)
+        dst[pos++] = *s++;
+    return pos;
+}
+
+/* Generic Linux /proc fallback when the host sandbox denies read access (-EACCES/-EPERM)
+ * to standard global procfs nodes (/proc/version, /proc/uptime, /proc/loadavg, /proc/stat,
+ * /proc/cmdline). On hosts where these nodes are readable, the real host fd is returned. */
+long pb_proc_fallback(Bridge *b, int flags)
+{
+    int kind = 0;
+    if (!strcmp(b->guest, "/proc/version")) kind = 1;
+    else if (!strcmp(b->guest, "/proc/uptime")) kind = 2;
+    else if (!strcmp(b->guest, "/proc/loadavg")) kind = 3;
+    else if (!strcmp(b->guest, "/proc/stat")) kind = 4;
+    else if (!strcmp(b->guest, "/proc/cmdline")) kind = 5;
+    else return -ENOENT;
+
+    long hfd = raw_syscall(__NR_openat, AT_FDCWD, (long)b->host, flags, 0, 0, 0);
+    if (hfd >= 0 || (hfd != -EACCES && hfd != -EPERM))
+        return hfd;
+
+    char buf[2048];
+    size_t p = 0;
+    const size_t cap = sizeof(buf);
+    uint32_t ncpus = g_payload_config.cpu_mask ? popcount64(g_payload_config.cpu_mask) : 1;
+    if (!ncpus) ncpus = 1;
+    if (ncpus > 32) ncpus = 32;
+
+    if (kind == 1) {
+        struct { char sysname[65], nodename[65], release[65], version[65], machine[65], domain[65]; } u;
+        memset(&u, 0, sizeof(u));
+        raw_syscall(__NR_uname, (long)&u, 0, 0, 0, 0, 0);
+        const char *sys = g_payload_config.kernel_sysname[0] ? g_payload_config.kernel_sysname
+                          : (u.sysname[0] ? u.sysname : "Linux");
+        const char *rel = g_payload_config.kernel_release[0] ? g_payload_config.kernel_release
+                          : (u.release[0] ? u.release : "6.1.0");
+        const char *ver = u.version[0] ? u.version : "#1 SMP PREEMPT";
+        p = append_str(buf, cap, p, sys);
+        p = append_str(buf, cap, p, " version ");
+        p = append_str(buf, cap, p, rel);
+        p = append_str(buf, cap, p, " (root@localhost) ");
+        p = append_str(buf, cap, p, ver);
+        p = append_str(buf, cap, p, "\n");
+    } else if (kind == 2) {
+        struct { long tv_sec; long tv_nsec; } ts = { 0, 0 };
+        raw_syscall(__NR_clock_gettime, 7 /* CLOCK_BOOTTIME */, (long)&ts, 0, 0, 0, 0);
+        uint64_t sec = ts.tv_sec > 0 ? (uint64_t)ts.tv_sec : 1;
+        uint64_t cs = ts.tv_nsec >= 0 ? (uint64_t)(ts.tv_nsec / 10000000L) : 0;
+        if (cs > 99) cs = 99;
+        p = append_u64(buf, cap, p, sec);
+        p = append_str(buf, cap, p, ".");
+        if (cs < 10 && p < cap) buf[p++] = '0';
+        p = append_u64(buf, cap, p, cs);
+        p = append_str(buf, cap, p, " ");
+        p = append_u64(buf, cap, p, sec * (uint64_t)ncpus);
+        p = append_str(buf, cap, p, ".");
+        if (cs < 10 && p < cap) buf[p++] = '0';
+        p = append_u64(buf, cap, p, cs);
+        p = append_str(buf, cap, p, "\n");
+    } else if (kind == 3) {
+        p = append_str(buf, cap, p, "0.10 0.08 0.05 1/64 1\n");
+    } else if (kind == 4) {
+        struct { long tv_sec; long tv_nsec; } rt = { 0, 0 }, bt = { 0, 0 };
+        raw_syscall(__NR_clock_gettime, 0 /* CLOCK_REALTIME */, (long)&rt, 0, 0, 0, 0);
+        raw_syscall(__NR_clock_gettime, 7 /* CLOCK_BOOTTIME */, (long)&bt, 0, 0, 0, 0);
+        uint64_t btime = (rt.tv_sec > bt.tv_sec && rt.tv_sec > 0) ? (uint64_t)(rt.tv_sec - bt.tv_sec) : 1700000000ull;
+        p = append_str(buf, cap, p, "cpu  0 0 0 0 0 0 0 0 0 0\n");
+        for (uint32_t i = 0; i < ncpus; i++) {
+            p = append_str(buf, cap, p, "cpu");
+            p = append_u32(buf, cap, p, i);
+            p = append_str(buf, cap, p, " 0 0 0 0 0 0 0 0 0 0\n");
+        }
+        p = append_str(buf, cap, p, "intr 0\nctxt 0\nbtime ");
+        p = append_u64(buf, cap, p, btime);
+        p = append_str(buf, cap, p, "\nprocesses 64\nprocs_running 1\nprocs_blocked 0\n"
+                                    "softirq 0 0 0 0 0 0 0 0 0 0 0\n");
+    } else {
+        p = append_str(buf, cap, p, "\n");
+    }
+
+    long mfd = raw_syscall(__NR_memfd_create, (long)"procfs",
+                           (flags & O_CLOEXEC) ? 1 : 0, 0, 0, 0, 0);
+    if (mfd < 0)
+        return mfd;
+    long rc = write_all_fd((int)mfd, buf, p);
+    if (rc >= 0) rc = raw_syscall(__NR_lseek, mfd, 0, 0, 0, 0, 0);
+    if (rc < 0) {
+        raw_syscall(__NR_close, mfd, 0, 0, 0, 0, 0);
+        return rc;
+    }
+    return mfd;
+}
+
+/* ---- Virtualized procfs/sysfs memfd tracking ---- */
+#define VFD_MAX 256u
+struct vfd_slot {
+    int fd;
+    uint8_t is_procfs;
+    char path[128];
+};
+static struct vfd_slot g_vfds[VFD_MAX];
+static unsigned g_vfd_active;
+static int g_vfd_lock;
+
+static inline void vfd_lock(void)
+{
+    while (__atomic_test_and_set(&g_vfd_lock, __ATOMIC_ACQUIRE))
+        raw_syscall(__NR_sched_yield, 0, 0, 0, 0, 0, 0);
+}
+static inline void vfd_unlock(void)
+{
+    __atomic_clear(&g_vfd_lock, __ATOMIC_RELEASE);
+}
+
+void pb_vfd_record(int fd, const char *guest_path)
+{
+    if (fd < 0 || !guest_path || !guest_path[0])
+        return;
+    char norm[128];
+    if (!strncmp(guest_path, "/proc/self/", 11)) {
+        format_proc(norm, current_id(__NR_getpid), 0);
+        size_t bl = strlen(norm);
+        size_t tl = strlen(guest_path + 10);
+        if (bl + tl < sizeof(norm))
+            memcpy(norm + bl, guest_path + 10, tl + 1);
+    } else if (!strncmp(guest_path, "/proc/thread-self/", 18)) {
+        format_proc(norm, current_id(__NR_getpid), current_id(__NR_gettid));
+        size_t bl = strlen(norm);
+        size_t tl = strlen(guest_path + 17);
+        if (bl + tl < sizeof(norm))
+            memcpy(norm + bl, guest_path + 17, tl + 1);
+    } else {
+        size_t l = strlen(guest_path);
+        if (l >= sizeof(norm)) l = sizeof(norm) - 1;
+        memcpy(norm, guest_path, l);
+        norm[l] = '\0';
+    }
+    uint8_t is_proc = (!strncmp(norm, "/proc/", 6)) ? 1 : 0;
+
+    vfd_lock();
+    int free_idx = -1;
+    for (unsigned i = 0; i < VFD_MAX; i++) {
+        if (g_vfds[i].path[0] && g_vfds[i].fd == fd) {
+            g_vfds[i].is_procfs = is_proc;
+            strcpy(g_vfds[i].path, norm);
+            vfd_unlock();
+            return;
+        }
+        if (!g_vfds[i].path[0] && free_idx < 0)
+            free_idx = (int)i;
+    }
+    if (free_idx >= 0) {
+        g_vfds[free_idx].fd = fd;
+        g_vfds[free_idx].is_procfs = is_proc;
+        strcpy(g_vfds[free_idx].path, norm);
+        __atomic_fetch_add(&g_vfd_active, 1u, __ATOMIC_RELEASE);
+    }
+    vfd_unlock();
+}
+
+void proot_vfd_close(int fd)
+{
+    if (fd < 0 || !__atomic_load_n(&g_vfd_active, __ATOMIC_ACQUIRE))
+        return;
+    vfd_lock();
+    for (unsigned i = 0; i < VFD_MAX; i++) {
+        if (g_vfds[i].path[0] && g_vfds[i].fd == fd) {
+            g_vfds[i].path[0] = '\0';
+            g_vfds[i].fd = -1;
+            __atomic_fetch_sub(&g_vfd_active, 1u, __ATOMIC_RELEASE);
+            break;
+        }
+    }
+    vfd_unlock();
+}
+
+void proot_vfd_dup(int oldfd, int newfd)
+{
+    if (oldfd < 0 || newfd < 0 || oldfd == newfd)
+        return;
+    if (!__atomic_load_n(&g_vfd_active, __ATOMIC_ACQUIRE))
+        return;
+    char copy[128];
+    copy[0] = '\0';
+    vfd_lock();
+    for (unsigned i = 0; i < VFD_MAX; i++) {
+        if (g_vfds[i].path[0] && g_vfds[i].fd == oldfd) {
+            strcpy(copy, g_vfds[i].path);
+            break;
+        }
+    }
+    vfd_unlock();
+    if (copy[0])
+        pb_vfd_record(newfd, copy);
+    else
+        proot_vfd_close(newfd);
+}
+
+int pb_vfd_guest_path(int fd, char *out, size_t cap)
+{
+    if (fd < 0 || !out || !cap || !__atomic_load_n(&g_vfd_active, __ATOMIC_ACQUIRE))
+        return -1;
+    vfd_lock();
+    for (unsigned i = 0; i < VFD_MAX; i++) {
+        if (g_vfds[i].path[0] && g_vfds[i].fd == fd) {
+            size_t l = strlen(g_vfds[i].path);
+            if (l >= cap) l = cap - 1;
+            memcpy(out, g_vfds[i].path, l);
+            out[l] = '\0';
+            vfd_unlock();
+            return 0;
+        }
+    }
+    vfd_unlock();
+    return -1;
+}
+
+void proot_vfd_fix_fstat(int fd, void *stat_buf)
+{
+    if (fd < 0 || !stat_buf || !__atomic_load_n(&g_vfd_active, __ATOMIC_ACQUIRE))
+        return;
+    int is_proc = 0;
+    vfd_lock();
+    for (unsigned i = 0; i < VFD_MAX; i++) {
+        if (g_vfds[i].path[0] && g_vfds[i].fd == fd) {
+            is_proc = g_vfds[i].is_procfs;
+            break;
+        }
+    }
+    vfd_unlock();
+    if (!is_proc)
+        return;
+    struct stat *st = (struct stat *)stat_buf;
+    st->st_mode = (st->st_mode & ~07777u) | 0444u;
+    st->st_size = 0;
+    st->st_blocks = 0;
 }

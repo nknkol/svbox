@@ -61,4 +61,8 @@ int proot_handles_syscall(long number);
 long proot_syscall(long number, long args[6]);
 /* R6: an ioctl on an emulated loop device (/dev/loop*): 1 with *result. */
 int proot_loop_ioctl(long fd, unsigned long cmd, long arg, long *result);
+/* Virtualized procfs/sysfs memfd tracking for /proc/self/fd readlink & fstat. */
+void proot_vfd_close(int fd);
+void proot_vfd_dup(int oldfd, int newfd);
+void proot_vfd_fix_fstat(int fd, void *stat_buf);
 #endif

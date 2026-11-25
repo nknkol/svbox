@@ -193,6 +193,9 @@ long pb_proc_status(Bridge *b, int flags);
 long pb_proc_maps(Bridge *b, int flags);
 long pb_proc_cpuinfo(Bridge *b, int flags);
 long pb_proc_meminfo(Bridge *b, int flags);
+long pb_proc_fallback(Bridge *b, int flags);
 long pb_proc_readlink(Bridge *b, long a[6]);
+void pb_vfd_record(int fd, const char *guest_path);
+int pb_vfd_guest_path(int fd, char *out, size_t cap);
 
 #endif

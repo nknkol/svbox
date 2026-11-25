@@ -653,8 +653,12 @@ long pb_dispatch(Bridge *b, long number, long a[6], struct proot_open_origin *or
             if (number == __NR_newfstatat) {
                 if (flags & ~(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW | AT_NO_AUTOMOUNT))
                     return -EINVAL;
-                if (a[0] != AT_FDCWD)
-                    return raw_syscall(__NR_fstat, a[0], a[2], 0, 0, 0, 0);
+                if (a[0] != AT_FDCWD) {
+                    long frc = raw_syscall(__NR_fstat, a[0], a[2], 0, 0, 0, 0);
+                    if (frc == 0 && a[2])
+                        proot_vfd_fix_fstat((int)a[0], (void *)a[2]);
+                    return frc;
+                }
                 return raw_syscall(number, AT_FDCWD, (long)".", a[2],
                                    flags & ~AT_EMPTY_PATH, 0, 0);
             }
@@ -715,12 +719,16 @@ long pb_dispatch(Bridge *b, long number, long a[6], struct proot_open_origin *or
              !strcmp(path, "/sys/devices/system/cpu/possible"))) {
             strcpy(b->guest, path);
             b->defer_final = false;
-            return pb_proc_cpuinfo(b, (int)a[2]);
+            long vfd = pb_proc_cpuinfo(b, (int)a[2]);
+            if (vfd >= 0) pb_vfd_record((int)vfd, b->guest);
+            return vfd;
         }
         if (g_payload_config.mem_limit_mb && !strcmp(path, "/proc/meminfo")) {
             strcpy(b->guest, path);
             b->defer_final = false;
-            return pb_proc_meminfo(b, (int)a[2]);
+            long vfd = pb_proc_meminfo(b, (int)a[2]);
+            if (vfd >= 0) pb_vfd_record((int)vfd, b->guest);
+            return vfd;
         }
     }
 
@@ -773,6 +781,10 @@ long pb_dispatch(Bridge *b, long number, long a[6], struct proot_open_origin *or
             ret = pb_proc_cpuinfo(b, (int)a[2]);
         if (ret == -ENOENT && g_payload_config.mem_limit_mb)
             ret = pb_proc_meminfo(b, (int)a[2]);
+        if (ret == -ENOENT && g_payload_config.mode == CONFIG_MODE_CONTAINER)
+            ret = pb_proc_fallback(b, (int)a[2]);
+        if (ret >= 0)
+            pb_vfd_record((int)ret, b->guest);
     } else ret = -ENOENT;
 
     if (ret == -ENOENT && number == __NR_newfstatat && follow && b->final_match) {

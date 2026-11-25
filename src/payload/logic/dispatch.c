@@ -438,6 +438,28 @@ long dispatch_syscall(long number, long a[6])
     case __NR_syslog:
 #endif
         return platform_is_harmonyos() ? -EPERM : passthrough(number, a);
+    case __NR_close:
+        proot_vfd_close((int)a[0]);
+        return passthrough(number, a);
+    case __NR_dup:
+    case __NR_dup3: {
+        long rc = passthrough(number, a);
+        if (rc >= 0)
+            proot_vfd_dup((int)a[0], (int)rc);
+        return rc;
+    }
+    case __NR_fcntl: {
+        long rc = passthrough(number, a);
+        if (rc >= 0 && (a[1] == 0 /* F_DUPFD */ || a[1] == 1030 /* F_DUPFD_CLOEXEC */))
+            proot_vfd_dup((int)a[0], (int)rc);
+        return rc;
+    }
+    case __NR_fstat: {
+        long rc = passthrough(number, a);
+        if (rc == 0 && a[1])
+            proot_vfd_fix_fstat((int)a[0], (void *)a[1]);
+        return rc;
+    }
     default:
         return passthrough(number, a);
     }
