@@ -727,10 +727,13 @@ static long binder_write_read(struct vdev_open_slot *slot, unsigned long arg)
     uint64_t wrem = bwr.write_size > bwr.write_consumed ? bwr.write_size - bwr.write_consumed : 0;
     const uint8_t *src = (const uint8_t *)(uintptr_t)(bwr.write_buffer + bwr.write_consumed);
 
-    /* Fast zero-mmap check: 99% of Binder calls fit inside an 8 KiB stack buffer. */
-    int use_stack = (rcap <= VDEV_BWR_STACK_CAP - 1024u && wrem <= 4096u);
-    if (use_stack) {
-        size_t est = sizeof(struct vdev_binder_wr_req);
+    /* Estimate total marshaled payload size for write commands so we can choose:
+     * 1) 8 KiB stack fast-path (99% of calls, zero mmap),
+     * 2) 256 KiB cached per-thread scratch, or
+     * 3) one-shot mmap up to VDEV_MAX_PAYLOAD (2 MiB) for large IPC transfers. */
+    size_t est = sizeof(struct vdev_binder_wr_req);
+    int has_sg = 0;
+    {
         size_t p = 0;
         while (p + 4 <= wrem) {
             uint32_t cmd;
@@ -738,40 +741,68 @@ static long binder_write_read(struct vdev_open_slot *slot, unsigned long arg)
             uint32_t asz = binder_bc_arg_size(cmd);
             if (p + 4 + asz > wrem)
                 break;
-            if (cmd == SV_BC_TRANSACTION_SG || cmd == SV_BC_REPLY_SG) {
-                use_stack = 0;
-                break;
-            }
-            if (cmd == SV_BC_TRANSACTION || cmd == SV_BC_REPLY) {
+            if (cmd == SV_BC_TRANSACTION || cmd == SV_BC_REPLY ||
+                cmd == SV_BC_TRANSACTION_SG || cmd == SV_BC_REPLY_SG) {
                 struct sv_binder_transaction_data txn;
                 memcpy(&txn, src + p + 4, sizeof(txn));
-                if (txn.data_size > VDEV_BWR_STACK_CAP || txn.offsets_size > VDEV_BWR_STACK_CAP) {
-                    use_stack = 0;
+                if (txn.data_size > VDEV_MAX_PAYLOAD || txn.offsets_size > VDEV_MAX_PAYLOAD) {
+                    est = (size_t)VDEV_MAX_PAYLOAD + 1u;
                     break;
                 }
                 est += 4 + asz + (size_t)txn.data_size + (size_t)txn.offsets_size;
+                if (cmd == SV_BC_TRANSACTION_SG || cmd == SV_BC_REPLY_SG) {
+                    has_sg = 1;
+                    if (p + 4 + sizeof(struct sv_binder_transaction_data_sg) <= wrem) {
+                        struct sv_binder_transaction_data_sg tsg;
+                        memcpy(&tsg, src + p + 4, sizeof(tsg));
+                        if (tsg.buffers_size > VDEV_MAX_PAYLOAD) {
+                            est = (size_t)VDEV_MAX_PAYLOAD + 1u;
+                            break;
+                        }
+                        est += (size_t)tsg.buffers_size;
+                    }
+                }
             } else {
                 est += 4 + asz;
             }
-            if (est > VDEV_BWR_STACK_CAP) {
-                use_stack = 0;
+            if (est > VDEV_MAX_PAYLOAD) {
+                est = (size_t)VDEV_MAX_PAYLOAD + 1u;
                 break;
             }
             p += 4 + asz;
         }
     }
 
+    int use_stack = (!has_sg && rcap <= VDEV_BWR_STACK_CAP - 1024u && est <= VDEV_BWR_STACK_CAP);
     uint8_t stack_buf[VDEV_BWR_STACK_CAP];
     uint8_t *scratch;
     size_t buf_cap;
+    size_t dyn_mmap_cap = 0;
     if (use_stack) {
         scratch = stack_buf;
         buf_cap = sizeof(stack_buf);
-    } else {
+    } else if (est <= VDEV_BWR_SCRATCH_CAP) {
         scratch = get_thread_bwr_scratch(slot, cur_pid, cur_tid);
         if (!scratch)
             return -ENOMEM;
         buf_cap = VDEV_BWR_SCRATCH_CAP;
+    } else if (est <= VDEV_MAX_PAYLOAD) {
+        size_t need_cap = est;
+        if (need_cap < (size_t)rcap + 4096u)
+            need_cap = (size_t)rcap + 4096u;
+        need_cap = (need_cap + 4095ul) & ~4095ul;
+        if (need_cap > VDEV_MAX_PAYLOAD)
+            need_cap = VDEV_MAX_PAYLOAD;
+        long addr = raw_syscall(__NR_mmap, 0, (long)need_cap,
+                                PROT_READ_ | PROT_WRITE_,
+                                MAP_PRIVATE_ | MAP_ANONYMOUS_, -1, 0);
+        if (addr < 0 && addr >= -4095)
+            return -ENOMEM;
+        scratch = (uint8_t *)(uintptr_t)addr;
+        buf_cap = need_cap;
+        dyn_mmap_cap = need_cap;
+    } else {
+        return -ENOMEM;
     }
 
     struct vdev_binder_wr_req *wreq = (struct vdev_binder_wr_req *)scratch;
@@ -952,6 +983,9 @@ static long binder_write_read(struct vdev_open_slot *slot, unsigned long arg)
     if (rc < 0) {
         for (uint32_t i = 0; i < recv_fd_count; i++)
             raw_syscall(__NR_close, recv_fds[i], 0, 0, 0, 0, 0);
+    }
+    if (dyn_mmap_cap > 0) {
+        raw_syscall(__NR_munmap, (long)scratch, (long)dyn_mmap_cap, 0, 0, 0, 0);
     }
     return rc;
 }

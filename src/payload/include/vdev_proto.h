@@ -11,7 +11,7 @@
 #define VDEV_PROTO_VERSION 1u
 
 #define VDEV_MAX_FDS       16
-#define VDEV_MAX_PAYLOAD   (512u * 1024u)
+#define VDEV_MAX_PAYLOAD   (2u * 1024u * 1024u)
 
 /* Device classes (matches config.h VDEV_TYPE_*). */
 #define VDEV_TYPE_CHR      0
