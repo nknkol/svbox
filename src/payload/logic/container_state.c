@@ -957,6 +957,35 @@ long owners_mark_symlink(const struct stat *st)
     return update(st, set, OWNER_IDS | OWNER_MODE | OWNER_SYMLINK, uid, gid, 0);
 }
 
+void owners_fix_getdents(int dirfd, void *buf, long len)
+{
+    if (dirfd < 0 || !buf || len <= 0 || !owners_has_symlinks())
+        return;
+    struct stat dst;
+    if (raw_syscall(__NR_fstat, dirfd, (long)&dst, 0, 0, 0, 0) < 0)
+        return;
+    unsigned char *p = (unsigned char *)buf;
+    long off = 0;
+    while (off + 19 <= len) {
+        uint64_t d_ino;
+        uint16_t reclen;
+        memcpy(&d_ino, p + off, 8);
+        memcpy(&reclen, p + off + 16, 2);
+        if (reclen < 19 || off + reclen > len)
+            break;
+        unsigned char d_type = p[off + 18];
+        if (d_type == 8 /* DT_REG */ || d_type == 0 /* DT_UNKNOWN */) {
+            struct stat qst;
+            qst.st_dev = dst.st_dev;
+            qst.st_ino = d_ino;
+            struct owner_record r;
+            if (find(&qst, &r) && (r.flags & OWNER_SYMLINK))
+                p[off + 18] = 10; /* DT_LNK */
+        }
+        off += reclen;
+    }
+}
+
 long owners_check_access(const struct stat *st, unsigned mode, int use_effective)
 {
     unsigned req = mode & 7u; /* R_OK=4, W_OK=2, X_OK=1 */

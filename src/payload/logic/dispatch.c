@@ -364,6 +364,12 @@ long dispatch_syscall(long number, long a[6])
         if (g_payload_config.seccomp_backstop || g_payload_config.trap_sigsys) {
             if (a[0] == 21 /* PR_GET_SECCOMP */)
                 return 0;
+            /* A guest seccomp-BPF filter stacked in the host kernel would also
+             * intercept svbox's own in-process payload syscalls (VFS, broker,
+             * platform_mprotect_exec) and conflict with svbox's SIGSYS handler.
+             * Report seccomp filter mode unavailable (same as CONFIG_SECCOMP_FILTER=n). */
+            if (a[0] == 22 /* PR_SET_SECCOMP */)
+                return -EINVAL;
             if (a[0] == 38 /* PR_SET_NO_NEW_PRIVS */ && a[1] == 1 && !a[2] && !a[3] && !a[4]) {
                 guest_nnp = 1;
                 return 0;
@@ -373,6 +379,12 @@ long dispatch_syscall(long number, long a[6])
         }
         return passthrough(number, a);
     }
+#ifdef __NR_seccomp
+    case __NR_seccomp:
+        if (g_payload_config.seccomp_backstop || g_payload_config.trap_sigsys)
+            return -ENOSYS;
+        return passthrough(number, a);
+#endif
     /* glibc falls back from both; the sandbox kills rseq with SIGSYS. */
     case __NR_rseq:
     case __NR_clone3:

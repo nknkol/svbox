@@ -178,5 +178,7 @@ long owners_check_access(const struct stat *st, unsigned mode, int use_effective
 int owners_has_symlinks(void);
 int owners_is_symlink(const struct stat *st);
 long owners_mark_symlink(const struct stat *st);
+/* Rewrite d_type from DT_REG/DT_UNKNOWN to DT_LNK for virtual symlinks in getdents64. */
+void owners_fix_getdents(int dirfd, void *buf, long len);
 
 #endif

@@ -174,6 +174,9 @@ SLOW_SYSCALL(__NR_membarrier)
 #ifdef __NR_prctl
 SLOW_SYSCALL(__NR_prctl)
 #endif
+#ifdef __NR_seccomp
+SLOW_SYSCALL(__NR_seccomp)
+#endif
 #ifdef __NR_faccessat2
 SLOW_SYSCALL(__NR_faccessat2)
 #endif

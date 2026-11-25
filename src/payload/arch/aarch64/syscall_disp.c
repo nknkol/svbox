@@ -107,6 +107,8 @@ long syscall_dispatcher(long sys_no, pt_regs *regs)
         long again[6] = {a[0], a[1], a[2], a[3], a[4], a[5]};
         ret = DISPATCH(sys_no, again);
     }
+    if (sys_no == __NR_getdents64 && ret > 0)
+        owners_fix_getdents((int)a[0], (void *)a[1], ret);
     /* R6: an openat2 lookup may be the kernel's own (RESOLVE_BENEATH, or
      * passed through): a layer image placeholder is filled all the same. */
     if (sys_no == __NR_openat2 && ret >= 0 && union_enabled()) {
