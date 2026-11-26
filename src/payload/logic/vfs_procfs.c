@@ -444,12 +444,13 @@ long pb_proc_status(Bridge *b, int flags)
                     if (pid == self_pid) {
                         uint32_t grps[32];
                         int ng = fake_ids_groups(grps);
-                        for (int gi = 0; gi < ng && llen + 12 < sizeof(line); gi++) {
-                            if (gi > 0) line[llen++] = ' ';
-                            llen = append_u32(line, sizeof(line) - 2, llen, grps[gi]);
+                        for (int gi = 0; gi < ng && llen + 13 < sizeof(line); gi++) {
+                            llen = append_u32(line, sizeof(line) - 3, llen, grps[gi]);
+                            line[llen++] = ' ';
                         }
                     } else {
-                        llen = append_u32(line, sizeof(line) - 2, llen, ids[4]);
+                        llen = append_u32(line, sizeof(line) - 3, llen, ids[4]);
+                        line[llen++] = ' ';
                     }
                     line[llen++] = '\n';
                 } else if (is_sigcgt || is_sigign) {

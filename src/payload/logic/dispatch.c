@@ -117,6 +117,139 @@ static long map_exec_copy(const long a[6])
     return mapped;
 }
 
+/* HarmonyOS refuses mprotect(..., PROT_EXEC) on non-anonymous VMAs (e.g.
+ * MAP_PRIVATE file/memfd mappings or mremap()ed read-only segments) with
+ * -EACCES even inside PR_HM_JIT. On Linux, upgrading a MAP_PRIVATE mapping
+ * to executable is valid; materialize the private pages as an anonymous copy
+ * preserving their exact bytes, then apply platform_mprotect_exec(). Never
+ * convert MAP_SHARED mappings. */
+static int parse_maps_hex(const char **pp, const char *end, uintptr_t *out)
+{
+    const char *p = *pp;
+    uintptr_t v = 0;
+    int digits = 0;
+    while (p < end) {
+        char c = *p;
+        unsigned d;
+        if (c >= '0' && c <= '9') d = (unsigned)(c - '0');
+        else if (c >= 'a' && c <= 'f') d = (unsigned)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') d = (unsigned)(c - 'A' + 10);
+        else break;
+        v = (v << 4) | d;
+        digits++;
+        p++;
+    }
+    if (!digits) return 0;
+    *pp = p;
+    *out = v;
+    return 1;
+}
+
+static long mprotect_private_exec_copy(unsigned long addr, size_t len, int prot)
+{
+    if (!len)
+        return 0;
+    uintptr_t lo = (uintptr_t)addr & ~(uintptr_t)4095ul;
+    uintptr_t raw_end = (uintptr_t)addr + len;
+    if (raw_end < (uintptr_t)addr)
+        return -EACCES;
+    uintptr_t hi = (raw_end + 4095ul) & ~(uintptr_t)4095ul;
+    if (hi <= lo || (hi - lo) > (256ul << 20))
+        return -EACCES;
+    size_t plen = (size_t)(hi - lo);
+
+    long mfd = raw_syscall(__NR_openat, -100 /* AT_FDCWD */, (long)"/proc/self/maps",
+                           0x80000 /* O_RDONLY | O_CLOEXEC */, 0, 0, 0);
+    if (mfd < 0)
+        return -EACCES;
+
+    struct { uintptr_t lo, hi; int readable; } subs[16];
+    int nsubs = 0;
+    uintptr_t covered = lo;
+    int ok = 1;
+    char rbuf[4096], line[512];
+    size_t line_len = 0;
+    int eof = 0;
+
+    while (!eof && ok && covered < hi) {
+        long nr = raw_syscall(__NR_read, mfd, (long)rbuf, sizeof(rbuf), 0, 0, 0);
+        if (nr <= 0) {
+            eof = 1;
+            if (!line_len) break;
+        }
+        size_t ri = 0;
+        while (ok && covered < hi && (ri < (size_t)(nr > 0 ? nr : 0) || (eof && line_len > 0))) {
+            int got = 0;
+            if (!eof) {
+                while (ri < (size_t)nr) {
+                    char ch = rbuf[ri++];
+                    if (line_len + 1 < sizeof(line))
+                        line[line_len++] = ch;
+                    if (ch == '\n') { got = 1; break; }
+                }
+            } else {
+                got = 1;
+            }
+            if (!got) break;
+            const char *p = line, *lend = line + line_len;
+            uintptr_t vlo = 0, vhi = 0;
+            if (parse_maps_hex(&p, lend, &vlo) && p < lend && *p == '-' &&
+                (++p, parse_maps_hex(&p, lend, &vhi)) && p + 5 <= lend && *p == ' ') {
+                const char *perms = p + 1;
+                if (vhi > covered && vlo < hi) {
+                    if (vlo > covered || perms[3] != 'p' || nsubs >= 16) {
+                        ok = 0;
+                    } else {
+                        uintptr_t ov_lo = vlo > lo ? vlo : lo;
+                        uintptr_t ov_hi = vhi < hi ? vhi : hi;
+                        subs[nsubs].lo = ov_lo;
+                        subs[nsubs].hi = ov_hi;
+                        subs[nsubs].readable = (perms[0] == 'r');
+                        nsubs++;
+                        covered = ov_hi;
+                    }
+                } else if (vlo >= hi) {
+                    ok = (covered >= hi);
+                    eof = 1;
+                }
+            }
+            line_len = 0;
+            if (eof) break;
+        }
+    }
+    raw_syscall(__NR_close, mfd, 0, 0, 0, 0, 0);
+    if (!ok || covered < hi)
+        return -EACCES;
+
+    long tmp = raw_syscall(__NR_mmap, 0, (long)plen, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (tmp < 0)
+        return tmp;
+    for (int i = 0; i < nsubs; i++) {
+        if (!subs[i].readable) {
+            long mrc = raw_syscall(__NR_mprotect, (long)subs[i].lo,
+                                   (long)(subs[i].hi - subs[i].lo), PROT_READ, 0, 0, 0);
+            if (mrc < 0) {
+                raw_syscall(__NR_munmap, tmp, (long)plen, 0, 0, 0, 0);
+                return -EACCES;
+            }
+        }
+    }
+    memcpy((void *)tmp, (const void *)lo, plen);
+    long mapped = raw_syscall(__NR_mmap, (long)lo, (long)plen, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (mapped != (long)lo) {
+        raw_syscall(__NR_munmap, tmp, (long)plen, 0, 0, 0, 0);
+        return mapped < 0 ? mapped : -EACCES;
+    }
+    memcpy((void *)lo, (const void *)tmp, plen);
+    raw_syscall(__NR_munmap, tmp, (long)plen, 0, 0, 0, 0);
+    long rc = platform_mprotect_exec(lo, plen, prot);
+    if (rc == 0)
+        vma_track_remove(lo, plen);
+    return rc;
+}
+
 /* Executable memory is readable (the hook scanner reads it) and hooked
  * before any of it can run. */
 static long map_exec(long number, long a[6])
@@ -153,6 +286,8 @@ static long map_exec(long number, long a[6])
             return ret;
     } else {
         ret = platform_mprotect_exec(a[0], (unsigned long)a[1], (int)a[2]);
+        if (ret == -EACCES && platform_is_harmonyos())
+            ret = mprotect_private_exec_copy((unsigned long)a[0], (size_t)a[1], (int)a[2]);
     }
     if (ret < 0)
         return ret;
@@ -362,6 +497,55 @@ long dispatch_syscall(long number, long a[6])
         if (a[2] & PROT_EXEC)
             return map_exec(number, a);
         return passthrough(number, a);
+#ifdef __NR_mremap
+    case __NR_mremap: {
+        /* On Linux, mremap(..., MREMAP_DONTUNMAP) on a file-backed MAP_PRIVATE
+         * mapping keeps the source pages intact (clean pages re-fault from the
+         * backing file). Because map_exec_copy materializes executable file
+         * segments as MAP_ANONYMOUS copies, forwarding MREMAP_DONTUNMAP to the
+         * host kernel would move the anonymous pages and zero-fill the live
+         * source segment. Duplicate via anonymous copy so both ranges retain
+         * the exact bytes. */
+        unsigned long flags = (unsigned long)a[3];
+        if ((flags & 4ul /* MREMAP_DONTUNMAP */) && a[1] > 0 && a[2] > 0) {
+            uintptr_t old_addr = (uintptr_t)a[0];
+            size_t old_len = (size_t)a[1];
+            size_t new_len = (size_t)a[2];
+            uintptr_t ov_lo = 0, ov_hi = 0;
+            if ((old_addr & 4095ul) == 0 && old_addr + old_len > old_addr &&
+                vma_track_next_overlap(old_addr, old_addr + old_len, &ov_lo, &ov_hi)) {
+                if ((flags & 1ul /* MREMAP_MAYMOVE */) == 0)
+                    return -EINVAL;
+                int fixed = (flags & 2ul /* MREMAP_FIXED */) != 0;
+                long hint = fixed ? a[4] : 0;
+                if (fixed) {
+                    uintptr_t h = (uintptr_t)hint;
+                    if ((h & 4095ul) != 0 || h + new_len <= h)
+                        return -EINVAL;
+                    if (h < old_addr + old_len && h + new_len > old_addr)
+                        return -EINVAL;
+                }
+                int mflags = MAP_PRIVATE | MAP_ANONYMOUS | (fixed ? MAP_FIXED : 0);
+                long dst = raw_syscall(__NR_mmap, hint, (long)new_len,
+                                       PROT_READ | PROT_WRITE, mflags, -1, 0);
+                if (dst < 0)
+                    return dst;
+                size_t copy_len = old_len < new_len ? old_len : new_len;
+                memcpy((void *)dst, (const void *)old_addr, copy_len);
+                long prc = platform_mprotect_exec((unsigned long)dst, new_len,
+                                                  PROT_READ | PROT_EXEC);
+                if (prc < 0) {
+                    raw_syscall(__NR_munmap, dst, (long)new_len, 0, 0, 0, 0);
+                    return prc;
+                }
+                if (fixed)
+                    vma_track_remove((uintptr_t)dst, new_len);
+                return dst;
+            }
+        }
+        return passthrough(number, a);
+    }
+#endif
     case __NR_madvise: {
         int advice = (int)a[2];
         /* On Linux, MADV_DONTNEED / MADV_DONTNEED_LOCKED on a file-backed
