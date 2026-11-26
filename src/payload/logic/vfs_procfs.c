@@ -1013,10 +1013,61 @@ long pb_proc_meminfo(Bridge *b, int flags)
             rval = limit_kb;
         } else if (llen >= 8 && !strncmp(lp, "MemFree:", 8)) {
             uint64_t v = parse_kb_value(lp, llen);
-            if (v > limit_kb) { rkey = "MemFree:"; rval = limit_kb / 2; }
+            if (v > limit_kb / 2) { rkey = "MemFree:"; rval = limit_kb / 2; }
         } else if (llen >= 13 && !strncmp(lp, "MemAvailable:", 13)) {
             uint64_t v = parse_kb_value(lp, llen);
-            if (v > limit_kb) { rkey = "MemAvailable:"; rval = (limit_kb * 3) / 4; }
+            if (v > (limit_kb * 3) / 4) { rkey = "MemAvailable:"; rval = (limit_kb * 3) / 4; }
+        } else if (llen >= 8 && !strncmp(lp, "Buffers:", 8)) {
+            uint64_t v = parse_kb_value(lp, llen);
+            if (v > limit_kb / 16) { rkey = "Buffers:"; rval = limit_kb / 16; }
+        } else if (llen >= 7 && !strncmp(lp, "Cached:", 7)) {
+            uint64_t v = parse_kb_value(lp, llen);
+            if (v > limit_kb / 4) { rkey = "Cached:"; rval = limit_kb / 4; }
+        } else if (llen >= 11 && !strncmp(lp, "SwapCached:", 11)) {
+            uint64_t v = parse_kb_value(lp, llen);
+            if (v > limit_kb / 16) { rkey = "SwapCached:"; rval = limit_kb / 16; }
+        } else if (llen >= 7 && !strncmp(lp, "Active:", 7)) {
+            uint64_t v = parse_kb_value(lp, llen);
+            if (v > limit_kb / 2) { rkey = "Active:"; rval = limit_kb / 2; }
+        } else if (llen >= 9 && !strncmp(lp, "Inactive:", 9)) {
+            uint64_t v = parse_kb_value(lp, llen);
+            if (v > limit_kb / 3) { rkey = "Inactive:"; rval = limit_kb / 3; }
+        } else if (llen >= 13 && !strncmp(lp, "Active(anon):", 13)) {
+            uint64_t v = parse_kb_value(lp, llen);
+            if (v > limit_kb / 3) { rkey = "Active(anon):"; rval = limit_kb / 3; }
+        } else if (llen >= 15 && !strncmp(lp, "Inactive(anon):", 15)) {
+            uint64_t v = parse_kb_value(lp, llen);
+            if (v > limit_kb / 4) { rkey = "Inactive(anon):"; rval = limit_kb / 4; }
+        } else if (llen >= 13 && !strncmp(lp, "Active(file):", 13)) {
+            uint64_t v = parse_kb_value(lp, llen);
+            if (v > limit_kb / 4) { rkey = "Active(file):"; rval = limit_kb / 4; }
+        } else if (llen >= 15 && !strncmp(lp, "Inactive(file):", 15)) {
+            uint64_t v = parse_kb_value(lp, llen);
+            if (v > limit_kb / 4) { rkey = "Inactive(file):"; rval = limit_kb / 4; }
+        } else if (llen >= 6 && !strncmp(lp, "Shmem:", 6)) {
+            uint64_t v = parse_kb_value(lp, llen);
+            if (v > limit_kb / 8) { rkey = "Shmem:"; rval = limit_kb / 8; }
+        } else if (llen >= 13 && !strncmp(lp, "SReclaimable:", 13)) {
+            uint64_t v = parse_kb_value(lp, llen);
+            if (v > limit_kb / 16) { rkey = "SReclaimable:"; rval = limit_kb / 16; }
+        } else if (llen >= 11 && !strncmp(lp, "SUnreclaim:", 11)) {
+            uint64_t v = parse_kb_value(lp, llen);
+            if (v > limit_kb / 16) { rkey = "SUnreclaim:"; rval = limit_kb / 16; }
+        } else if (llen >= 5 && !strncmp(lp, "Slab:", 5)) {
+            uint64_t v = parse_kb_value(lp, llen);
+            if (v > limit_kb / 8) { rkey = "Slab:"; rval = limit_kb / 8; }
+        } else if (llen >= 7 && !strncmp(lp, "Mapped:", 7)) {
+            uint64_t v = parse_kb_value(lp, llen);
+            if (v > limit_kb / 4) { rkey = "Mapped:"; rval = limit_kb / 4; }
+        } else if (llen >= 10 && !strncmp(lp, "AnonPages:", 10)) {
+            uint64_t v = parse_kb_value(lp, llen);
+            if (v > limit_kb / 2) { rkey = "AnonPages:"; rval = limit_kb / 2; }
+        } else if (llen >= 12 && !strncmp(lp, "Unevictable:", 12)) {
+            uint64_t v = parse_kb_value(lp, llen);
+            if (v > limit_kb / 8) { rkey = "Unevictable:"; rval = limit_kb / 8; }
+        } else if (llen >= 8 && !strncmp(lp, "Mlocked:", 8)) {
+            uint64_t v = parse_kb_value(lp, llen);
+            if (v > limit_kb / 8) { rkey = "Mlocked:"; rval = limit_kb / 8; }
         }
         if (rkey) {
             if (pos > span_start)

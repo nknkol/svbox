@@ -46,11 +46,25 @@ int main(void) {
         fprintf(stderr, "statx(/proc/meminfo): errno=%d size=%llu\n", errno, (unsigned long long)sx.stx_size);
         return 4;
     }
-    char buf[128] = {0};
+    char buf[4096] = {0};
     ssize_t n = read(fd, buf, sizeof(buf) - 1);
     close(fd);
     if (n <= 0 || !strstr(buf, "2097152 kB")) {
         fprintf(stderr, "meminfo mismatch: %s\n", buf);
+        return 5;
+    }
+    /* Verify Cached/Buffers/MemFree/MemAvailable stay bounded within MemTotal */
+    unsigned long long v_free = 0, v_avail = 0, v_cached = 0;
+    const char *p = strstr(buf, "MemFree:");
+    if (p) sscanf(p, "MemFree: %llu", &v_free);
+    p = strstr(buf, "MemAvailable:");
+    if (p) sscanf(p, "MemAvailable: %llu", &v_avail);
+    p = strstr(buf, "\nCached:");
+    if (p) sscanf(p, "\nCached: %llu", &v_cached);
+    if (v_free > 2097152ULL || v_avail > 2097152ULL || v_cached > 2097152ULL / 4 ||
+        v_free + v_cached > 2097152ULL) {
+        fprintf(stderr, "meminfo clamp violation: free=%llu avail=%llu cached=%llu\n",
+                v_free, v_avail, v_cached);
         return 5;
     }
 
