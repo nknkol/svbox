@@ -388,6 +388,8 @@ void options_print_help(int fd)
 		"  --cpuset LIST                  Pin container to host CPUs (e.g. 0-3 or 4,5,6,7)\n"
 		"  --mem-mb N                     Virtual /proc/meminfo MemTotal cap in MiB\n"
 		"  --disk-mb N                    Virtual statfs/fstatfs capacity cap in MiB\n"
+		"  --root-disk-mb N               Virtual statfs/fstatfs cap in MiB for root/lower mounts (reported full)\n"
+		"  --disk-used-mb N               Baseline used MiB deducted from --disk-mb free space\n"
 		"  --nice N                       Initial process nice value (-20..19)\n"
 		"  --sched POLICY                 Initial scheduler policy: other|batch|idle\n"
 		"\n"
@@ -575,6 +577,12 @@ void options_parse(int argc, char **argv, payload_config_t *cfg, struct loader_o
 			cfg->disk_limit_mb = (uint32_t)number(value(argc, argv, &i), 1024ul * 1024ul * 16ul, "--disk-mb");
 			if (!cfg->disk_limit_mb)
 				z_errx(1, "--disk-mb must be positive");
+		} else if (is(arg, "--root-disk-mb")) {
+			cfg->root_disk_mb = (uint32_t)number(value(argc, argv, &i), 1024ul * 1024ul * 16ul, "--root-disk-mb");
+			if (!cfg->root_disk_mb)
+				z_errx(1, "--root-disk-mb must be positive");
+		} else if (is(arg, "--disk-used-mb")) {
+			cfg->disk_used_mb = (uint32_t)number(value(argc, argv, &i), 1024ul * 1024ul * 16ul, "--disk-used-mb");
 		} else if (is(arg, "--nice")) {
 			cfg->nice_val = parse_nice(value(argc, argv, &i));
 		} else if (is(arg, "--sched")) {

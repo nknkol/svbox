@@ -144,4 +144,54 @@ with tempfile.TemporaryDirectory(prefix='reslim-', dir=build) as temp:
         '--', 'probe',
     ], capture_output=True, text=True, timeout=15)
     assert p.returncode == 0 and 'RESOURCE_LIMITS_OK\n' in p.stdout, (p.returncode, p.stdout, p.stderr)
-    print('PASS: --mem-mb, --disk-mb, memfd fstat/fstatat/statx, RO --lower, and lower-bind /proc/self/fd')
+
+    # Second pass: verify --root-disk-mb vs external volume --disk-mb + --disk-used-mb
+    extvol = td / 'extvol'
+    extvol.mkdir()
+    SPLIT_PROBE_C = r"""
+#include <fcntl.h>
+#include <stdio.h>
+#include <sys/statfs.h>
+#include <unistd.h>
+static int check_sf(const char *p, unsigned long long want_tot, unsigned long long want_free_max, int want_zero_free) {
+    struct statfs sf, sf2;
+    if (statfs(p, &sf) != 0) return 1;
+    int fd = open(p, O_RDONLY);
+    if (fd < 0 || fstatfs(fd, &sf2) != 0) return 2;
+    close(fd);
+    if (sf.f_blocks != sf2.f_blocks || sf.f_bfree != sf2.f_bfree) return 3;
+    unsigned long long unit = sf.f_frsize ? (unsigned long long)sf.f_frsize : (unsigned long long)sf.f_bsize;
+    unsigned long long tot = ((unsigned long long)sf.f_blocks * unit) / (1024ULL * 1024ULL);
+    unsigned long long fre = ((unsigned long long)sf.f_bfree * unit) / (1024ULL * 1024ULL);
+    if (tot != want_tot) { fprintf(stderr, "%s tot=%llu want=%llu\n", p, tot, want_tot); return 4; }
+    if (want_zero_free && fre != 0) { fprintf(stderr, "%s fre=%llu want=0\n", p, fre); return 5; }
+    if (!want_zero_free && fre > want_free_max) { fprintf(stderr, "%s fre=%llu max=%llu\n", p, fre, want_free_max); return 6; }
+    return 0;
+}
+int main(void) {
+    int rc;
+    if ((rc = check_sf("/", 1900, 0, 1)) != 0) return 10 + rc;
+    if ((rc = check_sf("/mnt/alias", 1900, 0, 1)) != 0) return 20 + rc;
+    if ((rc = check_sf("/mnt/extvol", 8192, 6192, 0)) != 0) return 30 + rc;
+    printf("SPLIT_DISK_OK\n");
+    return 0;
+}
+"""
+    src2 = td / 'split_probe.c'
+    bin2 = lower / 'split_probe'
+    src2.write_text(SPLIT_PROBE_C)
+    subprocess.run(['clang', '-static', str(src2), '-o', str(bin2)], check=True)
+    p2 = subprocess.run([
+        str(loader),
+        '--root', str(upper),
+        '--lower', str(lower),
+        '-u', '0:0',
+        '--root-disk-mb', '1900',
+        '--disk-mb', '8192',
+        '--disk-used-mb', '2000',
+        '-v', f'{lower / "sub"}:/mnt/alias',
+        '-v', f'{extvol}:/mnt/extvol',
+        '--', 'split_probe',
+    ], capture_output=True, text=True, timeout=15)
+    assert p2.returncode == 0 and 'SPLIT_DISK_OK\n' in p2.stdout, (p2.returncode, p2.stdout, p2.stderr)
+    print('PASS: --mem-mb, --disk-mb, --root-disk-mb, --disk-used-mb, memfd fstat/fstatat/statx, RO --lower, and lower-bind /proc/self/fd')

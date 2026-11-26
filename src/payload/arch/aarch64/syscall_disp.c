@@ -205,32 +205,6 @@ long syscall_dispatcher(long sys_no, pt_regs *regs)
             if (*dmaj == 0 && *dmin == 0)
                 *dmin = 1;
         }
-        /* Virtual filesystem capacity cap (--disk-mb): clamp non-pseudo
-         * statfs/fstatfs reports without over-reporting host free space. */
-        if (g_payload_config.disk_limit_mb > 0 &&
-            (sys_no == __NR_statfs || sys_no == __NR_fstatfs) && a[1]) {
-            unsigned char *sf = (unsigned char *)a[1];
-            uint64_t f_type = 0, f_bsize = 0, f_blocks = 0, f_bfree = 0, f_bavail = 0, f_frsize = 0;
-            memcpy(&f_type, sf + 0, 8);
-            if (f_type != 0x9fa0ULL && f_type != 0x62656572ULL && f_type != 0x1cd1ULL &&
-                f_type != 0x27e0ebULL && f_type != 0x63677270ULL &&
-                f_type != 0x50495045ULL && f_type != 0x534f434bULL) {
-                memcpy(&f_bsize, sf + 8, 8);
-                memcpy(&f_blocks, sf + 16, 8);
-                memcpy(&f_bfree, sf + 24, 8);
-                memcpy(&f_bavail, sf + 32, 8);
-                memcpy(&f_frsize, sf + 72, 8);
-                uint64_t unit = f_frsize ? f_frsize : (f_bsize ? f_bsize : 4096ULL);
-                uint64_t cap_blocks = ((uint64_t)g_payload_config.disk_limit_mb * 1024ULL * 1024ULL) / unit;
-                if (cap_blocks > 0 && f_blocks > cap_blocks) {
-                    uint64_t new_bfree = f_bfree > cap_blocks ? cap_blocks : f_bfree;
-                    uint64_t new_bavail = f_bavail > new_bfree ? new_bfree : f_bavail;
-                    memcpy(sf + 16, &cap_blocks, 8);
-                    memcpy(sf + 24, &new_bfree, 8);
-                    memcpy(sf + 32, &new_bavail, 8);
-                }
-            }
-        }
     }
     /* struct utsname: six 65-byte fields; sysname, nodename, release. */
     if (!ret && sys_no == __NR_uname && a[0]) {

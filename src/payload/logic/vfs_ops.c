@@ -158,6 +158,87 @@ static void pb_fix_statfs_magic(const Bridge *b, const char *guest, void *buf)
     }
 }
 
+static bool host_path_in_root_or_lower(const char *host)
+{
+    if (!host || !host[0])
+        return false;
+    if (g_payload_config.root[0] &&
+        (strcmp(g_payload_config.root, "/") == 0 || path_under_prefix(host, g_payload_config.root)))
+        return true;
+    for (int i = 0; i < g_payload_config.lower_count; i++) {
+        const char *l = g_payload_config.lower[i];
+        if (l[0] && (strcmp(l, "/") == 0 || path_under_prefix(host, l)))
+            return true;
+    }
+    return false;
+}
+
+static void pb_fix_statfs_cap(const char *guest, void *buf)
+{
+    if (!buf || (!g_payload_config.disk_limit_mb && !g_payload_config.root_disk_mb))
+        return;
+    unsigned char *sf = (unsigned char *)buf;
+    uint64_t f_type = 0, f_bsize = 0, f_blocks = 0, f_bfree = 0, f_bavail = 0, f_frsize = 0;
+    memcpy(&f_type, sf + 0, 8);
+    if (f_type == 0x9fa0ULL || f_type == 0x62656572ULL || f_type == 0x1cd1ULL ||
+        f_type == 0x27e0ebULL || f_type == 0x63677270ULL || f_type == 0xcafe4a11ULL ||
+        f_type == 0xf97cff8cULL || f_type == 0x19800202ULL || f_type == 0x50495045ULL ||
+        f_type == 0x534f434bULL || f_type == 0x01021994ULL)
+        return;
+
+    bool is_external_bind = true;
+    if (g_payload_config.root_disk_mb > 0 && guest && guest[0] == '/') {
+        int best_bind = -1;
+        size_t best_len = 0;
+        for (int i = 0; i < g_payload_config.bind_count; i++) {
+            const char *gp = g_payload_config.binds[i].src;
+            if (!gp[0] || (gp[0] == '/' && gp[1] == '\0'))
+                continue;
+            if (path_under_prefix(guest, gp)) {
+                size_t gl = strlen(gp);
+                if (gl >= best_len) {
+                    best_len = gl;
+                    best_bind = i;
+                }
+            }
+        }
+        is_external_bind = (best_bind >= 0 &&
+                            !host_path_in_root_or_lower(g_payload_config.binds[best_bind].dst));
+    }
+
+    memcpy(&f_bsize, sf + 8, 8);
+    memcpy(&f_blocks, sf + 16, 8);
+    memcpy(&f_bfree, sf + 24, 8);
+    memcpy(&f_bavail, sf + 32, 8);
+    memcpy(&f_frsize, sf + 72, 8);
+    uint64_t unit = f_frsize ? f_frsize : (f_bsize ? f_bsize : 4096ULL);
+
+    if (g_payload_config.root_disk_mb > 0 && !is_external_bind) {
+        uint64_t rcap = ((uint64_t)g_payload_config.root_disk_mb * 1024ULL * 1024ULL) / unit;
+        if (rcap > 0) {
+            uint64_t new_blocks = f_blocks > rcap ? rcap : f_blocks;
+            uint64_t zero = 0;
+            memcpy(sf + 16, &new_blocks, 8);
+            memcpy(sf + 24, &zero, 8);
+            memcpy(sf + 32, &zero, 8);
+        }
+        return;
+    }
+
+    if (g_payload_config.disk_limit_mb > 0) {
+        uint64_t cap_blocks = ((uint64_t)g_payload_config.disk_limit_mb * 1024ULL * 1024ULL) / unit;
+        uint64_t used_blocks = ((uint64_t)g_payload_config.disk_used_mb * 1024ULL * 1024ULL) / unit;
+        if (cap_blocks > 0 && f_blocks > cap_blocks) {
+            uint64_t avail_cap = used_blocks >= cap_blocks ? 0 : (cap_blocks - used_blocks);
+            uint64_t new_bfree = f_bfree > avail_cap ? avail_cap : f_bfree;
+            uint64_t new_bavail = f_bavail > new_bfree ? new_bfree : f_bavail;
+            memcpy(sf + 16, &cap_blocks, 8);
+            memcpy(sf + 24, &new_bfree, 8);
+            memcpy(sf + 32, &new_bavail, 8);
+        }
+    }
+}
+
 static bool contains_mount(Bridge *b, const char *guest)
 {
     if (compare_paths("/", guest) == PATHS_ARE_EQUAL)
@@ -669,12 +750,18 @@ long pb_dispatch(Bridge *b, long number, long a[6], struct proot_open_origin *or
         return raw_syscall(number, a[0], a[1], a[2], a[3], a[4], a[5]);
     if (number == __NR_fstatfs) {
         ret = raw_syscall(number, a[0], a[1], a[2], a[3], a[4], a[5]);
-        if (ret == 0 && a[1] && g_payload_config.mode == CONFIG_MODE_CONTAINER) {
+        if (ret == 0 && a[1]) {
+            const char *gpath = NULL;
             if (proot_vfd_is_procfs((int)a[0])) {
-                pb_fix_statfs_magic(NULL, "/proc", (void *)a[1]);
+                gpath = "/proc";
+                if (g_payload_config.mode == CONFIG_MODE_CONTAINER)
+                    pb_fix_statfs_magic(NULL, gpath, (void *)a[1]);
             } else if (pb_host_fd(b, (int)a[0], b->guest) >= 0) {
-                pb_fix_statfs_magic(b, b->guest, (void *)a[1]);
+                gpath = b->guest;
+                if (g_payload_config.mode == CONFIG_MODE_CONTAINER)
+                    pb_fix_statfs_magic(b, gpath, (void *)a[1]);
             }
+            pb_fix_statfs_cap(gpath, (void *)a[1]);
         }
         return ret;
     }
@@ -683,8 +770,11 @@ long pb_dispatch(Bridge *b, long number, long a[6], struct proot_open_origin *or
         ret = pb_resolve(b, AT_FDCWD, (const char *)a[0], true);
         if (ret < 0) return ret;
         ret = raw_syscall(number, (long)b->host, a[1], a[2], a[3], a[4], a[5]);
-        if (number == __NR_statfs && ret == 0 && a[1] && g_payload_config.mode == CONFIG_MODE_CONTAINER)
-            pb_fix_statfs_magic(b, b->guest, (void *)a[1]);
+        if (number == __NR_statfs && ret == 0 && a[1]) {
+            if (g_payload_config.mode == CONFIG_MODE_CONTAINER)
+                pb_fix_statfs_magic(b, b->guest, (void *)a[1]);
+            pb_fix_statfs_cap(b->guest, (void *)a[1]);
+        }
         return ret;
     }
     if (number == __NR_fchownat || number == __NR_utimensat) {
