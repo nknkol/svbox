@@ -23,7 +23,12 @@ long vdev_path_call(long number, long a[6], int vdev_idx);
 int vdev_fd_call(long number, long a[6], long *out);
 
 /* Returns the guest device path (e.g. "/dev/binder") if fd belongs to an
- * active vdev, or NULL otherwise. */
+ * active vdev (either the guest FD or its backing memfd), or NULL otherwise. */
 const char *vdev_fd_guest_path(int fd);
+
+/* Reverse-maps a host memfd path (e.g. "/memfd:svbox-<name> (deleted)" or
+ * "/memfd:vdev-<name> (deleted)") to a configured --vdev guest path when the
+ * suffix matches a configured vdev basename. Returns NULL if unmatched. */
+const char *vdev_match_memfd(const char *path, size_t len);
 
 #endif /* SVBOX_VDEV_H */

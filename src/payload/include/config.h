@@ -81,6 +81,8 @@ struct passed_fd {
     uint64_t dev, ino;
 };
 
+#define BIND_FLAG_NOMNT 1u
+
 struct bind_entry {
     char src[CONFIG_MAX_PATH];
     char dst[CONFIG_MAX_PATH];
@@ -88,6 +90,8 @@ struct bind_entry {
      * mountpoint regardless of case: 1 + length of the parent's guest
      * prefix (matched exactly); the rest matches ignoring ASCII case. */
     uint32_t fold;
+    /* Optional generic bind flags (e.g. BIND_FLAG_NOMNT: omit from /proc/mounts). */
+    uint32_t flags;
 };
 
 /* What the FD runtime and mount access policy enforce (each level includes
@@ -148,6 +152,8 @@ typedef struct payload_config {
     char kernel_sysname[65];
     /* --hostname: uname nodename; empty keeps the kernel's. */
     char hostname[65];
+    /* --proc-cmdline: virtual /proc/cmdline string; empty falls back to host. */
+    char proc_cmdline[256];
     /* Guarded build only (zero otherwise). */
     int32_t fd_state; /* Internal sealed exec handoff, -1 if absent. */
     /* --fd-capacity: FD records the runtime holds, when below the FD

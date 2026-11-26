@@ -1322,12 +1322,53 @@ const char *vdev_fd_guest_path(int fd)
 {
     if (!vdev_enabled() || fd < 0)
         return NULL;
-    struct vdev_open_slot *slot = find_slot_by_fd(fd);
-    if (!slot)
+    if (__atomic_load_n(&g_vdev_open_count, __ATOMIC_RELAXED) == 0)
         return NULL;
-    if (slot->vdev_idx < 0 || slot->vdev_idx >= g_payload_config.vdev_count)
+    int32_t pid = (int32_t)raw_syscall(__NR_getpid, 0, 0, 0, 0, 0, 0);
+    for (int i = 0; i < VDEV_MAX_OPEN; i++) {
+        if (g_open_slots[i].active && g_open_slots[i].owner_pid == pid &&
+            (g_open_slots[i].fd == fd || g_open_slots[i].memfd == fd)) {
+            int idx = g_open_slots[i].vdev_idx;
+            if (idx >= 0 && idx < g_payload_config.vdev_count)
+                return g_payload_config.vdevs[idx].guest;
+        }
+    }
+    return NULL;
+}
+
+const char *vdev_match_memfd(const char *path, size_t len)
+{
+    if (!vdev_enabled() || !path || len < 13)
         return NULL;
-    return g_payload_config.vdevs[slot->vdev_idx].guest;
+    if (strncmp(path, "/memfd:", 7) != 0)
+        return NULL;
+    size_t core = len;
+    if (core > 10 && strncmp(path + core - 10, " (deleted)", 10) == 0)
+        core -= 10;
+    const char *name = path + 7;
+    size_t nlen = core - 7;
+    const char *base = NULL;
+    size_t blen = 0;
+    if (nlen > 6 && strncmp(name, "svbox-", 6) == 0) {
+        base = name + 6;
+        blen = nlen - 6;
+    } else if (nlen > 5 && strncmp(name, "vdev-", 5) == 0) {
+        base = name + 5;
+        blen = nlen - 5;
+    } else {
+        return NULL;
+    }
+    for (int i = 0; i < g_payload_config.vdev_count; i++) {
+        const char *vg = g_payload_config.vdevs[i].guest;
+        const char *vbase = vg;
+        for (const char *q = vg; *q; q++) {
+            if (*q == '/')
+                vbase = q + 1;
+        }
+        if (strlen(vbase) == blen && strncmp(vbase, base, blen) == 0)
+            return vg;
+    }
+    return NULL;
 }
 
 int vdev_fd_call(long number, long a[6], long *out)

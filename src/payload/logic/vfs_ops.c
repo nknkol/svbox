@@ -70,6 +70,94 @@ static inline bool identity_fast_path(const Bridge *b, const char *path)
            !is_special_prefix(path) && pb_lexical_path(path);
 }
 
+static bool path_under_prefix(const char *path, const char *prefix)
+{
+    size_t n = strlen(prefix);
+    return !strncmp(path, prefix, n) && (path[n] == '\0' || path[n] == '/');
+}
+
+static uint64_t fstype_to_magic(const char *fstype, bool *zero_blocks)
+{
+    *zero_blocks = false;
+    if (!fstype || !fstype[0]) return 0;
+    if (!strcmp(fstype, "tmpfs")) return 0x01021994ULL;
+    if (!strcmp(fstype, "ramfs")) return 0x858458f6ULL;
+    if (!strcmp(fstype, "overlay")) return 0x794c7630ULL;
+    if (!strcmp(fstype, "erofs")) return 0xe0f5e1e2ULL;
+    if (!strcmp(fstype, "proc")) { *zero_blocks = true; return 0x9fa0ULL; }
+    if (!strcmp(fstype, "sysfs")) { *zero_blocks = true; return 0x62656572ULL; }
+    if (!strcmp(fstype, "cgroup")) { *zero_blocks = true; return 0x27e0ebULL; }
+    if (!strcmp(fstype, "cgroup2")) { *zero_blocks = true; return 0x63677270ULL; }
+    if (!strcmp(fstype, "devpts")) { *zero_blocks = true; return 0x1cd1ULL; }
+    if (!strcmp(fstype, "bpf")) { *zero_blocks = true; return 0xcafe4a11ULL; }
+    if (!strcmp(fstype, "selinuxfs")) { *zero_blocks = true; return 0xf97cff8cULL; }
+    if (!strcmp(fstype, "mqueue")) { *zero_blocks = true; return 0x19800202ULL; }
+    return 0;
+}
+
+static void pb_fix_statfs_magic(const Bridge *b, const char *guest, void *buf)
+{
+    if (!guest || !buf || guest[0] != '/')
+        return;
+    uint64_t magic = 0;
+    bool zero_blocks = false;
+
+    if (b && b->mount_count > 0) {
+        size_t best_len = 0;
+        const char *best_fs = NULL;
+        for (int i = 0; i < b->mount_count; i++) {
+            const char *mg = b->mounts[i].guest;
+            if (!mg[0]) continue;
+            if (path_under_prefix(guest, mg)) {
+                size_t ml = strlen(mg);
+                if (ml >= best_len) {
+                    best_len = ml;
+                    best_fs = b->mounts[i].fstype;
+                }
+            }
+        }
+        if (best_fs)
+            magic = fstype_to_magic(best_fs, &zero_blocks);
+    }
+
+    if (!magic) {
+        if (guest[1] == 'd') {
+            if (path_under_prefix(guest, "/dev/pts")) {
+                magic = 0x1cd1ULL; zero_blocks = true;
+            } else if (path_under_prefix(guest, "/dev/mqueue")) {
+                magic = 0x19800202ULL; zero_blocks = true;
+            } else if (path_under_prefix(guest, "/dev")) {
+                magic = 0x01021994ULL; /* TMPFS_MAGIC */
+            }
+        } else if (guest[1] == 's') {
+            if (path_under_prefix(guest, "/sys/fs/cgroup")) {
+                magic = 0x27e0ebULL; zero_blocks = true;
+            } else if (path_under_prefix(guest, "/sys/fs/bpf")) {
+                magic = 0xcafe4a11ULL; zero_blocks = true;
+            } else if (path_under_prefix(guest, "/sys/fs/selinux")) {
+                magic = 0xf97cff8cULL; zero_blocks = true;
+            } else if (path_under_prefix(guest, "/sys")) {
+                magic = 0x62656572ULL; zero_blocks = true; /* SYSFS_MAGIC */
+            }
+        } else if (guest[1] == 'p' && path_under_prefix(guest, "/proc")) {
+            magic = 0x9fa0ULL; zero_blocks = true; /* PROC_SUPER_MAGIC */
+        }
+    }
+
+    if (!magic)
+        return;
+    unsigned char *sf = (unsigned char *)buf;
+    memcpy(sf + 0, &magic, 8);
+    if (zero_blocks) {
+        uint64_t z = 0;
+        memcpy(sf + 16, &z, 8); /* f_blocks */
+        memcpy(sf + 24, &z, 8); /* f_bfree */
+        memcpy(sf + 32, &z, 8); /* f_bavail */
+        memcpy(sf + 40, &z, 8); /* f_files */
+        memcpy(sf + 48, &z, 8); /* f_ffree */
+    }
+}
+
 static bool contains_mount(Bridge *b, const char *guest)
 {
     if (compare_paths("/", guest) == PATHS_ARE_EQUAL)
@@ -577,13 +665,27 @@ long pb_dispatch(Bridge *b, long number, long a[6], struct proot_open_origin *or
     }
     if (number == __NR_fchown)
         return fake_chown(raw_syscall(number, a[0], a[1], a[2], 0, 0, 0));
-    if (number == __NR_fchmod || number == __NR_fstatfs || number == __NR_ftruncate)
+    if (number == __NR_fchmod || number == __NR_ftruncate)
         return raw_syscall(number, a[0], a[1], a[2], a[3], a[4], a[5]);
+    if (number == __NR_fstatfs) {
+        ret = raw_syscall(number, a[0], a[1], a[2], a[3], a[4], a[5]);
+        if (ret == 0 && a[1] && g_payload_config.mode == CONFIG_MODE_CONTAINER) {
+            if (proot_vfd_is_procfs((int)a[0])) {
+                pb_fix_statfs_magic(NULL, "/proc", (void *)a[1]);
+            } else if (pb_host_fd(b, (int)a[0], b->guest) >= 0) {
+                pb_fix_statfs_magic(b, b->guest, (void *)a[1]);
+            }
+        }
+        return ret;
+    }
     if (number == __NR_statfs || number == __NR_truncate) {
         if (!a[0]) return -EFAULT;
         ret = pb_resolve(b, AT_FDCWD, (const char *)a[0], true);
         if (ret < 0) return ret;
-        return raw_syscall(number, (long)b->host, a[1], a[2], a[3], a[4], a[5]);
+        ret = raw_syscall(number, (long)b->host, a[1], a[2], a[3], a[4], a[5]);
+        if (number == __NR_statfs && ret == 0 && a[1] && g_payload_config.mode == CONFIG_MODE_CONTAINER)
+            pb_fix_statfs_magic(b, b->guest, (void *)a[1]);
+        return ret;
     }
     if (number == __NR_fchownat || number == __NR_utimensat) {
         long flags = a[number == __NR_fchownat ? 4 : 3];

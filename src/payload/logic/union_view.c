@@ -351,7 +351,7 @@ static int walk(const struct union_view *u, const char *rel, struct union_hit *h
                 struct union_memo *memo, bool need_below)
 {
     char path[PATH_MAX];
-    uint32_t all = (1u << u->count) - 1, mask = all;
+    uint32_t all = (1u << u->count) - 1, mask = all, dir_mask = all;
     size_t pos = 0, len = strlen(rel);
     bool p_udir_valid = false;
     struct vfs_upper_dir_info p_udir;
@@ -359,6 +359,7 @@ static int walk(const struct union_view *u, const char *rel, struct union_hit *h
     if (memo && memo->view != u) memo->valid = false;
     if (memo && memo->valid && memo->length <= len && !strncmp(rel, memo->rel, memo->length) &&
         (rel[memo->length] == '/' || memo->length == len)) {
+        dir_mask = memo->mask;
         mask = (memo->length == len) ? memo->mask : memo->child_mask;
         pos = memo->length;
         if (memo->length < len && memo->upper_dir_valid) {
@@ -395,6 +396,23 @@ static int walk(const struct union_view *u, const char *rel, struct union_hit *h
         size_t start = pos + 1, next = start;
         while (next < len && rel[next] != '/') next++;
         bool last = next == len;
+        if (next - start == 1 && rel[start] == '.') {
+            if (pos == 0 && (dir_mask & 1u) &&
+                join(path, u->layer[0], u->length[0], OPAQUE, sizeof(OPAQUE) - 1, NULL) == 0 &&
+                exists(path)) {
+                dir_mask = 1u;
+                mask &= 1u;
+            }
+            if (last) {
+                hit->layer = dir_mask ? __builtin_ctz(dir_mask) : -1;
+                hit->dir = hit->layer >= 0;
+                hit->dirs = dir_mask;
+                hit->below = (dir_mask & ~1u) != 0;
+                return 0;
+            }
+            pos = next;
+            continue;
+        }
         if (union_hidden_name(rel + start) && next - start >= 4) {
             hit->layer = -1;
             return 0; /* Never a name of the view. */
@@ -564,6 +582,7 @@ static int walk(const struct union_view *u, const char *rel, struct union_hit *h
             hit->dirs = first < 0 ? 0 : 1u << first;
             return 0;
         }
+        dir_mask = next_mask;
         mask = child_mask;
         pos = next;
         p_udir_valid = next_udir_valid;

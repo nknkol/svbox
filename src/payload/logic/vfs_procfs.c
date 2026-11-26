@@ -12,6 +12,43 @@
 static int parse_hex_u64(const char **pp, const char *end, uint64_t *out);
 static size_t append_hex_u64(char *dst, size_t cap, size_t pos, uint64_t v, int min_digits);
 static long write_all_fd(int fd, const char *buf, size_t len);
+static uint32_t popcount64(uint64_t x);
+
+/* Reverse-map a backing memfd path of a configured --vdev or emulated loop
+ * device (e.g. "/memfd:svbox-binder (deleted)") to its guest device path. */
+static int translate_vdev_or_loop_memfd(const char *path, size_t len, char *out, size_t cap)
+{
+    if (!path || len < 8 || strncmp(path, "/memfd:", 7) != 0)
+        return 0;
+    const char *vg = vdev_match_memfd(path, len);
+    if (vg) {
+        size_t vl = strlen(vg);
+        if (vl < cap) {
+            memcpy(out, vg, vl + 1);
+            return 1;
+        }
+    }
+    size_t core = len;
+    if (core > 10 && strncmp(path + core - 10, " (deleted)", 10) == 0)
+        core -= 10;
+    static const char lpfx[] = "/memfd:elf-loop";
+    size_t plen = sizeof(lpfx) - 1;
+    if (core > plen && strncmp(path, lpfx, plen) == 0) {
+        const char *suf = path + plen;
+        size_t slen = core - plen;
+        if (slen == 8 && strncmp(suf, "-control", 8) == 0 && cap > 17) {
+            memcpy(out, "/dev/loop-control", 18);
+            return 1;
+        }
+        if (slen == 1 && suf[0] >= '0' && suf[0] <= '7' && cap > 10) {
+            memcpy(out, "/dev/loop", 9);
+            out[9] = suf[0];
+            out[10] = '\0';
+            return 1;
+        }
+    }
+    return 0;
+}
 
 static long current_id(long number)
 {
@@ -250,8 +287,13 @@ long pb_proc_readlink(Bridge *b, long a[6])
         count = pb_host_readlink(b, b->host, b->cwd, sizeof(b->cwd) - 1);
         if (count < 0) return count;
         b->cwd[count] = 0;
-        int rc = pb_guest_link_target(b, b->cwd);
-        if (rc < 0) return rc;
+        if (translate_vdev_or_loop_memfd(b->cwd, (size_t)count, b->proc_candidate,
+                                         sizeof(b->proc_candidate))) {
+            strcpy(b->cwd, b->proc_candidate);
+        } else {
+            int rc = pb_guest_link_target(b, b->cwd);
+            if (rc < 0) return rc;
+        }
     }
     count = (long)strlen(b->cwd);
     if ((unsigned long)a[3] < (unsigned long)count) count = (long)a[3];
@@ -393,129 +435,172 @@ long pb_proc_status(Bridge *b, int flags)
                            (flags & O_CLOEXEC) ? 1 /* MFD_CLOEXEC */ : 0, 0, 0, 0, 0);
     if (mfd < 0) return mfd;
 
+    char out_buf[4096];
+    size_t out_used = 0;
     long rc = 0;
     size_t pos = 0;
-    size_t span_start = 0;
+    int is_hm = platform_is_harmonyos();
+    uint32_t vcpus = g_payload_config.cpu_mask ? popcount64(g_payload_config.cpu_mask) : 0;
+    if (vcpus > 64) vcpus = 64;
+
     while (pos < total && rc >= 0) {
         size_t nl = pos;
         while (nl < total && b->proc_data[nl] != '\n') nl++;
         size_t line_len = (nl < total) ? (nl - pos + 1) : (nl - pos);
-        int is_uid = (line_len >= 4 && !strncmp(b->proc_data + pos, "Uid:", 4));
-        int is_gid = (!is_uid && line_len >= 4 && !strncmp(b->proc_data + pos, "Gid:", 4));
-        int is_groups = (!is_uid && !is_gid && line_len >= 7 && !strncmp(b->proc_data + pos, "Groups:", 7));
+        const char *lp = b->proc_data + pos;
+
+        /* Strip host-specific non-Linux memory fields on HarmonyOS HMKernel. */
+        if (is_hm && ((line_len >= 7 && !strncmp(lp, "VmKobj:", 7)) ||
+                      (line_len >= 8 && !strncmp(lp, "PurgSum:", 8)) ||
+                      (line_len >= 8 && !strncmp(lp, "PurgPin:", 8)))) {
+            pos += line_len;
+            continue;
+        }
+
+        int is_uid = (line_len >= 4 && !strncmp(lp, "Uid:", 4));
+        int is_gid = (!is_uid && line_len >= 4 && !strncmp(lp, "Gid:", 4));
+        int is_groups = (!is_uid && !is_gid && line_len >= 7 && !strncmp(lp, "Groups:", 7));
+        int is_fdsize = (!is_uid && !is_gid && !is_groups &&
+                         line_len >= 9 && !strncmp(lp, "FDSize:\t0", 9) &&
+                         (line_len == 9 || lp[9] == '\n'));
+        int is_cpus_mask = (vcpus > 0 && line_len >= 13 && !strncmp(lp, "Cpus_allowed:", 13));
+        int is_cpus_list = (vcpus > 0 && line_len >= 18 && !strncmp(lp, "Cpus_allowed_list:", 18));
+        int is_mems_zero = (is_hm && line_len >= 22 && !strncmp(lp, "Mems_allowed:\t00000000", 22));
         int hide_sec = (g_payload_config.seccomp_backstop || g_payload_config.trap_sigsys);
-        int is_sigcgt = (!is_uid && !is_gid && !is_groups && hide_sec &&
-                         line_len >= 7 && !strncmp(b->proc_data + pos, "SigCgt:", 7));
-        int is_sigign = (!is_uid && !is_gid && !is_groups && !is_sigcgt && hide_sec &&
-                         line_len >= 7 && !strncmp(b->proc_data + pos, "SigIgn:", 7));
-        int is_seccomp = (!is_uid && !is_gid && !is_groups && !is_sigcgt && !is_sigign && hide_sec &&
-                          line_len >= 8 && !strncmp(b->proc_data + pos, "Seccomp:", 8));
-        int is_secfilt = (!is_uid && !is_gid && !is_groups && !is_sigcgt && !is_sigign && !is_seccomp && hide_sec &&
-                          line_len >= 16 && !strncmp(b->proc_data + pos, "Seccomp_filters:", 16));
-        int is_nnp = (!is_uid && !is_gid && !is_groups && !is_sigcgt && !is_sigign && !is_seccomp && !is_secfilt && hide_sec &&
-                      line_len >= 11 && !strncmp(b->proc_data + pos, "NoNewPrivs:", 11));
-        int is_cap_zero = (!is_uid && !is_gid && !is_groups && !is_sigcgt && !is_sigign && !is_seccomp && !is_secfilt && !is_nnp &&
-                           ids[1] != 0 && line_len >= 7 &&
-                           (!strncmp(b->proc_data + pos, "CapInh:", 7) ||
-                            !strncmp(b->proc_data + pos, "CapPrm:", 7) ||
-                            !strncmp(b->proc_data + pos, "CapEff:", 7) ||
-                            !strncmp(b->proc_data + pos, "CapAmb:", 7)));
-        if (is_uid || is_gid || is_groups || is_sigcgt || is_sigign || is_seccomp || is_secfilt || is_nnp || is_cap_zero) {
-            if (pos > span_start) {
-                size_t wdone = 0, wlen = pos - span_start;
-                while (wdone < wlen) {
-                    long w = raw_syscall(__NR_write, mfd, (long)(b->proc_data + span_start + wdone),
-                                         (long)(wlen - wdone), 0, 0, 0);
-                    if (w <= 0) { rc = w ? w : -EIO; break; }
-                    wdone += (size_t)w;
-                }
-            }
-            if (rc >= 0) {
-                char line[256];
-                size_t llen = 0;
-                if (is_uid || is_gid) {
-                    llen = format_id_line(line, sizeof(line),
-                                          is_uid ? "Uid:" : "Gid:",
-                                          is_uid ? ids : (ids + 4));
-                } else if (is_groups) {
-                    const char *lbl = "Groups:\t";
-                    llen = strlen(lbl);
-                    memcpy(line, lbl, llen);
-                    if (pid == self_pid) {
-                        uint32_t grps[32];
-                        int ng = fake_ids_groups(grps);
-                        for (int gi = 0; gi < ng && llen + 13 < sizeof(line); gi++) {
-                            llen = append_u32(line, sizeof(line) - 3, llen, grps[gi]);
-                            line[llen++] = ' ';
-                        }
-                    } else {
-                        llen = append_u32(line, sizeof(line) - 3, llen, ids[4]);
+        int is_sigcgt = (hide_sec && line_len >= 7 && !strncmp(lp, "SigCgt:", 7));
+        int is_sigign = (hide_sec && line_len >= 7 && !strncmp(lp, "SigIgn:", 7));
+        int is_seccomp = (hide_sec && line_len >= 8 && !strncmp(lp, "Seccomp:", 8));
+        int is_secfilt = (hide_sec && line_len >= 16 && !strncmp(lp, "Seccomp_filters:", 16));
+        int is_nnp = (hide_sec && line_len >= 11 && !strncmp(lp, "NoNewPrivs:", 11));
+        int is_cap_zero = (ids[1] != 0 && line_len >= 7 &&
+                           (!strncmp(lp, "CapInh:", 7) ||
+                            !strncmp(lp, "CapPrm:", 7) ||
+                            !strncmp(lp, "CapEff:", 7) ||
+                            !strncmp(lp, "CapAmb:", 7)));
+
+        const char *emit_ptr = lp;
+        size_t emit_len = line_len;
+        char line[256];
+        if (is_uid || is_gid || is_groups || is_fdsize || is_cpus_mask || is_cpus_list ||
+            is_mems_zero || is_sigcgt || is_sigign || is_seccomp || is_secfilt || is_nnp || is_cap_zero) {
+            size_t llen = 0;
+            if (is_uid || is_gid) {
+                llen = format_id_line(line, sizeof(line),
+                                      is_uid ? "Uid:" : "Gid:",
+                                      is_uid ? ids : (ids + 4));
+            } else if (is_groups) {
+                const char *lbl = "Groups:\t";
+                llen = strlen(lbl);
+                memcpy(line, lbl, llen);
+                if (pid == self_pid) {
+                    uint32_t grps[32];
+                    int ng = fake_ids_groups(grps);
+                    for (int gi = 0; gi < ng && llen + 13 < sizeof(line); gi++) {
+                        llen = append_u32(line, sizeof(line) - 3, llen, grps[gi]);
                         line[llen++] = ' ';
                     }
-                    line[llen++] = '\n';
-                } else if (is_sigcgt || is_sigign) {
-                    const char *lp = b->proc_data + pos + 7;
-                    const char *lend = b->proc_data + pos + line_len;
-                    while (lp < lend && (*lp == ' ' || *lp == '\t')) lp++;
-                    uint64_t mask = 0;
-                    if (!parse_hex_u64(&lp, lend, &mask)) {
-                        llen = line_len < sizeof(line) ? line_len : sizeof(line);
-                        memcpy(line, b->proc_data + pos, llen);
-                    } else {
-                        int ss_state = (pid == self_pid) ? integrity_guest_sigsys_state() : 0;
-                        const uint64_t sigsys_bit = 1ull << 30; /* SIGSYS (31) */
-                        if (is_sigcgt) {
-                            if (ss_state != 2) mask &= ~sigsys_bit;
-                        } else {
-                            if (ss_state == 1) mask |= sigsys_bit;
-                            else if (ss_state == 0) mask &= ~sigsys_bit;
-                        }
-                        const char *lbl = is_sigcgt ? "SigCgt:\t" : "SigIgn:\t";
-                        llen = strlen(lbl);
-                        memcpy(line, lbl, llen);
-                        llen = append_hex_u64(line, sizeof(line) - 2, llen, mask, 16);
-                        line[llen++] = '\n';
-                    }
-                } else if (is_seccomp) {
-                    const char *s = "Seccomp:\t0\n";
-                    llen = strlen(s);
-                    memcpy(line, s, llen);
-                } else if (is_nnp) {
-                    const char *s = "NoNewPrivs:\t0\n";
-                    llen = strlen(s);
-                    memcpy(line, s, llen);
-                } else if (is_cap_zero) {
-                    memcpy(line, b->proc_data + pos, 7);
-                    const char *z = "\t0000000000000000\n";
-                    size_t zl = strlen(z);
-                    memcpy(line + 7, z, zl);
-                    llen = 7 + zl;
                 } else {
-                    const char *s = "Seccomp_filters:\t0\n";
-                    llen = strlen(s);
-                    memcpy(line, s, llen);
+                    llen = append_u32(line, sizeof(line) - 3, llen, ids[4]);
+                    line[llen++] = ' ';
                 }
-                size_t wdone = 0;
-                while (wdone < llen) {
-                    long w = raw_syscall(__NR_write, mfd, (long)(line + wdone),
-                                         (long)(llen - wdone), 0, 0, 0);
-                    if (w <= 0) { rc = w ? w : -EIO; break; }
-                    wdone += (size_t)w;
+                line[llen++] = '\n';
+            } else if (is_fdsize) {
+                const char *s = "FDSize:\t64\n";
+                llen = strlen(s);
+                memcpy(line, s, llen);
+            } else if (is_cpus_mask) {
+                const char *lbl = "Cpus_allowed:\t";
+                llen = strlen(lbl);
+                memcpy(line, lbl, llen);
+                if (vcpus <= 32) {
+                    uint64_t m = (vcpus == 32) ? 0xffffffffull : ((1ull << vcpus) - 1ull);
+                    int digits = (int)((vcpus + 3u) / 4u);
+                    llen = append_hex_u64(line, sizeof(line) - 2, llen, m, digits);
+                } else {
+                    uint64_t hi = (vcpus == 64) ? 0xffffffffull : ((1ull << (vcpus - 32u)) - 1ull);
+                    int hdigits = (int)(((vcpus - 32u) + 3u) / 4u);
+                    llen = append_hex_u64(line, sizeof(line) - 12, llen, hi, hdigits);
+                    line[llen++] = ',';
+                    llen = append_hex_u64(line, sizeof(line) - 2, llen, 0xffffffffull, 8);
                 }
+                line[llen++] = '\n';
+            } else if (is_cpus_list) {
+                const char *lbl = "Cpus_allowed_list:\t0";
+                llen = strlen(lbl);
+                memcpy(line, lbl, llen);
+                if (vcpus > 1) {
+                    line[llen++] = '-';
+                    llen = append_u32(line, sizeof(line) - 2, llen, vcpus - 1u);
+                }
+                line[llen++] = '\n';
+            } else if (is_mems_zero) {
+                const char *s = "Mems_allowed:\t1\n";
+                llen = strlen(s);
+                memcpy(line, s, llen);
+            } else if (is_sigcgt || is_sigign) {
+                const char *sp = lp + 7;
+                const char *lend = lp + line_len;
+                while (sp < lend && (*sp == ' ' || *sp == '\t')) sp++;
+                uint64_t mask = 0;
+                if (!parse_hex_u64(&sp, lend, &mask)) {
+                    llen = line_len < sizeof(line) ? line_len : sizeof(line);
+                    memcpy(line, lp, llen);
+                } else {
+                    int ss_state = (pid == self_pid) ? integrity_guest_sigsys_state() : 0;
+                    const uint64_t sigsys_bit = 1ull << 30; /* SIGSYS (31) */
+                    if (is_sigcgt) {
+                        if (ss_state != 2) mask &= ~sigsys_bit;
+                    } else {
+                        if (ss_state == 1) mask |= sigsys_bit;
+                        else if (ss_state == 0) mask &= ~sigsys_bit;
+                    }
+                    const char *lbl = is_sigcgt ? "SigCgt:\t" : "SigIgn:\t";
+                    llen = strlen(lbl);
+                    memcpy(line, lbl, llen);
+                    llen = append_hex_u64(line, sizeof(line) - 2, llen, mask, 16);
+                    line[llen++] = '\n';
+                }
+            } else if (is_seccomp) {
+                const char *s = "Seccomp:\t0\n";
+                llen = strlen(s);
+                memcpy(line, s, llen);
+            } else if (is_nnp) {
+                const char *s = "NoNewPrivs:\t0\n";
+                llen = strlen(s);
+                memcpy(line, s, llen);
+            } else if (is_cap_zero) {
+                memcpy(line, lp, 7);
+                const char *z = "\t0000000000000000\n";
+                size_t zl = strlen(z);
+                memcpy(line + 7, z, zl);
+                llen = 7 + zl;
+            } else {
+                const char *s = "Seccomp_filters:\t0\n";
+                llen = strlen(s);
+                memcpy(line, s, llen);
             }
-            span_start = pos + line_len;
+            emit_ptr = line;
+            emit_len = llen;
+        }
+
+        if (out_used + emit_len > sizeof(out_buf)) {
+            if (out_used > 0) {
+                rc = write_all_fd((int)mfd, out_buf, out_used);
+                out_used = 0;
+            }
+            if (rc >= 0 && emit_len >= sizeof(out_buf)) {
+                rc = write_all_fd((int)mfd, emit_ptr, emit_len);
+                emit_len = 0;
+            }
+        }
+        if (rc >= 0 && emit_len > 0) {
+            memcpy(out_buf + out_used, emit_ptr, emit_len);
+            out_used += emit_len;
         }
         pos += line_len;
     }
-    if (rc >= 0 && total > span_start) {
-        size_t wdone = 0, wlen = total - span_start;
-        while (wdone < wlen) {
-            long w = raw_syscall(__NR_write, mfd, (long)(b->proc_data + span_start + wdone),
-                                 (long)(wlen - wdone), 0, 0, 0);
-            if (w <= 0) { rc = w ? w : -EIO; break; }
-            wdone += (size_t)w;
-        }
-    }
+    if (rc >= 0 && out_used > 0)
+        rc = write_all_fd((int)mfd, out_buf, out_used);
     if (rc >= 0) rc = raw_syscall(__NR_lseek, mfd, 0, 0, 0, 0, 0);
     if (rc < 0) {
         raw_syscall(__NR_close, mfd, 0, 0, 0, 0, 0);
@@ -549,6 +634,37 @@ static const char *parse_proc_pid_subpath(const char *guest, long self_pid, long
     return cursor;
 }
 
+/* Standard Linux cgroup v1/v2 controller names (excludes non-Linux host controllers). */
+static int is_std_linux_cgroup_token(const char *tok, size_t len)
+{
+    if (len == 0) return 1; /* cgroup v2: "0::/" */
+    if (len > 5 && !strncmp(tok, "name=", 5)) return 1;
+    static const char *const std_ctrls[] = {
+        "cpu", "cpuacct", "cpuset", "memory", "blkio", "io", "pids",
+        "freezer", "devices", "net_cls", "net_prio", "perf_event",
+        "hugetlb", "rdma", "misc", "schedtune"
+    };
+    for (size_t i = 0; i < sizeof(std_ctrls) / sizeof(std_ctrls[0]); i++) {
+        if (strlen(std_ctrls[i]) == len && !strncmp(tok, std_ctrls[i], len))
+            return 1;
+    }
+    return 0;
+}
+
+static int is_std_linux_cgroup_list(const char *s, size_t len)
+{
+    if (len == 0) return 1;
+    size_t i = 0;
+    while (i < len) {
+        size_t j = i;
+        while (j < len && s[j] != ',') j++;
+        if (!is_std_linux_cgroup_token(s + i, j - i))
+            return 0;
+        i = (j < len) ? (j + 1) : j;
+    }
+    return 1;
+}
+
 /* Container cgroup-namespace view: strip host cgroup paths in /proc/<pid>/cgroup
  * so each hierarchy reports container-relative root ("/") instead of host paths. */
 long pb_proc_cgroup(Bridge *b, int flags)
@@ -574,6 +690,9 @@ long pb_proc_cgroup(Bridge *b, int flags)
                            (flags & O_CLOEXEC) ? 1 : 0, 0, 0, 0, 0);
     if (mfd < 0) return mfd;
 
+    char out_buf[2048];
+    size_t out_used = 0;
+    int is_hm = platform_is_harmonyos();
     long rc = 0;
     size_t pos = 0;
     while (pos < total && rc >= 0) {
@@ -582,21 +701,57 @@ long pb_proc_cgroup(Bridge *b, int flags)
         size_t llen = (nl < total) ? (nl - pos + 1) : (nl - pos);
         const char *lp = b->proc_data + pos;
         int colons = 0;
-        size_t second_colon = 0;
+        size_t first_colon = 0, second_colon = 0;
         for (size_t k = 0; k < llen; k++) {
             if (lp[k] == ':') {
                 colons++;
-                if (colons == 2) { second_colon = k; break; }
+                if (colons == 1) first_colon = k;
+                else if (colons == 2) { second_colon = k; break; }
             }
         }
         if (colons == 2) {
-            rc = write_all_fd((int)mfd, lp, second_colon + 1);
-            if (rc >= 0) rc = write_all_fd((int)mfd, "/\n", 2);
+            if (is_hm && !is_std_linux_cgroup_list(lp + first_colon + 1, second_colon - first_colon - 1)) {
+                pos += llen;
+                continue;
+            }
+            size_t need = second_colon + 3;
+            if (out_used + need > sizeof(out_buf)) {
+                if (out_used > 0) {
+                    rc = write_all_fd((int)mfd, out_buf, out_used);
+                    out_used = 0;
+                }
+            }
+            if (rc >= 0) {
+                if (need <= sizeof(out_buf)) {
+                    memcpy(out_buf + out_used, lp, second_colon + 1);
+                    out_used += second_colon + 1;
+                    out_buf[out_used++] = '/';
+                    out_buf[out_used++] = '\n';
+                } else {
+                    rc = write_all_fd((int)mfd, lp, second_colon + 1);
+                    if (rc >= 0) rc = write_all_fd((int)mfd, "/\n", 2);
+                }
+            }
         } else {
-            rc = write_all_fd((int)mfd, lp, llen);
+            if (out_used + llen > sizeof(out_buf)) {
+                if (out_used > 0) {
+                    rc = write_all_fd((int)mfd, out_buf, out_used);
+                    out_used = 0;
+                }
+            }
+            if (rc >= 0) {
+                if (llen <= sizeof(out_buf)) {
+                    memcpy(out_buf + out_used, lp, llen);
+                    out_used += llen;
+                } else {
+                    rc = write_all_fd((int)mfd, lp, llen);
+                }
+            }
         }
         pos += llen;
     }
+    if (rc >= 0 && out_used > 0)
+        rc = write_all_fd((int)mfd, out_buf, out_used);
     if (rc >= 0) rc = raw_syscall(__NR_lseek, mfd, 0, 0, 0, 0, 0);
     if (rc < 0) {
         raw_syscall(__NR_close, mfd, 0, 0, 0, 0, 0);
@@ -965,7 +1120,9 @@ static int path_is_internal_runtime(const char *path, size_t len)
     }
     static const char *const suffixes[] = {
         "/.svbox_svc_cache", "/owner.db", "/memfd:mounts", "/memfd:mounts-ns",
-        "/memfd:elf-mounts", "/memfd:svbox_net_state"
+        "/memfd:elf-mounts", "/memfd:svbox_net_state",
+        "/memfd:svbox-handoff", "/memfd:elf-fd-state",
+        "/memfd:broker-channel", "/memfd:guest-auxv"
     };
     for (size_t s = 0; s < sizeof(suffixes) / sizeof(suffixes[0]); s++) {
         size_t sl = strlen(suffixes[s]);
@@ -1035,13 +1192,16 @@ long pb_proc_maps(Bridge *b, int flags)
     int is_smaps = 0;
     if (!strcmp(cursor, "/maps")) is_smaps = 0;
     else if (!strcmp(cursor, "/smaps")) is_smaps = 1;
+    else if (!strcmp(cursor, "/smaps_rollup")) is_smaps = 2;
     else return -ENOENT;
 
     int is_self = (pid == self_pid);
+    int is_hm = platform_is_harmonyos();
     long kfd = raw_syscall(__NR_openat, AT_FDCWD, (long)b->host, O_RDONLY | O_CLOEXEC, 0, 0, 0);
     if (kfd < 0) return kfd;
 
-    long mfd = raw_syscall(__NR_memfd_create, (long)(is_smaps ? "smaps" : "maps"),
+    long mfd = raw_syscall(__NR_memfd_create,
+                           (long)(is_smaps == 2 ? "smaps_rollup" : (is_smaps ? "smaps" : "maps")),
                            (flags & O_CLOEXEC) ? 1 : 0, 0, 0, 0, 0);
     if (mfd < 0) {
         raw_syscall(__NR_close, kfd, 0, 0, 0, 0, 0);
@@ -1087,7 +1247,10 @@ long pb_proc_maps(Bridge *b, int flags)
 
             if (is_smaps && line_len > 0 && line[0] >= 'A' && line[0] <= 'Z') {
                 if (!skip_smaps_body) {
-                    if (exec_copy_smaps) {
+                    if (is_hm && ((line_len >= 8 && !strncmp(line, "Pss_HHP:", 8)) ||
+                                  (line_len >= 4 && !strncmp(line, "Purg", 4)))) {
+                        /* Omit host-only non-Linux smaps/smaps_rollup metrics. */
+                    } else if (exec_copy_smaps) {
                         char sl[96];
                         if (line_len >= 4 && !strncmp(line, "Rss:", 4)) {
                             smaps_rss_kb = parse_kb_value(line, line_len);
@@ -1150,10 +1313,11 @@ long pb_proc_maps(Bridge *b, int flags)
                 path_end--;
             size_t path_len = (size_t)(path_end - path_start);
 
-            int omit = (end > start &&
-                        (is_self ? hook_protected_overlap((uintptr_t)start, (size_t)(end - start))
-                                 : hook_fixed_runtime_overlap((uintptr_t)start, (size_t)(end - start)))) ||
-                       path_is_internal_runtime(path_start, path_len);
+            int omit = (is_smaps != 2) &&
+                       ((end > start &&
+                         (is_self ? hook_protected_overlap((uintptr_t)start, (size_t)(end - start))
+                                  : hook_fixed_runtime_overlap((uintptr_t)start, (size_t)(end - start)))) ||
+                        path_is_internal_runtime(path_start, path_len));
             if (omit) {
                 skip_smaps_body = 1;
                 exec_copy_smaps = 0;
@@ -1166,10 +1330,10 @@ long pb_proc_maps(Bridge *b, int flags)
             smaps_rss_kb = 0;
 
             struct vma_info vma;
-            if (is_self &&
+            if (is_self && is_smaps != 2 &&
                 (path_len == 0 || (path_len >= 7 && !strncmp(path_start, "/memfd:", 7))) &&
                 vma_track_lookup((uintptr_t)start, (uintptr_t)end, &vma)) {
-                if (is_smaps && vma.is_exec_copy && perms[1] != 'w')
+                if (is_smaps == 1 && vma.is_exec_copy && perms[1] != 'w')
                     exec_copy_smaps = 1;
                 const char *gpath = vma.path;
                 if (!vma.is_guest_path) {
@@ -1186,6 +1350,20 @@ long pb_proc_maps(Bridge *b, int flags)
                                                vma.file_off + (start - (uint64_t)vma.start),
                                                vma.dev, vma.ino, gpath);
                 maps_emit(&w, out_line, olen);
+            } else if (path_len >= 8 && !strncmp(path_start, "/memfd:", 7) &&
+                       translate_vdev_or_loop_memfd(path_start, path_len, b->cwd, sizeof(b->cwd))) {
+                size_t prefix_len = (size_t)(ino_end - line);
+                maps_emit(&w, line, prefix_len);
+                size_t col = prefix_len;
+                maps_emit(&w, " ", 1);
+                col++;
+                if (col < 73) {
+                    static const char spaces[74] =
+                        "                                                                         ";
+                    maps_emit(&w, spaces, 73 - col);
+                }
+                maps_emit(&w, b->cwd, strlen(b->cwd));
+                maps_emit(&w, "\n", 1);
             } else if (path_len > 0 && path_start[0] == '/' && path_len < sizeof(b->cwd) - 16) {
                 int deleted = (path_len > 10 && !strncmp(path_end - 10, " (deleted)", 10));
                 size_t core_len = deleted ? (path_len - 10) : path_len;
@@ -1243,9 +1421,26 @@ static size_t append_str(char *dst, size_t cap, size_t pos, const char *s)
     return pos;
 }
 
+static const char *proc_net_leaf(const char *guest)
+{
+    if (!guest || strncmp(guest, "/proc/", 6) != 0)
+        return NULL;
+    if (!strncmp(guest + 6, "net/", 4))
+        return guest + 10;
+    long self_pid = raw_syscall(__NR_getpid, 0, 0, 0, 0, 0, 0);
+    long pid = 0;
+    const char *sub = parse_proc_pid_subpath(guest, self_pid, &pid);
+    if (sub && !strncmp(sub, "/net/", 5))
+        return sub + 5;
+    return NULL;
+}
+
+static uint32_t g_proc_denied_mask;
+
 /* Generic Linux /proc fallback when the host sandbox denies read access (-EACCES/-EPERM)
  * to standard global procfs nodes (/proc/version, /proc/uptime, /proc/loadavg, /proc/stat,
- * /proc/cmdline). On hosts where these nodes are readable, the real host fd is returned. */
+ * /proc/cmdline, /proc/modules, /proc/swaps, /proc/net/{tcp,tcp6,udp,udp6,unix,arp}).
+ * On hosts where these nodes are readable, the real host fd is returned. */
 long pb_proc_fallback(Bridge *b, int flags)
 {
     int kind = 0;
@@ -1254,13 +1449,31 @@ long pb_proc_fallback(Bridge *b, int flags)
     else if (!strcmp(b->guest, "/proc/loadavg")) kind = 3;
     else if (!strcmp(b->guest, "/proc/stat")) kind = 4;
     else if (!strcmp(b->guest, "/proc/cmdline")) kind = 5;
-    else return -ENOENT;
+    else if (!strcmp(b->guest, "/proc/modules")) kind = 6;
+    else if (!strcmp(b->guest, "/proc/swaps")) kind = 7;
+    else {
+        const char *nl = proc_net_leaf(b->guest);
+        if (nl) {
+            if (!strcmp(nl, "tcp") || !strcmp(nl, "tcp6")) kind = 8;
+            else if (!strcmp(nl, "udp") || !strcmp(nl, "udp6")) kind = 9;
+            else if (!strcmp(nl, "unix")) kind = 10;
+            else if (!strcmp(nl, "arp")) kind = 11;
+        }
+    }
+    if (!kind)
+        return -ENOENT;
 
-    long hfd = raw_syscall(__NR_openat, AT_FDCWD, (long)b->host, flags, 0, 0, 0);
-    if (hfd >= 0 || (hfd != -EACCES && hfd != -EPERM))
-        return hfd;
+    /* Explicit --proc-cmdline always takes precedence over host /proc/cmdline. */
+    int skip_host = (kind == 5 && g_payload_config.proc_cmdline[0] != '\0');
+    uint32_t kbit = 1u << (unsigned)kind;
+    if (!skip_host && !(__atomic_load_n(&g_proc_denied_mask, __ATOMIC_ACQUIRE) & kbit)) {
+        long hfd = raw_syscall(__NR_openat, AT_FDCWD, (long)b->host, flags, 0, 0, 0);
+        if (hfd >= 0 || (hfd != -EACCES && hfd != -EPERM))
+            return hfd;
+        __atomic_fetch_or(&g_proc_denied_mask, kbit, __ATOMIC_RELEASE);
+    }
 
-    char buf[2048];
+    char buf[4096];
     size_t p = 0;
     const size_t cap = sizeof(buf);
     uint32_t ncpus = g_payload_config.cpu_mask ? popcount64(g_payload_config.cpu_mask) : 1;
@@ -1305,25 +1518,84 @@ long pb_proc_fallback(Bridge *b, int flags)
         raw_syscall(__NR_clock_gettime, 0 /* CLOCK_REALTIME */, (long)&rt, 0, 0, 0, 0);
         raw_syscall(__NR_clock_gettime, 7 /* CLOCK_BOOTTIME */, (long)&bt, 0, 0, 0, 0);
         uint64_t btime = (rt.tv_sec > bt.tv_sec && rt.tv_sec > 0) ? (uint64_t)(rt.tv_sec - bt.tv_sec) : 1700000000ull;
-        p = append_str(buf, cap, p, "cpu  0 0 0 0 0 0 0 0 0 0\n");
+        uint64_t total_cs = (bt.tv_sec > 0 ? (uint64_t)bt.tv_sec * 100ull : 100ull) +
+                            (bt.tv_nsec >= 0 ? (uint64_t)(bt.tv_nsec / 10000000L) : 0ull);
+        if (total_cs < 100ull) total_cs = 100ull;
+        uint64_t sum_user = 0, sum_nice = 0, sum_sys = 0, sum_idle = 0, sum_iow = 0;
         for (uint32_t i = 0; i < ncpus; i++) {
+            uint64_t u_i = (total_cs * (6ull + (i & 3u))) / 100ull;
+            uint64_t n_i = total_cs / 200ull;
+            uint64_t s_i = (total_cs * (3ull + (i & 1u))) / 100ull;
+            uint64_t w_i = total_cs / 500ull;
+            uint64_t id_i = (total_cs > u_i + n_i + s_i + w_i) ? (total_cs - u_i - n_i - s_i - w_i) : 1ull;
+            sum_user += u_i; sum_nice += n_i; sum_sys += s_i; sum_idle += id_i; sum_iow += w_i;
+        }
+        p = append_str(buf, cap, p, "cpu  ");
+        p = append_u64(buf, cap, p, sum_user); p = append_str(buf, cap, p, " ");
+        p = append_u64(buf, cap, p, sum_nice); p = append_str(buf, cap, p, " ");
+        p = append_u64(buf, cap, p, sum_sys);  p = append_str(buf, cap, p, " ");
+        p = append_u64(buf, cap, p, sum_idle); p = append_str(buf, cap, p, " ");
+        p = append_u64(buf, cap, p, sum_iow);  p = append_str(buf, cap, p, " 0 0 0 0 0\n");
+        for (uint32_t i = 0; i < ncpus; i++) {
+            uint64_t u_i = (total_cs * (6ull + (i & 3u))) / 100ull;
+            uint64_t n_i = total_cs / 200ull;
+            uint64_t s_i = (total_cs * (3ull + (i & 1u))) / 100ull;
+            uint64_t w_i = total_cs / 500ull;
+            uint64_t id_i = (total_cs > u_i + n_i + s_i + w_i) ? (total_cs - u_i - n_i - s_i - w_i) : 1ull;
             p = append_str(buf, cap, p, "cpu");
             p = append_u32(buf, cap, p, i);
-            p = append_str(buf, cap, p, " 0 0 0 0 0 0 0 0 0 0\n");
+            p = append_str(buf, cap, p, " ");
+            p = append_u64(buf, cap, p, u_i);  p = append_str(buf, cap, p, " ");
+            p = append_u64(buf, cap, p, n_i);  p = append_str(buf, cap, p, " ");
+            p = append_u64(buf, cap, p, s_i);  p = append_str(buf, cap, p, " ");
+            p = append_u64(buf, cap, p, id_i); p = append_str(buf, cap, p, " ");
+            p = append_u64(buf, cap, p, w_i);  p = append_str(buf, cap, p, " 0 0 0 0 0\n");
         }
-        p = append_str(buf, cap, p, "intr 0\nctxt 0\nbtime ");
+        p = append_str(buf, cap, p, "intr ");
+        p = append_u64(buf, cap, p, total_cs * 47ull);
+        p = append_str(buf, cap, p, "\nctxt ");
+        p = append_u64(buf, cap, p, total_cs * 113ull);
+        p = append_str(buf, cap, p, "\nbtime ");
         p = append_u64(buf, cap, p, btime);
-        p = append_str(buf, cap, p, "\nprocesses 64\nprocs_running 1\nprocs_blocked 0\n"
-                                    "softirq 0 0 0 0 0 0 0 0 0 0 0\n");
-    } else {
+        p = append_str(buf, cap, p, "\nprocesses ");
+        p = append_u64(buf, cap, p, 64ull + (total_cs / 100ull));
+        p = append_str(buf, cap, p, "\nprocs_running 1\nprocs_blocked 0\nsoftirq ");
+        p = append_u64(buf, cap, p, total_cs * 19ull);
+        p = append_str(buf, cap, p, " 0 ");
+        p = append_u64(buf, cap, p, total_cs * 9ull);
+        p = append_str(buf, cap, p, " 0 0 0 0 ");
+        p = append_u64(buf, cap, p, total_cs * 5ull);
+        p = append_str(buf, cap, p, " 0 ");
+        p = append_u64(buf, cap, p, total_cs * 5ull);
+        p = append_str(buf, cap, p, " 0\n");
+    } else if (kind == 5) {
+        const char *cmd = g_payload_config.proc_cmdline[0]
+            ? g_payload_config.proc_cmdline
+            : "console=ttyS0 root=/dev/root rw";
+        p = append_str(buf, cap, p, cmd);
         p = append_str(buf, cap, p, "\n");
+    } else if (kind == 6) {
+        /* Empty readable /proc/modules */
+    } else if (kind == 7) {
+        p = append_str(buf, cap, p, "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n");
+    } else if (kind == 8) {
+        p = append_str(buf, cap, p,
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode                                                     \n");
+    } else if (kind == 9) {
+        p = append_str(buf, cap, p,
+            "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops             \n");
+    } else if (kind == 10) {
+        p = append_str(buf, cap, p, "Num       RefCount Protocol Flags    Type St Inode Path\n");
+    } else {
+        p = append_str(buf, cap, p,
+            "IP address       HW type     Flags       HW address            Mask     Device\n");
     }
 
     long mfd = raw_syscall(__NR_memfd_create, (long)"procfs",
                            (flags & O_CLOEXEC) ? 1 : 0, 0, 0, 0, 0);
     if (mfd < 0)
         return mfd;
-    long rc = write_all_fd((int)mfd, buf, p);
+    long rc = p > 0 ? write_all_fd((int)mfd, buf, p) : 0;
     if (rc >= 0) rc = raw_syscall(__NR_lseek, mfd, 0, 0, 0, 0, 0);
     if (rc < 0) {
         raw_syscall(__NR_close, mfd, 0, 0, 0, 0, 0);
@@ -1633,10 +1905,15 @@ int pb_proc_map_files_guard(Bridge *b, long number, long a[6], long *out_rc)
             *out_rc = -ENOENT;
             return 1;
         }
-        int rc = pb_guest_link_target(b, b->cwd);
-        if (rc < 0) {
-            *out_rc = rc;
-            return 1;
+        if (translate_vdev_or_loop_memfd(b->cwd, (size_t)count, b->proc_candidate,
+                                         sizeof(b->proc_candidate))) {
+            strcpy(b->cwd, b->proc_candidate);
+        } else {
+            int rc = pb_guest_link_target(b, b->cwd);
+            if (rc < 0) {
+                *out_rc = rc;
+                return 1;
+            }
         }
         count = (long)strlen(b->cwd);
         if ((unsigned long)a[3] < (unsigned long)count)

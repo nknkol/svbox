@@ -147,13 +147,31 @@ static void add_bind(payload_config_t *cfg, char *bind_modes, const char *spec)
 		z_errx(1, "too many bind mounts (at most %d)", CONFIG_MAX_BINDS);
 
 	char mode = 'w';
+	uint32_t bflags = 0;
 	const char *guest_start = c1 + 1;
 	size_t guest_len;
 	const char *c2 = z_strchr(guest_start, ':');
 	if (c2) {
 		if (c2 == guest_start || !c2[1] || z_strchr(c2 + 1, ':'))
-			z_errx(1, "invalid --bind specification %s (expect HOST:GUEST[:rw|ro|deny])", spec);
-		mode = parse_access_mode(c2 + 1, "bind mode");
+			z_errx(1, "invalid --bind specification %s (expect HOST:GUEST[:rw|ro|deny][,nomnt])", spec);
+		const char *optp = c2 + 1;
+		int mode_set = 0;
+		while (*optp) {
+			const char *comma = z_strchr(optp, ',');
+			size_t tok_len = comma ? (size_t)(comma - optp) : z_strlen(optp);
+			if (tok_len == 5 && z_strncmp(optp, "nomnt", 5) == 0) {
+				bflags |= BIND_FLAG_NOMNT;
+			} else if (!mode_set && tok_len < 16) {
+				char tok[16];
+				z_memcpy(tok, optp, tok_len);
+				tok[tok_len] = '\0';
+				mode = parse_access_mode(tok, "bind mode");
+				mode_set = 1;
+			} else {
+				z_errx(1, "invalid bind option in %s", spec);
+			}
+			optp = comma ? comma + 1 : optp + tok_len;
+		}
 		guest_len = (size_t)(c2 - guest_start);
 	} else {
 		guest_len = z_strlen(guest_start);
@@ -163,6 +181,7 @@ static void add_bind(payload_config_t *cfg, char *bind_modes, const char *spec)
 	struct bind_entry *b = &cfg->binds[idx];
 	copy_substr(b->dst, CONFIG_MAX_PATH, spec, (size_t)(c1 - spec));
 	copy_substr(b->src, CONFIG_MAX_PATH, guest_start, guest_len);
+	b->flags = bflags;
 	bind_modes[idx] = mode;
 }
 
@@ -264,6 +283,7 @@ static void read_handoff(int fd, payload_config_t *cfg, struct loader_options *o
 	    !has_nul(hc->kernel_release, sizeof(hc->kernel_release)) ||
 	    !has_nul(hc->kernel_sysname, sizeof(hc->kernel_sysname)) ||
 	    !has_nul(hc->hostname, sizeof(hc->hostname)) ||
+	    !has_nul(hc->proc_cmdline, sizeof(hc->proc_cmdline)) ||
 	    !has_nul(hc->mount_access_observe, sizeof(hc->mount_access_observe)) ||
 	    !has_nul(hc->mount_scratch, sizeof(hc->mount_scratch)) ||
 	    !has_nul(hc->net_peers, sizeof(hc->net_peers)) ||
@@ -379,6 +399,7 @@ void options_print_help(int fd)
 		"  --hostname NAME                Override uname nodename\n"
 		"  --kernel-release VER           Override uname release\n"
 		"  --kernel-sysname NAME          Override uname sysname\n"
+		"  --proc-cmdline STR             Virtual /proc/cmdline content\n"
 		"  --net-addr IP                  Virtual container IPv4 address (127.128.0.0/9)\n"
 		"  --net-peers FILE               Peer container mapping file\n"
 		"  --net-sock PATH                Userspace virtual network & TUN daemon socket\n"
@@ -676,6 +697,11 @@ void options_parse(int argc, char **argv, payload_config_t *cfg, struct loader_o
 			if (z_strlen(v) >= sizeof(cfg->kernel_release))
 				z_errx(1, "invalid value for %s", arg);
 			copy_cstr(field, sizeof(cfg->kernel_release), v);
+		} else if (is(arg, "--proc-cmdline")) {
+			const char *v = value(argc, argv, &i);
+			if (z_strlen(v) >= sizeof(cfg->proc_cmdline))
+				z_errx(1, "invalid value for %s", arg);
+			copy_cstr(cfg->proc_cmdline, sizeof(cfg->proc_cmdline), v);
 		} else if (is(arg, "--net-addr")) {
 			const char *v = value(argc, argv, &i);
 			uint32_t ip = 0, part = 0;

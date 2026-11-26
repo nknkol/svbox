@@ -549,6 +549,7 @@ const char *mounts_fs_name(const char *host)
         {0x73636673, "securityfs"}, {0x64626720, "debugfs"}, {0x74726163, "tracefs"},
         {0xe0f5e1e2, "erofs"}, {0x6e736673, "nsfs"}, {0x5346414f, "afs"}, {0x2011bab0, "exfat"},
         {0x4d44, "vfat"}, {0x794c7630, "overlay"}, {0x58465342, "xfs"}, {0x9123683e, "btrfs"},
+        {0xcafe4a11, "bpf"}, {0xf97cff8c, "selinuxfs"},
     };
     unsigned long buffer[16];
     if (host_syscall(__NR_statfs, (long)host, (long)buffer, 0, 0, 0, 0) < 0)
@@ -556,7 +557,7 @@ const char *mounts_fs_name(const char *host)
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
         if ((buffer[0] & 0xffffffffu) == names[i].magic)
             return names[i].name;
-    return "none";
+    return "fuse";
 }
 
 /* One line: what every format needs of a mount. */
@@ -608,13 +609,76 @@ static void put_row(struct out *o, const struct row *r, int info)
     put(o, r->flags & MS_RDONLY_ ? " ro\n" : " rw\n");
 }
 
-#define ROWS (1 + CONFIG_MAX_BINDS + MOUNT_TABLE_MAX)
+#define ROWS (3 + CONFIG_MAX_BINDS + MOUNT_TABLE_MAX)
 struct render_scratch {
     struct mount_entry entries[MOUNT_TABLE_MAX];
     struct row rows[ROWS];
-    char fstypes[1 + CONFIG_MAX_BINDS][16];
     struct out out;
 };
+
+static int bind_meta_ready;
+static uint8_t bind_meta_is_dir[CONFIG_MAX_BINDS];
+static char bind_meta_fstype[CONFIG_MAX_BINDS][16];
+
+static void ensure_bind_meta(const payload_config_t *cfg)
+{
+    if (__atomic_load_n(&bind_meta_ready, __ATOMIC_ACQUIRE))
+        return;
+    for (int i = 0; i < cfg->bind_count && i < CONFIG_MAX_BINDS; i++) {
+        const char *host = cfg->binds[i].dst;
+        struct stat st;
+        int is_dir = 1;
+        if (host_syscall(__NR_newfstatat, AT_FDCWD_, (long)host, (long)&st, 0, 0, 0) == 0)
+            is_dir = ((st.st_mode & S_IFMT_) == S_IFDIR_) ? 1 : 0;
+        bind_meta_is_dir[i] = (uint8_t)is_dir;
+        const char *fs = is_dir ? mounts_fs_name(host) : "none";
+        size_t n = strlen(fs);
+        if (n >= sizeof(bind_meta_fstype[i]))
+            n = sizeof(bind_meta_fstype[i]) - 1;
+        memcpy(bind_meta_fstype[i], fs, n);
+        bind_meta_fstype[i][n] = '\0';
+    }
+    __atomic_store_n(&bind_meta_ready, 1, __ATOMIC_RELEASE);
+}
+
+static int normalize_virtual_mount(const char *guest, const char **src_out,
+                                   const char **fs_out, uint32_t *flags_io)
+{
+    if (!strcmp(guest, "/proc")) {
+        *src_out = "proc"; *fs_out = "proc"; return 1;
+    }
+    if (!strcmp(guest, "/dev")) {
+        *src_out = "tmpfs"; *fs_out = "tmpfs"; *flags_io |= MS_NOSUID_; return 1;
+    }
+    if (!strcmp(guest, "/dev/pts")) {
+        *src_out = "devpts"; *fs_out = "devpts"; return 1;
+    }
+    if (!strcmp(guest, "/dev/mqueue")) {
+        *src_out = "mqueue"; *fs_out = "mqueue"; return 1;
+    }
+    if (!strcmp(guest, "/dev/shm")) {
+        *src_out = "tmpfs"; *fs_out = "tmpfs"; return 1;
+    }
+    if (!strcmp(guest, "/sys")) {
+        *src_out = "sysfs"; *fs_out = "sysfs";
+        *flags_io |= MS_NOSUID_ | MS_NODEV_ | MS_NOEXEC_;
+        return 1;
+    }
+    if (!strcmp(guest, "/sys/fs/cgroup")) {
+        *src_out = "cgroup"; *fs_out = "cgroup";
+        *flags_io |= MS_NOSUID_ | MS_NODEV_ | MS_NOEXEC_;
+        return 1;
+    }
+    if (!strcmp(guest, "/sys/fs/bpf")) {
+        *src_out = "bpf"; *fs_out = "bpf";
+        *flags_io |= MS_NOSUID_ | MS_NODEV_ | MS_NOEXEC_;
+        return 1;
+    }
+    if (!strcmp(guest, "/sys/fs/selinux")) {
+        *src_out = "selinuxfs"; *fs_out = "selinuxfs"; return 1;
+    }
+    return 0;
+}
 
 long mounts_render(int fd, int info)
 {
@@ -623,23 +687,68 @@ long mounts_render(int fd, int info)
         return mem;
     struct render_scratch *s = (void *)mem;
     payload_config_t *cfg = &g_payload_config;
+    ensure_bind_meta(cfg);
     int count = mounts_snapshot(s->entries, MOUNT_TABLE_MAX), rows = 0;
     const char *root = cfg->root[0] ? cfg->root : "/";
     uint32_t root_flags = 0;
     if (cfg->mount_access_observe[0] == 'r' && cfg->guard >= GUARD_PATHS)
         root_flags = MS_RDONLY_;
     s->rows[rows++] = (struct row){"/", root, "overlay", "overlay", root_flags, 20, 1};
+
+    int is_ctr = (cfg->mode == CONFIG_MODE_CONTAINER);
+    int have_dev = 0, have_sys = 0, want_dev = 0, want_sys = 0;
+    if (is_ctr) {
+        for (int i = 0; i < cfg->bind_count && i < CONFIG_MAX_BINDS; i++) {
+            const char *g = cfg->binds[i].src;
+            if (!strcmp(g, "/dev")) have_dev = 1;
+            else if (!strncmp(g, "/dev/", 5)) want_dev = 1;
+            if (!strcmp(g, "/sys")) have_sys = 1;
+            else if (!strncmp(g, "/sys/", 5)) want_sys = 1;
+        }
+        for (int i = 0; i < count; i++) {
+            const char *g = s->entries[i].guest;
+            if (!g[0]) continue;
+            if (!strcmp(g, "/dev")) have_dev = 1;
+            if (!strcmp(g, "/sys")) have_sys = 1;
+        }
+        if (!have_dev && want_dev)
+            s->rows[rows++] = (struct row){"/dev", root, "tmpfs", "tmpfs", MS_NOSUID_, 18, 20};
+        if (!have_sys && want_sys)
+            s->rows[rows++] = (struct row){"/sys", root, "sysfs", "sysfs",
+                                           MS_NOSUID_ | MS_NODEV_ | MS_NOEXEC_, 19, 20};
+    }
+
     for (int i = 0; i < cfg->bind_count && i < CONFIG_MAX_BINDS; i++) {
+        const char *guest = cfg->binds[i].src;
         const char *host = cfg->binds[i].dst;
-        strcpy(s->fstypes[i], mounts_fs_name(host));
+        if (cfg->binds[i].flags & BIND_FLAG_NOMNT)
+            continue;
+        if (is_ctr) {
+            if (!bind_meta_is_dir[i])
+                continue;
+            if (!strncmp(guest, "/dev/", 5) &&
+                strcmp(guest, "/dev/pts") != 0 &&
+                strcmp(guest, "/dev/mqueue") != 0 &&
+                strcmp(guest, "/dev/shm") != 0)
+                continue;
+            if (!strncmp(guest, "/sys/", 5) &&
+                strcmp(guest, "/sys/fs/cgroup") != 0 &&
+                strcmp(guest, "/sys/fs/bpf") != 0 &&
+                strcmp(guest, "/sys/fs/selinux") != 0)
+                continue;
+        }
         uint32_t flags = 0;
         if (cfg->mount_access_observe[i + 1] == 'r' && cfg->guard >= GUARD_PATHS)
             flags = MS_RDONLY_;
-        const char *fstype = s->fstypes[i];
-        s->rows[rows++] = (struct row){cfg->binds[i].src, host,
-                                       !strcmp(fstype, "proc") || !strcmp(fstype, "sysfs") ||
-                                       !strcmp(fstype, "devpts") || !strcmp(fstype, "tmpfs") ?
-                                       fstype : "/dev/root", fstype, flags, 21 + i, 0};
+        const char *source = NULL;
+        const char *fstype = bind_meta_fstype[i];
+        if (!is_ctr || !normalize_virtual_mount(guest, &source, &fstype, &flags)) {
+            source = (!strcmp(fstype, "proc") || !strcmp(fstype, "sysfs") ||
+                      !strcmp(fstype, "devpts") || !strcmp(fstype, "tmpfs") ||
+                      !strcmp(fstype, "cgroup") || !strcmp(fstype, "bpf") ||
+                      !strcmp(fstype, "selinuxfs")) ? fstype : "/dev/root";
+        }
+        s->rows[rows++] = (struct row){guest, host, source, fstype, flags, 21 + i, 0};
     }
     /* Emulated mounts in creation order. */
     for (uint32_t last = 0;;) {
