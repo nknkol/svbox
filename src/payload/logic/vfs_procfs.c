@@ -1050,6 +1050,15 @@ long pb_proc_meminfo(Bridge *b, int flags)
         } else if (llen >= 13 && !strncmp(lp, "SReclaimable:", 13)) {
             uint64_t v = parse_kb_value(lp, llen);
             if (v > limit_kb / 16) { rkey = "SReclaimable:"; rval = limit_kb / 16; }
+        } else if (llen >= 13 && !strncmp(lp, "KReclaimable:", 13)) {
+            uint64_t v = parse_kb_value(lp, llen);
+            if (v > limit_kb / 16) { rkey = "KReclaimable:"; rval = limit_kb / 16; }
+        } else if (llen >= 10 && !strncmp(lp, "SwapTotal:", 10)) {
+            uint64_t v = parse_kb_value(lp, llen);
+            if (v > limit_kb / 2) { rkey = "SwapTotal:"; rval = limit_kb / 2; }
+        } else if (llen >= 9 && !strncmp(lp, "SwapFree:", 9)) {
+            uint64_t v = parse_kb_value(lp, llen);
+            if (v > limit_kb / 2) { rkey = "SwapFree:"; rval = limit_kb / 2; }
         } else if (llen >= 11 && !strncmp(lp, "SUnreclaim:", 11)) {
             uint64_t v = parse_kb_value(lp, llen);
             if (v > limit_kb / 16) { rkey = "SUnreclaim:"; rval = limit_kb / 16; }
