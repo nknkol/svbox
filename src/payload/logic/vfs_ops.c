@@ -783,6 +783,11 @@ long pb_dispatch(Bridge *b, long number, long a[6], struct proot_open_origin *or
         int device = pb_loop_device(b->guest);
         if (device != -1) return pb_loop_path_call(number, a, device);
     }
+    if (g_payload_config.mode == CONFIG_MODE_CONTAINER && b->guest[0] == '/' && b->guest[1] == 'p') {
+        long mfrc = 0;
+        if (pb_proc_map_files_guard(b, number, a, &mfrc))
+            return mfrc;
+    }
     if (number == __NR_readlinkat) {
         Comparison c = compare_paths("/proc", b->guest);
         if (c == PATH1_IS_PREFIX)

@@ -3,8 +3,10 @@
  * fd), their cmdline, readlink of /proc names, and the mount tables
  * generated from the R4 table. */
 #include "vfs_bridge_internal.h"
+#include "fake_ids.h"
 #include "hook_runtime.h"
 #include "integrity.h"
+#include "platform.h"
 #include "vdev.h"
 
 static int parse_hex_u64(const char **pp, const char *end, uint64_t *out);
@@ -962,7 +964,7 @@ static int path_is_internal_runtime(const char *path, size_t len)
     }
     static const char *const suffixes[] = {
         "/.svbox_svc_cache", "/owner.db", "/memfd:mounts", "/memfd:mounts-ns",
-        "/memfd:svbox_net_state"
+        "/memfd:elf-mounts", "/memfd:svbox_net_state"
     };
     for (size_t s = 0; s < sizeof(suffixes) / sizeof(suffixes[0]); s++) {
         size_t sl = strlen(suffixes[s]);
@@ -1207,6 +1209,14 @@ long pb_proc_maps(Bridge *b, int flags)
                 } else {
                     maps_emit(&w, line, line_len);
                 }
+            } else if (platform_is_harmonyos() && path_len > 0 && path_start[0] == '[' &&
+                       ((path_len == 8 && !strncmp(path_start, "[kshare]", 8)) ||
+                        (path_len == 6 && !strncmp(path_start, "[shmm]", 6)))) {
+                const char *vname = (path_len == 8) ? "[vvar]" : "[vdso]";
+                size_t prefix_len = (size_t)(path_start - line);
+                maps_emit(&w, line, prefix_len);
+                maps_emit(&w, vname, 6);
+                maps_emit(&w, "\n", 1);
             } else {
                 maps_emit(&w, line, line_len);
             }
@@ -1510,12 +1520,149 @@ static int proc_pid_is_container(const char *pid_str, long self_pid, const char 
            !strncmp(cbuf, loader, loader_len);
 }
 
-/* Filter /proc root directory listings in container mode so host/sibling
- * non-container processes sharing the same host UID are not exposed to guests. */
+/* Parse /proc/(self|thread-self|<pid>)(/task/<tid>)?/map_files(/<lo>-<hi>)?
+ * Returns: 0 = not map_files, 1 = map_files dir itself, 2 = map_files/<entry>. */
+static int parse_proc_map_files(const char *path, int *is_self_out,
+                                int *has_range_out, uint64_t *lo_out, uint64_t *hi_out)
+{
+    if (!path || strncmp(path, "/proc/", 6) != 0)
+        return 0;
+    const char *cur = path + 6;
+    long self_pid = current_id(__NR_getpid);
+    long pid = 0;
+    if (!strncmp(cur, "self/", 5)) {
+        pid = self_pid;
+        cur += 4;
+    } else if (!strncmp(cur, "thread-self/", 12)) {
+        pid = self_pid;
+        cur += 11;
+    } else {
+        if (*cur < '1' || *cur > '9') return 0;
+        while (*cur >= '0' && *cur <= '9') pid = pid * 10 + (*cur++ - '0');
+    }
+    if (!strncmp(cur, "/task/", 6)) {
+        cur += 6;
+        if (*cur < '1' || *cur > '9') return 0;
+        while (*cur >= '0' && *cur <= '9') cur++;
+    }
+    if (strncmp(cur, "/map_files", 10) != 0)
+        return 0;
+    cur += 10;
+    if (is_self_out) *is_self_out = (pid == self_pid);
+    if (has_range_out) *has_range_out = 0;
+    if (*cur == '\0' || (*cur == '/' && cur[1] == '\0'))
+        return 1;
+    if (*cur != '/')
+        return 0;
+    cur++;
+    const char *end = cur + strlen(cur);
+    const char *p = cur;
+    uint64_t lo = 0, hi = 0;
+    if (parse_hex_u64(&p, end, &lo) && p < end && *p == '-' &&
+        (++p, parse_hex_u64(&p, end, &hi)) && p == end) {
+        if (has_range_out) *has_range_out = 1;
+        if (lo_out) *lo_out = lo;
+        if (hi_out) *hi_out = hi;
+    }
+    return 2;
+}
+
+static int proc_map_files_capable(void)
+{
+    if (!g_payload_config.fake_ids)
+        return 1;
+    return fake_ids_capable(21 /* CAP_SYS_ADMIN */) ||
+           fake_ids_capable(40 /* CAP_CHECKPOINT_RESTORE */);
+}
+
+/* Enforce Linux /proc/<pid>/map_files capability checks (CAP_SYS_ADMIN /
+ * CAP_CHECKPOINT_RESTORE) and hide internal runtime mappings + translate
+ * vma_track / host paths for privileged callers. */
+int pb_proc_map_files_guard(Bridge *b, long number, long a[6], long *out_rc)
+{
+    int is_self = 0, has_range = 0;
+    uint64_t lo = 0, hi = 0;
+    int kind = parse_proc_map_files(b->guest, &is_self, &has_range, &lo, &hi);
+    if (kind != 2)
+        return 0;
+    if (!proc_map_files_capable()) {
+        *out_rc = -EPERM;
+        return 1;
+    }
+    if (has_range && hi > lo) {
+        int hidden = is_self
+            ? hook_protected_overlap((uintptr_t)lo, (size_t)(hi - lo))
+            : hook_fixed_runtime_overlap((uintptr_t)lo, (size_t)(hi - lo));
+        if (hidden) {
+            *out_rc = -ENOENT;
+            return 1;
+        }
+    }
+    if (number == __NR_readlinkat) {
+        if (!a[2]) {
+            *out_rc = -EFAULT;
+            return 1;
+        }
+        struct vma_info vma;
+        if (is_self && has_range && hi > lo &&
+            vma_track_lookup((uintptr_t)lo, (uintptr_t)hi, &vma)) {
+            const char *gpath = vma.path;
+            if (!vma.is_guest_path) {
+                size_t pl = strlen(vma.path);
+                if (pl < sizeof(b->cwd)) {
+                    memcpy(b->cwd, vma.path, pl + 1);
+                    if (pb_guest_link_target(b, b->cwd) >= 0)
+                        gpath = b->cwd;
+                }
+            }
+            long count = (long)strlen(gpath);
+            if ((unsigned long)a[3] < (unsigned long)count)
+                count = (long)a[3];
+            memcpy((void *)a[2], gpath, (size_t)count);
+            *out_rc = count;
+            return 1;
+        }
+        long count = pb_host_readlink(b, b->host, b->cwd, sizeof(b->cwd) - 1);
+        if (count < 0) {
+            *out_rc = count;
+            return 1;
+        }
+        b->cwd[count] = '\0';
+        if (path_is_internal_runtime(b->cwd, (size_t)count)) {
+            *out_rc = -ENOENT;
+            return 1;
+        }
+        int rc = pb_guest_link_target(b, b->cwd);
+        if (rc < 0) {
+            *out_rc = rc;
+            return 1;
+        }
+        count = (long)strlen(b->cwd);
+        if ((unsigned long)a[3] < (unsigned long)count)
+            count = (long)a[3];
+        memcpy((void *)a[2], b->cwd, (size_t)count);
+        *out_rc = count;
+        return 1;
+    }
+    /* For openat/stat/access on privileged map_files/<entry>: still hide internal runtime files. */
+    long n = pb_host_readlink(b, b->host, b->cwd, sizeof(b->cwd) - 1);
+    if (n > 0) {
+        b->cwd[n] = '\0';
+        if (path_is_internal_runtime(b->cwd, (size_t)n)) {
+            *out_rc = -ENOENT;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Filter /proc root directory listings and /proc/<pid>/map_files in container mode:
+ * - /proc: hide host/sibling non-container processes sharing the same host UID.
+ * - /proc/<pid>/map_files: enforce CAP_SYS_ADMIN/CAP_CHECKPOINT_RESTORE (-EPERM)
+ *   and omit internal runtime mappings for privileged callers. */
 long proot_proc_filter_pids(int fd, void *buffer, long length)
 {
-    if (g_payload_config.mode != CONFIG_MODE_CONTAINER ||
-        !g_payload_config.loader_path[0] || !buffer || length <= 0)
+    if (g_payload_config.mode != CONFIG_MODE_CONTAINER || !buffer || length <= 0)
         return length;
 
     unsigned long fs[16];
@@ -1523,18 +1670,64 @@ long proot_proc_filter_pids(int fd, void *buffer, long length)
         (unsigned)fs[0] != 0x9fa0 /* PROC_SUPER_MAGIC */)
         return length;
 
-    /* Confirm fd refers to /proc itself, not /proc/<pid>/task or /proc/<pid>/fd. */
     char fdlink[32];
     memcpy(fdlink, "/proc/self/fd/", 14);
     size_t fp = append_u32(fdlink, sizeof(fdlink) - 1, 14, (uint32_t)fd);
     fdlink[fp] = '\0';
-    char target[32];
+    char target[96];
     long tlen = raw_syscall(__NR_readlinkat, AT_FDCWD, (long)fdlink,
                             (long)target, (long)(sizeof(target) - 1), 0, 0);
-    if (tlen != 5)
+    if (tlen < 5)
         return length;
-    target[5] = '\0';
-    if (strcmp(target, "/proc") != 0)
+    target[tlen] = '\0';
+
+    int is_self_mf = 0;
+    if (parse_proc_map_files(target, &is_self_mf, NULL, NULL, NULL) == 1) {
+        if (!proc_map_files_capable()) {
+            memset(buffer, 0, (size_t)length);
+            return -EPERM;
+        }
+        unsigned char *bytes = (unsigned char *)buffer;
+        long kept = 0;
+        for (long at = 0; at < length;) {
+            unsigned short size;
+            memcpy(&size, bytes + at + 16, sizeof(size));
+            if (size < 20 || at + size > length)
+                return length;
+            const char *name = (const char *)bytes + at + 19;
+            int keep = 1;
+            if (strcmp(name, ".") != 0 && strcmp(name, "..") != 0) {
+                const char *p = name;
+                const char *end = name + strlen(name);
+                uint64_t lo = 0, hi = 0;
+                if (parse_hex_u64(&p, end, &lo) && p < end && *p == '-' &&
+                    (++p, parse_hex_u64(&p, end, &hi)) && p == end && hi > lo) {
+                    if (is_self_mf ? hook_protected_overlap((uintptr_t)lo, (size_t)(hi - lo))
+                                   : hook_fixed_runtime_overlap((uintptr_t)lo, (size_t)(hi - lo)))
+                        keep = 0;
+                }
+                if (keep) {
+                    char lbuf[256];
+                    long ln = raw_syscall(__NR_readlinkat, fd, (long)name,
+                                          (long)lbuf, (long)(sizeof(lbuf) - 1), 0, 0);
+                    if (ln > 0) {
+                        lbuf[ln] = '\0';
+                        if (path_is_internal_runtime(lbuf, (size_t)ln))
+                            keep = 0;
+                    }
+                }
+            }
+            if (keep) {
+                if (kept != at)
+                    memmove(bytes + kept, bytes + at, size);
+                kept += size;
+            }
+            at += size;
+        }
+        return kept;
+    }
+
+    if (!g_payload_config.loader_path[0] || tlen != 5 || strcmp(target, "/proc") != 0)
         return length;
 
     const char *loader = g_payload_config.loader_path;
