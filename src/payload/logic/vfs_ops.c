@@ -848,6 +848,8 @@ long pb_dispatch(Bridge *b, long number, long a[6], struct proot_open_origin *or
         long nrc = net_stack_proc_call(number, a, path);
         if (nrc != -ENOENT) {
             b->defer_final = false;
+            if (number == __NR_openat && nrc >= 0)
+                pb_vfd_record((int)nrc, path);
             return nrc;
         }
     }

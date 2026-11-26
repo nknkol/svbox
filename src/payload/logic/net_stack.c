@@ -114,7 +114,33 @@ static inline uint16_t ns_be16(uint16_t v) { return (uint16_t)((v << 8) | (v >> 
 static inline uint32_t ns_be32(uint32_t v) { return __builtin_bswap32(v); }
 
 static volatile int g_ns_lock = 0;
-static const struct sv_net_state *g_net_state = NULL;
+static struct sv_net_state *g_net_state = NULL;
+static int g_net_state_rw = 0;
+
+/* Lockless FD bitmaps tracking AF_INET/AF_INET6 sockets (FDs 0..1023) and
+ * whether the socket's peer/destination is loopback, for zero-IPC live
+ * rx/tx counter updates in shared sv_net_state. */
+static uint64_t g_inet_fds[16];
+static uint64_t g_inet_lo_fds[16];
+
+static inline int inet_fd_test(const uint64_t bm[16], int fd)
+{
+    if ((unsigned)fd >= 1024u) return 0;
+    return (int)((__atomic_load_n(&bm[(unsigned)fd >> 6], __ATOMIC_RELAXED) >>
+                  ((unsigned)fd & 63u)) & 1ull);
+}
+
+static inline void inet_fd_set(uint64_t bm[16], int fd)
+{
+    if ((unsigned)fd >= 1024u) return;
+    __atomic_fetch_or(&bm[(unsigned)fd >> 6], 1ull << ((unsigned)fd & 63u), __ATOMIC_RELAXED);
+}
+
+static inline void inet_fd_clear(uint64_t bm[16], int fd)
+{
+    if ((unsigned)fd >= 1024u) return;
+    __atomic_fetch_and(&bm[(unsigned)fd >> 6], ~(1ull << ((unsigned)fd & 63u)), __ATOMIC_RELAXED);
+}
 
 #define NS_MAX_NL_FDS       64
 #define NS_MARK_INLINE_CAP  64
@@ -308,7 +334,7 @@ const struct sv_net_state *net_stack_state(void)
 {
     if (!net_stack_enabled())
         return NULL;
-    const struct sv_net_state *cur = __atomic_load_n(&g_net_state, __ATOMIC_ACQUIRE);
+    struct sv_net_state *cur = __atomic_load_n(&g_net_state, __ATOMIC_ACQUIRE);
     if (cur)
         return cur;
 
@@ -322,12 +348,18 @@ const struct sv_net_state *net_stack_state(void)
             size_t sz = rep.arg0 >= sizeof(struct sv_net_state)
                 ? (size_t)rep.arg0
                 : sizeof(struct sv_net_state);
-            long addr = raw_syscall(__NR_mmap, 0, (long)sz, PROT_READ_, MAP_SHARED_, mfd, 0);
+            int rw = 1;
+            long addr = raw_syscall(__NR_mmap, 0, (long)sz, PROT_READ_ | PROT_WRITE_, MAP_SHARED_, mfd, 0);
+            if (addr < 0 || (unsigned long)addr >= (unsigned long)-4095) {
+                rw = 0;
+                addr = raw_syscall(__NR_mmap, 0, (long)sz, PROT_READ_, MAP_SHARED_, mfd, 0);
+            }
             raw_syscall(__NR_close, mfd, 0, 0, 0, 0, 0);
             if (addr >= 0 && (unsigned long)addr < (unsigned long)-4095) {
-                const struct sv_net_state *st = (const struct sv_net_state *)addr;
+                struct sv_net_state *st = (struct sv_net_state *)addr;
                 if (st->magic == SV_NET_STATE_MAGIC && st->version == SV_NET_STATE_VERSION) {
                     hook_note_internal((uintptr_t)addr, sz);
+                    g_net_state_rw = rw;
                     __atomic_store_n(&g_net_state, st, __ATOMIC_RELEASE);
                     cur = st;
                 } else {
@@ -592,6 +624,86 @@ static int is_v4_loopback_or_unspec(uint32_t net_ip)
     if (h == 0 || (h >> 24) == 127u)
         return 1;
     return 0;
+}
+
+static int sockaddr_is_loopback(const void *sa, unsigned len)
+{
+    if (!sa || len < 8)
+        return 0;
+    uint16_t fam = 0;
+    memcpy(&fam, sa, 2);
+    if (fam == AF_INET_) {
+        uint32_t ip4 = 0;
+        memcpy(&ip4, (const uint8_t *)sa + 4, 4);
+        return is_v4_loopback_or_unspec(ip4);
+    }
+    if (fam == AF_INET6_ && len >= 24) {
+        const uint8_t *a6 = (const uint8_t *)sa + 8;
+        uint32_t ip4 = 0;
+        if (extract_v4_from_v6(a6, &ip4))
+            return is_v4_loopback_or_unspec(ip4);
+        return is_v6_loopback_or_unspec(a6);
+    }
+    return 0;
+}
+
+static int sockaddr_is_explicit_loopback(const void *sa, unsigned len)
+{
+    if (!sa || len < 8)
+        return 0;
+    uint16_t fam = 0;
+    memcpy(&fam, sa, 2);
+    if (fam == AF_INET_) {
+        uint32_t ip4 = 0;
+        memcpy(&ip4, (const uint8_t *)sa + 4, 4);
+        return (ns_be32(ip4) >> 24) == 127u;
+    }
+    if (fam == AF_INET6_ && len >= 24) {
+        const uint8_t *a6 = (const uint8_t *)sa + 8;
+        uint32_t ip4 = 0;
+        if (extract_v4_from_v6(a6, &ip4))
+            return (ns_be32(ip4) >> 24) == 127u;
+        return is_v6_loopback_or_unspec(a6) && a6[15] == 1;
+    }
+    return 0;
+}
+
+static void net_account_io(int is_lo, int is_tx, uint64_t bytes)
+{
+    if (!bytes)
+        return;
+    struct sv_net_state *st = __atomic_load_n(&g_net_state, __ATOMIC_ACQUIRE);
+    if (!st)
+        st = (struct sv_net_state *)net_stack_state();
+    if (!st || !g_net_state_rw)
+        return;
+    struct sv_net_iface *target = NULL;
+    for (int i = 0; i < SV_NET_MAX_IFACES; i++) {
+        struct sv_net_iface *f = &st->ifaces[i];
+        if (!f->active || !(f->flags & SV_IFF_UP))
+            continue;
+        if (is_lo) {
+            if (f->flags & SV_IFF_LOOPBACK) {
+                target = f;
+                break;
+            }
+        } else {
+            if (!(f->flags & SV_IFF_LOOPBACK) && !f->is_tun) {
+                target = f;
+                break;
+            }
+        }
+    }
+    if (!target)
+        return;
+    uint64_t pkts = (bytes + 1459ull) / 1460ull;
+    if (is_tx) {
+        __atomic_fetch_add(&target->tx_bytes, bytes, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&target->tx_packets, pkts, __ATOMIC_RELAXED);
+    } else {
+        __atomic_fetch_add(&target->rx_bytes, bytes, __ATOMIC_RELAXED);
+        __atomic_fetch_add(&target->rx_packets, pkts, __ATOMIC_RELAXED);
+    }
 }
 
 static int uid_routed_to_tun(const struct sv_net_state *st)
@@ -901,6 +1013,8 @@ int net_stack_pre_syscall(long number, long a[6], long *out)
     if (number == __NR_close) {
         nl_clear_fd((int)a[0]);
         mark_clear_fd((int)a[0]);
+        inet_fd_clear(g_inet_fds, (int)a[0]);
+        inet_fd_clear(g_inet_lo_fds, (int)a[0]);
         return 0;
     }
 
@@ -1117,6 +1231,17 @@ int net_stack_pre_syscall(long number, long a[6], long *out)
     /* 5. SIOC* virtual interface / route ioctls. */
     if (number == __NR_ioctl)
         return handle_sioc_ioctl((unsigned long)a[1], (unsigned long)a[2], out);
+
+    /* 5b. Record loopback vs external peer on AF_INET/AF_INET6 connect() or bind(). */
+    if (number == __NR_connect && inet_fd_test(g_inet_fds, (int)a[0]) && a[1] && (unsigned)a[2] >= 8u) {
+        if (sockaddr_is_loopback((const void *)a[1], (unsigned)a[2]))
+            inet_fd_set(g_inet_lo_fds, (int)a[0]);
+        else
+            inet_fd_clear(g_inet_lo_fds, (int)a[0]);
+    } else if (number == __NR_bind && inet_fd_test(g_inet_fds, (int)a[0]) && a[1] && (unsigned)a[2] >= 8u) {
+        if (sockaddr_is_explicit_loopback((const void *)a[1], (unsigned)a[2]))
+            inet_fd_set(g_inet_lo_fds, (int)a[0]);
+    }
 
     /* 6. Transparent TCP / UDP redirection when a TUN route is active. */
     if (number == __NR_connect || number == __NR_sendto || number == __NR_sendmsg) {
@@ -1363,16 +1488,86 @@ void net_stack_post_syscall(long number, long a[6], long ret, unsigned name_cap)
     if (!net_stack_enabled() || ret < 0)
         return;
 
-    /* Keep FD tracking tables consistent across socket/dup/fcntl. */
+    /* Keep FD tracking tables consistent across socket/accept/dup/fcntl. */
     if (number == __NR_socket) {
         nl_clear_fd((int)ret);
         mark_clear_fd((int)ret);
+        if (a[0] == AF_INET_ || a[0] == AF_INET6_) {
+            inet_fd_set(g_inet_fds, (int)ret);
+            inet_fd_clear(g_inet_lo_fds, (int)ret);
+        } else {
+            inet_fd_clear(g_inet_fds, (int)ret);
+            inet_fd_clear(g_inet_lo_fds, (int)ret);
+        }
+        return;
+    }
+    if (number == __NR_accept || number == __NR_accept4) {
+        if (inet_fd_test(g_inet_fds, (int)a[0])) {
+            inet_fd_set(g_inet_fds, (int)ret);
+            if (a[1] && a[2] && *(unsigned *)a[2] >= 8u &&
+                sockaddr_is_loopback((const void *)a[1], *(unsigned *)a[2]))
+                inet_fd_set(g_inet_lo_fds, (int)ret);
+            else
+                inet_fd_clear(g_inet_lo_fds, (int)ret);
+        } else {
+            inet_fd_clear(g_inet_fds, (int)ret);
+            inet_fd_clear(g_inet_lo_fds, (int)ret);
+        }
         return;
     }
     if (number == __NR_dup || number == __NR_dup3 ||
         (number == __NR_fcntl && (a[1] == F_DUPFD_ || a[1] == F_DUPFD_CLOEXEC_))) {
         dup_tracked_fd((int)a[0], (int)ret);
+        if (inet_fd_test(g_inet_fds, (int)a[0])) {
+            inet_fd_set(g_inet_fds, (int)ret);
+            if (inet_fd_test(g_inet_lo_fds, (int)a[0]))
+                inet_fd_set(g_inet_lo_fds, (int)ret);
+            else
+                inet_fd_clear(g_inet_lo_fds, (int)ret);
+        } else {
+            inet_fd_clear(g_inet_fds, (int)ret);
+            inet_fd_clear(g_inet_lo_fds, (int)ret);
+        }
         return;
+    }
+
+    /* Zero-IPC live byte/packet accounting for AF_INET/AF_INET6 traffic. */
+    if ((number == __NR_sendto || number == __NR_sendmsg ||
+         number == __NR_write || number == __NR_writev) &&
+        ret > 0 && inet_fd_test(g_inet_fds, (int)a[0])) {
+        int is_lo = inet_fd_test(g_inet_lo_fds, (int)a[0]);
+        if (number == __NR_sendto && a[4] && (unsigned)a[5] >= 8u)
+            is_lo = sockaddr_is_loopback((const void *)a[4], (unsigned)a[5]);
+        else if (number == __NR_sendmsg && a[1]) {
+            const struct ns_msghdr *m = (const struct ns_msghdr *)a[1];
+            if (m->msg_name && m->msg_namelen >= 8u)
+                is_lo = sockaddr_is_loopback(m->msg_name, m->msg_namelen);
+        }
+        net_account_io(is_lo, 1, (uint64_t)ret);
+        return;
+    }
+    if ((number == __NR_read || number == __NR_readv) &&
+        ret > 0 && inet_fd_test(g_inet_fds, (int)a[0])) {
+        net_account_io(inet_fd_test(g_inet_lo_fds, (int)a[0]), 0, (uint64_t)ret);
+        return;
+    }
+    if (number == __NR_connect && inet_fd_test(g_inet_fds, (int)a[0])) {
+        int is_lo = inet_fd_test(g_inet_lo_fds, (int)a[0]);
+        net_account_io(is_lo, 1, 60);
+        net_account_io(is_lo, 0, 60);
+        return;
+    }
+    if ((number == __NR_recvfrom || number == __NR_recvmsg) &&
+        ret > 0 && inet_fd_test(g_inet_fds, (int)a[0])) {
+        int is_lo = inet_fd_test(g_inet_lo_fds, (int)a[0]);
+        if (number == __NR_recvfrom && a[4] && a[5] && *(unsigned *)a[5] >= 8u)
+            is_lo = sockaddr_is_loopback((const void *)a[4], *(unsigned *)a[5]);
+        else if (number == __NR_recvmsg && a[1]) {
+            const struct ns_msghdr *m = (const struct ns_msghdr *)a[1];
+            if (m->msg_name && m->msg_namelen >= 8u)
+                is_lo = sockaddr_is_loopback(m->msg_name, m->msg_namelen);
+        }
+        net_account_io(is_lo, 0, (uint64_t)ret);
     }
 
     /* Virtual netlink recvfrom/recvmsg: synthesize kernel sockaddr_nl (nl_pid = 0). */
@@ -1640,13 +1835,13 @@ long net_stack_proc_call(long number, long a[6], const char *guest_path)
                 for (size_t sp = nlen; sp < 6 && pos < sizeof(buf); sp++) buf[pos++] = ' ';
                 pos = fmt_str(buf, sizeof(buf), pos, f->name);
                 pos = fmt_str(buf, sizeof(buf), pos, ": ");
-                pos = fmt_u64(buf, sizeof(buf), pos, f->rx_bytes);
+                pos = fmt_u64(buf, sizeof(buf), pos, __atomic_load_n(&f->rx_bytes, __ATOMIC_RELAXED));
                 pos = fmt_str(buf, sizeof(buf), pos, " ");
-                pos = fmt_u64(buf, sizeof(buf), pos, f->rx_packets);
+                pos = fmt_u64(buf, sizeof(buf), pos, __atomic_load_n(&f->rx_packets, __ATOMIC_RELAXED));
                 pos = fmt_str(buf, sizeof(buf), pos, " 0 0 0 0 0 0 ");
-                pos = fmt_u64(buf, sizeof(buf), pos, f->tx_bytes);
+                pos = fmt_u64(buf, sizeof(buf), pos, __atomic_load_n(&f->tx_bytes, __ATOMIC_RELAXED));
                 pos = fmt_str(buf, sizeof(buf), pos, " ");
-                pos = fmt_u64(buf, sizeof(buf), pos, f->tx_packets);
+                pos = fmt_u64(buf, sizeof(buf), pos, __atomic_load_n(&f->tx_packets, __ATOMIC_RELAXED));
                 pos = fmt_str(buf, sizeof(buf), pos, " 0 0 0 0 0 0\n");
             }
         } else if (!strcmp(leaf, "route")) {
@@ -1752,13 +1947,37 @@ long net_stack_proc_call(long number, long a[6], const char *guest_path)
                 pos = fmt_hex(buf, sizeof(buf), pos, f->mac[b], 2, 0);
             }
             pos = fmt_str(buf, sizeof(buf), pos, "\n");
+        } else if (strncmp(attr, "statistics/", 11) == 0) {
+            const char *st_attr = attr + 11;
+            if (!strcmp(st_attr, "rx_bytes")) {
+                pos = fmt_u64(buf, sizeof(buf), pos, __atomic_load_n(&f->rx_bytes, __ATOMIC_RELAXED));
+                pos = fmt_str(buf, sizeof(buf), pos, "\n");
+            } else if (!strcmp(st_attr, "tx_bytes")) {
+                pos = fmt_u64(buf, sizeof(buf), pos, __atomic_load_n(&f->tx_bytes, __ATOMIC_RELAXED));
+                pos = fmt_str(buf, sizeof(buf), pos, "\n");
+            } else if (!strcmp(st_attr, "rx_packets")) {
+                pos = fmt_u64(buf, sizeof(buf), pos, __atomic_load_n(&f->rx_packets, __ATOMIC_RELAXED));
+                pos = fmt_str(buf, sizeof(buf), pos, "\n");
+            } else if (!strcmp(st_attr, "tx_packets")) {
+                pos = fmt_u64(buf, sizeof(buf), pos, __atomic_load_n(&f->tx_packets, __ATOMIC_RELAXED));
+                pos = fmt_str(buf, sizeof(buf), pos, "\n");
+            } else if (!strcmp(st_attr, "rx_errors") || !strcmp(st_attr, "tx_errors") ||
+                       !strcmp(st_attr, "rx_dropped") || !strcmp(st_attr, "tx_dropped") ||
+                       !strcmp(st_attr, "multicast") || !strcmp(st_attr, "collisions") ||
+                       !strcmp(st_attr, "rx_frame_errors") || !strcmp(st_attr, "rx_fifo_errors") ||
+                       !strcmp(st_attr, "tx_fifo_errors") || !strcmp(st_attr, "tx_carrier_errors")) {
+                pos = fmt_str(buf, sizeof(buf), pos, "0\n");
+            } else {
+                return -ENOENT;
+            }
         } else {
             return -ENOENT;
         }
         if (number == __NR_openat) {
             if (a[2] & (O_WRONLY | O_RDWR))
                 return -EACCES;
-            return make_memfd_text(attr, buf, pos, (int)a[2]);
+            const char *mname = strchr(attr, '/');
+            return make_memfd_text(mname ? mname + 1 : attr, buf, pos, (int)a[2]);
         }
         return synth_reg_stat(number, a, pos, 0);
     }

@@ -211,10 +211,15 @@ reentry_bypass:
     ldp     x2, x3, [sp, #16]
     ldp     x0, x1, [sp, #0]
     add     sp, sp, #GPR_SIZE
-    b       fast_passthrough
-
-fast_passthrough:
     svc     #0
+    br      x30
+
+    .global fast_passthrough_svc
+    .global fast_passthrough_after
+fast_passthrough:
+fast_passthrough_svc:
+    svc     #0
+fast_passthrough_after:
     br      x30
 
 fast_path_sigreturn:

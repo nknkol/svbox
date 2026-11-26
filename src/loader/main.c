@@ -462,7 +462,7 @@ void z_entry(unsigned long *sp, void (*fini)(void))
 		int fast_io = (!cfg.isolate && !has_lazy_layer);
 		backstop_install(payload_entry, !opt.child, cfg.trap_sigsys, fast_io);
 	} else if (cfg.trap_sigsys)
-		sigsys_trap_install();
+		backstop_install(payload_entry, 0, 1, 0);
 	/* --cwd: the guest directory, through the root and binds (the program
 	 * and its interpreter are loaded: they were named from the root). */
 	if (opt.cwd && !opt.child) {

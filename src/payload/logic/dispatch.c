@@ -28,6 +28,13 @@
 
 extern long raw_syscall(long number, long a1, long a2, long a3, long a4, long a5, long a6);
 extern void _start(void);
+extern void fast_passthrough_svc(void);
+extern void fast_passthrough_after(void);
+
+/* Tracks whether the guest installed a seccomp filter and whether its BPF
+ * returns SECCOMP_RET_TRAP with zero (bit 0) or nonzero (bit 1) trap data. */
+static volatile uint32_t g_guest_seccomp_trap_flags = 0;
+static volatile int g_guest_seccomp_installed = 0;
 
 static long passthrough(long number, const long a[6])
 {
@@ -337,9 +344,28 @@ static long install_wrapped_seccomp(long number, const long a[6], unsigned long 
     const struct svbox_sock_fprog *up = (const struct svbox_sock_fprog *)fprog_addr;
     uint16_t ulen = up->len;
     const struct svbox_sock_filter *ufilt = up->filter;
-    if (!ufilt || ulen == 0 || ulen > 4089u)
+    if (!ufilt || ulen == 0 || ulen > 4087u)
         return passthrough(number, a);
-    enum { PREFIX_LEN = 7 };
+
+    uint32_t tflags = 0;
+    for (uint16_t i = 0; i < ulen; i++) {
+        if (ufilt[i].code == 0x06u /* BPF_RET | BPF_K */ &&
+            (ufilt[i].k & 0xffff0000u) == 0x00030000u /* SECCOMP_RET_TRAP */) {
+            tflags |= ((ufilt[i].k & 0xffffu) == 0u) ? 1u : 2u;
+        } else if (ufilt[i].code == 0x16u /* BPF_RET | BPF_A */) {
+            tflags |= 3u;
+        }
+    }
+
+    uintptr_t pay_base = (uintptr_t)&_start;
+    uint32_t ldr_hi = (uint32_t)(LOADER_FIXED_BASE >> 32);
+    uint32_t pay_hi = (uint32_t)(pay_base >> 32);
+    uint32_t pay_lo = (uint32_t)(pay_base & 0xffffffffu);
+    uint32_t pay_end = pay_lo + 0x01000000u;
+    uint32_t fp_after_lo = (uint32_t)((uintptr_t)&fast_passthrough_after & 0xffffffffu);
+    uint32_t fp_svc_lo = (uint32_t)((uintptr_t)&fast_passthrough_svc & 0xffffffffu);
+
+    enum { PREFIX_LEN = 9 };
     size_t total = (size_t)ulen + PREFIX_LEN;
     size_t bytes = total * sizeof(struct svbox_sock_filter);
     struct svbox_sock_filter stack_buf[512];
@@ -353,14 +379,18 @@ static long install_wrapped_seccomp(long number, const long a[6], unsigned long 
         buf = (struct svbox_sock_filter *)m;
         used_mmap = 1;
     }
-    static const struct svbox_sock_filter prefix[PREFIX_LEN] = {
-        { 0x20, 0, 0, 12u },                                          /* ld ip_hi */
-        { 0x15, 0, 5, (uint32_t)(LOADER_FIXED_BASE >> 32) },          /* != 0x3f -> guest[0] */
-        { 0x20, 0, 0, 8u },                                           /* ld ip_lo */
-        { 0x35, 0, 2, 0x01000000u },                                  /* < 16 MiB (loader) -> ALLOW */
-        { 0x35, 0, 2, (uint32_t)(PAYLOAD_FIXED_BASE & 0xffffffffu) }, /* < payload -> guest[0] */
-        { 0x35, 1, 0, (uint32_t)((PAYLOAD_FIXED_BASE & 0xffffffffu) + 0x01000000u) }, /* >= end -> guest[0] */
-        { 0x06, 0, 0, 0x7fff0000u },                                  /* ret SECCOMP_RET_ALLOW */
+    /* Allow internal syscalls from loader and payload ranges while still
+     * routing fast_passthrough's guest svc #0 through the guest filter. */
+    struct svbox_sock_filter prefix[PREFIX_LEN] = {
+        { 0x20, 0, 0, 12u },                  /* 0: ld ip_hi */
+        { 0x15, 0, 7, pay_hi == ldr_hi ? ldr_hi : pay_hi }, /* 1: != hi -> guest[0] */
+        { 0x20, 0, 0, 8u },                   /* 2: ld ip_lo */
+        { 0x35, 0, 4, pay_hi == ldr_hi ? 0x01000000u : 0u }, /* 3: < 16 MiB (loader) -> ALLOW */
+        { 0x35, 0, 4, pay_lo },               /* 4: < pay_lo -> guest[0] */
+        { 0x35, 3, 0, pay_end },              /* 5: >= pay_end -> guest[0] */
+        { 0x15, 2, 0, fp_after_lo },          /* 6: == fast_passthrough_after -> guest[0] */
+        { 0x15, 1, 0, fp_svc_lo },            /* 7: == fast_passthrough_svc -> guest[0] */
+        { 0x06, 0, 0, 0x7fff0000u },          /* 8: ret SECCOMP_RET_ALLOW */
     };
     memcpy(buf, prefix, sizeof(prefix));
     memcpy(buf + PREFIX_LEN, ufilt, (size_t)ulen * sizeof(struct svbox_sock_filter));
@@ -370,6 +400,11 @@ static long install_wrapped_seccomp(long number, const long a[6], unsigned long 
     long rc = passthrough(number, wa);
     if (used_mmap)
         raw_syscall(__NR_munmap, (long)buf, (long)bytes, 0, 0, 0, 0);
+    if (rc == 0) {
+        if (tflags)
+            __atomic_fetch_or(&g_guest_seccomp_trap_flags, tflags, __ATOMIC_RELEASE);
+        __atomic_store_n(&g_guest_seccomp_installed, 1, __ATOMIC_RELEASE);
+    }
     return rc;
 }
 
@@ -377,6 +412,8 @@ long dispatch_syscall(long number, long a[6])
 {
     if (number == __NR_prctl && a[0] == PR_GET_AUXV)
         return proot_get_auxv(a);
+    if (number == __NR_prctl && a[0] == SVBOX_PR_GET_GUEST_SECCOMP_TRAPS)
+        return (long)__atomic_load_n(&g_guest_seccomp_trap_flags, __ATOMIC_ACQUIRE);
     if (number == __NR_execve || number == __NR_execveat)
         return proot_execve(number, a);
     if (proot_handles_syscall(number))
@@ -604,14 +641,16 @@ long dispatch_syscall(long number, long a[6])
         if (platform_is_harmonyos() && (a[0] == 55 /* PR_SET_TAGGED_ADDR_CTRL */ ||
                                         a[0] == 56 /* PR_GET_TAGGED_ADDR_CTRL */))
             return -EINVAL;
+        if (a[0] == 22 /* PR_SET_SECCOMP */ && a[1] == 2 /* SECCOMP_MODE_FILTER */)
+            return install_wrapped_seccomp(number, a, (unsigned long)a[2]);
         if (g_payload_config.seccomp_backstop || g_payload_config.trap_sigsys) {
             if (a[0] == 21 /* PR_GET_SECCOMP */)
-                return 0;
-            if (a[0] == 22 /* PR_SET_SECCOMP */ && a[1] == 2 /* SECCOMP_MODE_FILTER */)
-                return install_wrapped_seccomp(number, a, (unsigned long)a[2]);
+                return __atomic_load_n(&g_guest_seccomp_installed, __ATOMIC_ACQUIRE) ? 2 : 0;
             if (a[0] == 38 /* PR_SET_NO_NEW_PRIVS */ && a[1] == 1 && !a[2] && !a[3] && !a[4]) {
-                guest_nnp = 1;
-                return 0;
+                long rc = passthrough(number, a);
+                if (rc == 0)
+                    guest_nnp = 1;
+                return rc;
             }
             if (a[0] == 39 /* PR_GET_NO_NEW_PRIVS */)
                 return guest_nnp;

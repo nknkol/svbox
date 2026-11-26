@@ -89,6 +89,23 @@ static void loader_sigsys_handler(int sig, siginfo_t *si, void *ucontext)
 		}
 		return;
 	}
+	/* Forward guest-installed SECCOMP_RET_TRAP to the guest's SIGSYS action:
+	 * - Nonzero si_errno (!= BACKSTOP_TRAP_DATA) always comes from a guest
+	 *   seccomp filter (host sandboxes use trap data 0).
+	 * - Zero si_errno is forwarded only when this process installed a guest
+	 *   filter returning SECCOMP_RET_TRAP | 0 (and not while reentering
+	 *   svbox internals, where backstop_call returns < 0). */
+	int is_guest_trap = (si->si_errno != 0);
+	if (!is_guest_trap && g_payload_entry) {
+		unsigned long qregs[9] = {SVBOX_PR_GET_GUEST_SECCOMP_TRAPS, 0, 0, 0, 0, 0, 0, 0, __NR_prctl};
+		long tflags = backstop_call(g_payload_entry, qregs);
+		if (tflags > 0 && (tflags & 1L))
+			is_guest_trap = 1;
+	}
+	if (is_guest_trap) {
+		forward_guest_sigsys(sig, si, ucontext);
+		return;
+	}
 	if (g_trap_host_sigsys) {
 		regs[0] = (unsigned long)-38L; /* -ENOSYS */
 		return;
@@ -202,7 +219,7 @@ void backstop_install(unsigned long payload_entry, int with_filter,
 {
 	g_payload_entry = payload_entry;
 	g_trap_host_sigsys = trap_host_sigsys;
-	if (g_payload_lo != PAYLOAD_FIXED_BASE)
+	if (with_filter && g_payload_lo != PAYLOAD_FIXED_BASE)
 		z_errx(1, "seccomp backstop: payload not at its fixed address");
 	/* NODEFER + explicit SA_RESTORER: a guest handler run from here may
 	 * itself trap, and rt_sigreturn runs from our loader's allowed range. */
