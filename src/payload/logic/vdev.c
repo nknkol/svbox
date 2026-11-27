@@ -73,6 +73,7 @@ struct vdev_cmsghdr {
 #define VDEV_MAX_THREADS     4096
 #define VDEV_BWR_STACK_CAP   8192u
 #define VDEV_BWR_SCRATCH_CAP 262144u
+#define VDEV_FDA_SLOTS       512u
 
 struct vdev_thread_chan {
     int32_t tid;
@@ -80,6 +81,15 @@ struct vdev_thread_chan {
     int32_t rpc_fd;
     int32_t used;
     uint8_t *bwr_scratch; /* lazily cached 256 KiB scratch buffer for large BWR calls */
+};
+
+/* Per-transaction BINDER_TYPE_FDA file descriptors owned by the binder driver
+ * until userspace frees the transaction buffer via BC_FREE_BUFFER (matching
+ * Linux drivers/android/binder.c binder_transaction_buffer_release()). */
+struct vdev_fda_entry {
+    uint64_t buf_ptr;
+    uint32_t fd_count;
+    int32_t  fds[VDEV_MAX_FDS];
 };
 
 struct vdev_open_slot {
@@ -96,6 +106,7 @@ struct vdev_open_slot {
     uint64_t map_len;
     struct vdev_thread_chan *threads;
     uint32_t threads_cap;
+    struct vdev_fda_entry *fda_entries;
 };
 
 static struct vdev_open_slot g_open_slots[VDEV_MAX_OPEN];
@@ -483,17 +494,21 @@ static void drop_thread_rpc_fd(struct vdev_open_slot *slot)
 
 static void close_slot(struct vdev_open_slot *slot)
 {
+    int32_t cur_pid = (int32_t)raw_syscall(__NR_getpid, 0, 0, 0, 0, 0, 0);
     vdev_lock();
     if (!slot->active) {
         vdev_unlock();
         return;
     }
     int memfd = slot->memfd;
+    int32_t owner_pid = slot->owner_pid;
     slot->memfd = -1;
     struct vdev_thread_chan *tbl = slot->threads;
     uint32_t cap = slot->threads_cap;
     slot->threads = NULL;
     slot->threads_cap = 0;
+    struct vdev_fda_entry *ftbl = slot->fda_entries;
+    __atomic_store_n(&slot->fda_entries, (struct vdev_fda_entry *)NULL, __ATOMIC_RELEASE);
     if (tbl) {
         for (uint32_t i = 0; i < cap; i++) {
             if (tbl[i].used && tbl[i].rpc_fd >= 0) {
@@ -514,6 +529,21 @@ static void close_slot(struct vdev_open_slot *slot)
     slot->fd = -1;
     __atomic_sub_fetch(&g_vdev_open_count, 1, __ATOMIC_RELEASE);
     vdev_unlock();
+    if (ftbl) {
+        if (owner_pid == cur_pid) {
+            for (uint32_t i = 0; i < VDEV_FDA_SLOTS; i++) {
+                if (ftbl[i].buf_ptr != 0) {
+                    for (uint32_t j = 0; j < ftbl[i].fd_count && j < VDEV_MAX_FDS; j++) {
+                        if (ftbl[i].fds[j] >= 0)
+                            raw_syscall(__NR_close, ftbl[i].fds[j], 0, 0, 0, 0, 0);
+                    }
+                }
+            }
+        }
+        raw_syscall(__NR_munmap, (long)ftbl,
+                    (long)((size_t)VDEV_FDA_SLOTS * sizeof(struct vdev_fda_entry)),
+                    0, 0, 0, 0);
+    }
     if (memfd >= 0)
         raw_syscall(__NR_close, memfd, 0, 0, 0, 0, 0);
 }
@@ -642,6 +672,11 @@ long vdev_path_call(long number, long a[6], int vdev_idx)
                         (long)((size_t)s->threads_cap * sizeof(struct vdev_thread_chan)),
                         0, 0, 0, 0);
         }
+        if (was_active && s->fda_entries) {
+            raw_syscall(__NR_munmap, (long)s->fda_entries,
+                        (long)((size_t)VDEV_FDA_SLOTS * sizeof(struct vdev_fda_entry)),
+                        0, 0, 0, 0);
+        }
         memset(s, 0, sizeof(*s));
         s->active = 1;
         s->vdev_idx = vdev_idx;
@@ -700,6 +735,141 @@ long vdev_path_call(long number, long a[6], int vdev_idx)
 static uint32_t binder_bc_arg_size(uint32_t cmd)
 {
     return (cmd >> 16) & 0x3fffu;
+}
+
+static void slot_record_fda_fds(struct vdev_open_slot *slot, uint64_t buf_ptr,
+                                const int32_t *fds, uint32_t count)
+{
+    if (!buf_ptr || !fds || count == 0)
+        return;
+    if (count > VDEV_MAX_FDS)
+        count = VDEV_MAX_FDS;
+    vdev_lock();
+    struct vdev_fda_entry *tbl = slot->fda_entries;
+    if (!tbl) {
+        size_t bytes = (size_t)VDEV_FDA_SLOTS * sizeof(struct vdev_fda_entry);
+        long addr = raw_syscall(__NR_mmap, 0, (long)bytes,
+                                PROT_READ_ | PROT_WRITE_,
+                                MAP_PRIVATE_ | MAP_ANONYMOUS_, -1, 0);
+        if (addr < 0 && addr >= -4095) {
+            vdev_unlock();
+            return;
+        }
+        tbl = (struct vdev_fda_entry *)(uintptr_t)addr;
+        __atomic_store_n(&slot->fda_entries, tbl, __ATOMIC_RELEASE);
+    }
+    int free_idx = -1;
+    for (uint32_t i = 0; i < VDEV_FDA_SLOTS; i++) {
+        if (tbl[i].buf_ptr == buf_ptr) {
+            free_idx = (int)i;
+            break;
+        }
+        if (tbl[i].buf_ptr == 0 && free_idx < 0)
+            free_idx = (int)i;
+    }
+    if (free_idx >= 0) {
+        tbl[free_idx].buf_ptr = buf_ptr;
+        tbl[free_idx].fd_count = count;
+        for (uint32_t j = 0; j < count; j++)
+            tbl[free_idx].fds[j] = fds[j];
+    }
+    vdev_unlock();
+}
+
+static void slot_record_fda_from_br(struct vdev_open_slot *slot, const uint8_t *br, size_t br_len)
+{
+    uint64_t mb = slot->map_base;
+    uint64_t me = mb + slot->map_len;
+    if (!mb || me <= mb)
+        return;
+    size_t pos = 0;
+    while (pos + 4 <= br_len) {
+        uint32_t br_cmd = 0;
+        memcpy(&br_cmd, br + pos, 4);
+        uint32_t br_asz = binder_bc_arg_size(br_cmd);
+        if (pos + 4 + br_asz > br_len)
+            break;
+        if ((br_cmd == SV_BR_TRANSACTION || br_cmd == SV_BR_REPLY) &&
+            br_asz >= sizeof(struct sv_binder_transaction_data)) {
+            struct sv_binder_transaction_data txn;
+            memcpy(&txn, br + pos + 4, sizeof(txn));
+            if (txn.offsets_size >= sizeof(uint64_t) && (txn.offsets_size & 7u) == 0 &&
+                txn.data.ptr.buffer >= mb && txn.data.ptr.buffer <= me &&
+                txn.data_size <= me - txn.data.ptr.buffer &&
+                txn.data.ptr.offsets >= mb && txn.data.ptr.offsets <= me &&
+                txn.offsets_size <= me - txn.data.ptr.offsets) {
+                const uint8_t *data = (const uint8_t *)(uintptr_t)txn.data.ptr.buffer;
+                const uint64_t *offs = (const uint64_t *)(uintptr_t)txn.data.ptr.offsets;
+                size_t n_offs = (size_t)(txn.offsets_size / sizeof(uint64_t));
+                int32_t fda_fds[VDEV_MAX_FDS];
+                uint32_t fda_count = 0;
+                for (size_t k = 0; k < n_offs; k++) {
+                    uint64_t o = offs[k];
+                    if (o > txn.data_size || txn.data_size - o < sizeof(struct sv_binder_fd_array_object))
+                        continue;
+                    uint32_t otype = 0;
+                    memcpy(&otype, data + o, 4);
+                    if (otype != SV_BINDER_TYPE_FDA)
+                        continue;
+                    struct sv_binder_fd_array_object fda;
+                    memcpy(&fda, data + o, sizeof(fda));
+                    if (fda.parent >= k || fda.parent >= n_offs)
+                        continue;
+                    uint64_t po = offs[fda.parent];
+                    if (po > txn.data_size || txn.data_size - po < sizeof(struct sv_binder_buffer_object))
+                        continue;
+                    struct sv_binder_buffer_object bbo;
+                    memcpy(&bbo, data + po, sizeof(bbo));
+                    if (bbo.type != SV_BINDER_TYPE_PTR)
+                        continue;
+                    if (bbo.buffer < mb || bbo.buffer > me || bbo.length > me - bbo.buffer)
+                        continue;
+                    const uint8_t *pbuf = (const uint8_t *)(uintptr_t)bbo.buffer;
+                    for (uint64_t j = 0; j < fda.num_fds; j++) {
+                        uint64_t foff = fda.parent_offset + j * 4u;
+                        if (foff > bbo.length || bbo.length - foff < 4u)
+                            break;
+                        int32_t fd = -1;
+                        memcpy(&fd, pbuf + foff, 4);
+                        if (fd >= 0 && fda_count < VDEV_MAX_FDS)
+                            fda_fds[fda_count++] = fd;
+                    }
+                }
+                if (fda_count > 0)
+                    slot_record_fda_fds(slot, txn.data.ptr.buffer, fda_fds, fda_count);
+            }
+        }
+        pos += 4 + br_asz;
+    }
+}
+
+static void slot_close_fda_for_buffer(struct vdev_open_slot *slot, uint64_t buf_ptr)
+{
+    if (!buf_ptr || !__atomic_load_n(&slot->fda_entries, __ATOMIC_ACQUIRE))
+        return;
+    int32_t to_close[VDEV_MAX_FDS];
+    uint32_t close_count = 0;
+    vdev_lock();
+    struct vdev_fda_entry *tbl = slot->fda_entries;
+    if (tbl) {
+        for (uint32_t i = 0; i < VDEV_FDA_SLOTS; i++) {
+            if (tbl[i].buf_ptr == buf_ptr) {
+                close_count = tbl[i].fd_count;
+                if (close_count > VDEV_MAX_FDS)
+                    close_count = VDEV_MAX_FDS;
+                for (uint32_t j = 0; j < close_count; j++)
+                    to_close[j] = tbl[i].fds[j];
+                tbl[i].buf_ptr = 0;
+                tbl[i].fd_count = 0;
+                break;
+            }
+        }
+    }
+    vdev_unlock();
+    for (uint32_t j = 0; j < close_count; j++) {
+        if (to_close[j] >= 0)
+            raw_syscall(__NR_close, to_close[j], 0, 0, 0, 0, 0);
+    }
 }
 
 static long binder_write_read(struct vdev_open_slot *slot, unsigned long arg)
@@ -820,6 +990,9 @@ static long binder_write_read(struct vdev_open_slot *slot, unsigned long arg)
     int send_fds[VDEV_MAX_FDS];
     uint32_t send_fd_count = 0;
 
+    uint64_t freed_bufs[32];
+    uint32_t freed_buf_count = 0;
+
     wreq->raw_write_size = (uint32_t)wrem;
     size_t soff = 0;
     long rc = 0;
@@ -924,6 +1097,12 @@ static long binder_write_read(struct vdev_open_slot *slot, unsigned long arg)
                 rc = -ENOMEM;
                 break;
             }
+            if (cmd == SV_BC_FREE_BUFFER && asz >= 8 && freed_buf_count < 32) {
+                uint64_t fptr = 0;
+                memcpy(&fptr, src + soff + 4, 8);
+                if (fptr != 0)
+                    freed_bufs[freed_buf_count++] = fptr;
+            }
             memcpy(dst + dst_off, src + soff, 4 + asz);
             dst_off += 4 + asz;
         }
@@ -931,6 +1110,10 @@ static long binder_write_read(struct vdev_open_slot *slot, unsigned long arg)
     }
 
     if (rc == 0) {
+        /* Close BINDER_TYPE_FDA FDs owned by freed transaction buffers before sending
+         * BC_FREE_BUFFER to the daemon so no reuse race on the same buf_ptr can occur. */
+        for (uint32_t i = 0; i < freed_buf_count; i++)
+            slot_close_fda_for_buffer(slot, freed_bufs[i]);
         wreq->packed_len = (uint32_t)dst_off;
         rc = send_msg(rpc_fd, VDEV_OP_BINDER_WR, slot->proc_id, 0, 0,
                       scratch, (uint32_t)(sizeof(*wreq) + dst_off),
@@ -953,6 +1136,7 @@ static long binder_write_read(struct vdev_open_slot *slot, unsigned long arg)
         size_t patch_bytes = (size_t)wrep.fd_patch_count * sizeof(uint64_t);
         if (sizeof(wrep) + patch_bytes + wrep.read_bytes <= rhdr.payload_len) {
             /* Patch received FDs into guest's shared memfd mapping if any. */
+            uint32_t patched_fds = 0;
             if (wrep.fd_patch_count > 0 && slot->map_base && slot->map_len) {
                 /* Daemon wrote the memfd; guest mapping is PROT_READ unless
                  * daemon passed memfd offsets that we patch via pwrite on slot->memfd. */
@@ -963,10 +1147,22 @@ static long binder_write_read(struct vdev_open_slot *slot, unsigned long arg)
                     if (slot->memfd >= 0 && fd_off + 4 <= slot->map_len) {
                         uint32_t new_fd = (uint32_t)recv_fds[i];
                         raw_syscall(__NR_pwrite64, slot->memfd, (long)&new_fd, 4, (long)fd_off, 0, 0);
+                        patched_fds = i + 1;
+                    } else if (recv_fds[i] >= 0) {
+                        raw_syscall(__NR_close, recv_fds[i], 0, 0, 0, 0, 0);
+                        recv_fds[i] = -1;
                     }
                 }
             }
+            for (uint32_t i = patched_fds; i < recv_fd_count; i++) {
+                if (recv_fds[i] >= 0) {
+                    raw_syscall(__NR_close, recv_fds[i], 0, 0, 0, 0, 0);
+                    recv_fds[i] = -1;
+                }
+            }
             const uint8_t *br = scratch + sizeof(wrep) + patch_bytes;
+            if (patched_fds > 0 && wrep.read_bytes > 0 && slot->map_base && slot->map_len)
+                slot_record_fda_from_br(slot, br, wrep.read_bytes);
             if (wrep.read_bytes > 0 && bwr.read_buffer) {
                 size_t copy_n = wrep.read_bytes;
                 if (copy_n > rcap)
@@ -982,8 +1178,10 @@ static long binder_write_read(struct vdev_open_slot *slot, unsigned long arg)
     }
 
     if (rc < 0) {
-        for (uint32_t i = 0; i < recv_fd_count; i++)
-            raw_syscall(__NR_close, recv_fds[i], 0, 0, 0, 0, 0);
+        for (uint32_t i = 0; i < recv_fd_count; i++) {
+            if (recv_fds[i] >= 0)
+                raw_syscall(__NR_close, recv_fds[i], 0, 0, 0, 0, 0);
+        }
     }
     if (dyn_mmap_cap > 0) {
         raw_syscall(__NR_munmap, (long)scratch, (long)dyn_mmap_cap, 0, 0, 0, 0);
